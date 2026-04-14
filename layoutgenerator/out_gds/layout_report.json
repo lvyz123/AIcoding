@@ -1,0 +1,42 @@
+{
+  "config": {
+    "width_um": 120.0,
+    "height_um": 80.0,
+    "layers": 3,
+    "count": 2,
+    "output_format": "gds",
+    "output_dir": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_gds",
+    "base_name": "layout",
+    "min_shapes_per_layer": 8,
+    "max_shapes_per_layer": 20,
+    "margin_um": 5.0,
+    "seed": 42
+  },
+  "generated_files": 2,
+  "layouts": [
+    {
+      "index": 0,
+      "file": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_gds\\layout_000.gds",
+      "layers": 3,
+      "layer_shape_counts": {
+        "1": 18,
+        "2": 8,
+        "3": 20
+      },
+      "width_um": 120.0,
+      "height_um": 80.0
+    },
+    {
+      "index": 1,
+      "file": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_gds\\layout_001.gds",
+      "layers": 3,
+      "layer_shape_counts": {
+        "1": 16,
+        "2": 10,
+        "3": 12
+      },
+      "width_um": 120.0,
+      "height_um": 80.0
+    }
+  ]
+}

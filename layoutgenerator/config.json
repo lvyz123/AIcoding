@@ -1,0 +1,13 @@
+﻿{
+  "width": 550,
+  "height": 550,
+  "layers": 4,
+  "count": 1,
+  "format": "oas",
+  "output_dir": "out_oas",
+  "base_name": "sample_layout",
+  "min_shapes": 90,
+  "max_shapes": 140,
+  "margin": 3,
+  "seed": 20260329
+}

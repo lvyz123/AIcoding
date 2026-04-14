@@ -1,0 +1,148 @@
+{
+  "summary": {
+    "input_file_count": 1,
+    "total_item_count": 4,
+    "active_group_count": 1,
+    "exact_group_compression_ratio": 0.25,
+    "cluster_count": 1,
+    "singleton_cluster_count": 0,
+    "workers": 2,
+    "design_layer": "1/0",
+    "marker_layer": "999/0",
+    "pattern_radius_um": 1.35
+  },
+  "pattern_generation": {
+    "input_file_count": 1,
+    "total_item_count": 4,
+    "design_layer": "1/0",
+    "marker_layer": "999/0",
+    "pattern_radius_um": 1.35,
+    "window_size_um": 2.7,
+    "sources": [
+      {
+        "source_name": "tiny_layout.oas",
+        "design_layer": "1/0",
+        "marker_layer": "999/0",
+        "hierarchy_expanded": true,
+        "top_cell_names": [
+          "TOP"
+        ],
+        "expanded_design_geometry_count": 4,
+        "expanded_marker_geometry_count": 4,
+        "layout_bbox": [
+          0.0,
+          0.0,
+          10.0,
+          1.0
+        ],
+        "raw_marker_geometry_count": 4,
+        "merged_marker_count": 4,
+        "generated_item_count": 4,
+        "pattern_radius_um": 1.35,
+        "window_size_um": 2.7,
+        "marker_source": "layer:999/0"
+      }
+    ],
+    "exact_grouping": {
+      "enabled": true,
+      "total_item_count": 4,
+      "active_group_count": 1,
+      "exact_group_compression_ratio": 0.25,
+      "exact_group_reduction_factor": 4.0
+    }
+  },
+  "sparse_graph": {
+    "rounds": []
+  },
+  "alignment_refinement": {
+    "rounds": []
+  },
+  "closed_loop": {
+    "rounds": [],
+    "executed_rounds": 0,
+    "final_orphan_count": 1
+  },
+  "clusters": [
+    {
+      "cluster_id": 0,
+      "size": 4,
+      "representative_item_id": 0,
+      "representative_source_name": "tiny_layout.oas",
+      "representative_center": [
+        0.5,
+        0.5
+      ],
+      "representative_marker_bbox": [
+        0.4,
+        0.4,
+        0.6000000000000001,
+        0.6000000000000001
+      ],
+      "member_item_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "members": [
+        {
+          "item_id": 0,
+          "source_name": "tiny_layout.oas",
+          "center": [
+            0.5,
+            0.5
+          ],
+          "marker_bbox": [
+            0.4,
+            0.4,
+            0.6000000000000001,
+            0.6000000000000001
+          ]
+        },
+        {
+          "item_id": 1,
+          "source_name": "tiny_layout.oas",
+          "center": [
+            3.5,
+            0.5
+          ],
+          "marker_bbox": [
+            3.4,
+            0.4,
+            3.6,
+            0.6000000000000001
+          ]
+        },
+        {
+          "item_id": 2,
+          "source_name": "tiny_layout.oas",
+          "center": [
+            6.5,
+            0.5
+          ],
+          "marker_bbox": [
+            6.4,
+            0.4,
+            6.6000000000000005,
+            0.6000000000000001
+          ]
+        },
+        {
+          "item_id": 3,
+          "source_name": "tiny_layout.oas",
+          "center": [
+            9.5,
+            0.5
+          ],
+          "marker_bbox": [
+            9.4,
+            0.4,
+            9.6,
+            0.6000000000000001
+          ]
+        }
+      ],
+      "alignment_results": []
+    }
+  ]
+}

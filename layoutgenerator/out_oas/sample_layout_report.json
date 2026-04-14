@@ -1,0 +1,66 @@
+{
+  "config": {
+    "width_um": 550.0,
+    "height_um": 550.0,
+    "layers": 4,
+    "cells": 2,
+    "count": 1,
+    "start_index": 1,
+    "output_format": "oas",
+    "output_dir": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_oas",
+    "base_name": "sample_layout",
+    "density": "medium",
+    "min_shapes_per_layer": 8,
+    "max_shapes_per_layer": 20,
+    "target_primitives": 1200000,
+    "path_ratio": 0.2,
+    "margin_um": 3.0,
+    "seed": 20260404
+  },
+  "generated_files": 1,
+  "layouts": [
+    {
+      "index": 1,
+      "file": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_oas\\sample_layout_001.oas",
+      "layers": 4,
+      "cells": 2,
+      "total_primitives": 1200000,
+      "polygon_count": 960000,
+      "path_count": 240000,
+      "layer_primitive_counts": {
+        "1": 300000,
+        "2": 300000,
+        "3": 300000,
+        "4": 300000
+      },
+      "cell_summaries": [
+        {
+          "name": "TOP_001",
+          "primitive_count": 600000,
+          "polygon_count": 480000,
+          "path_count": 120000,
+          "layer_primitive_counts": {
+            "1": 150000,
+            "2": 150000,
+            "3": 150000,
+            "4": 150000
+          }
+        },
+        {
+          "name": "CELL_001_01",
+          "primitive_count": 600000,
+          "polygon_count": 480000,
+          "path_count": 120000,
+          "layer_primitive_counts": {
+            "1": 150000,
+            "2": 150000,
+            "3": 150000,
+            "4": 150000
+          }
+        }
+      ],
+      "width_um": 550.0,
+      "height_um": 550.0
+    }
+  ]
+}

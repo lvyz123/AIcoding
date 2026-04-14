@@ -1,0 +1,19 @@
+# Layout clustering algorithms - runtime dependencies
+#
+# Covered entrypoints:
+# - layout_clustering_scp.py
+# - layout_clustering_hdbscan.py
+# - layout_clustering_clip_shifting.py
+
+# Shared numeric / OASIS geometry stack
+numpy>=1.23.0
+scipy>=1.11.0
+gdstk>=0.9.52
+Rtree>=1.0.1
+
+# SCP version: polygon rasterization for bitmap features
+scikit-image>=0.20.0
+
+# HDBSCAN version: feature scaling, distance metrics, and clustering
+scikit-learn>=1.2.0
+hdbscan>=0.8.33

@@ -1,0 +1,102 @@
+{
+  "config": {
+    "width_um": 2000.0,
+    "height_um": 2000.0,
+    "tile_size_um": 125.0,
+    "rows": 16,
+    "cols": 16,
+    "m1_layer": 1,
+    "m1_datatype": 0,
+    "marker_layer": 999,
+    "marker_datatype": 0,
+    "marker_size_um": 0.1,
+    "output_path": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_oas\\sample_layout_002.oas",
+    "report_path": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_oas\\sample_layout_002_report.json"
+  },
+  "tile_variants": {
+    "DRAM_M1_TILE_00": {
+      "track_count": 143,
+      "m1_polygons": 341,
+      "marker_polygons": 48,
+      "marker_breakdown": {
+        "line_end": 20,
+        "bridge_edge": 12,
+        "strap_edge": 8,
+        "pad_transition": 4,
+        "dense_cluster": 4
+      }
+    },
+    "DRAM_M1_TILE_01": {
+      "track_count": 143,
+      "m1_polygons": 341,
+      "marker_polygons": 48,
+      "marker_breakdown": {
+        "line_end": 20,
+        "bridge_edge": 12,
+        "strap_edge": 8,
+        "dense_cluster": 4,
+        "fallback": 4
+      }
+    },
+    "DRAM_M1_TILE_02": {
+      "track_count": 143,
+      "m1_polygons": 341,
+      "marker_polygons": 48,
+      "marker_breakdown": {
+        "line_end": 20,
+        "bridge_edge": 12,
+        "strap_edge": 8,
+        "dense_cluster": 4,
+        "fallback": 4
+      }
+    },
+    "DRAM_M1_TILE_03": {
+      "track_count": 143,
+      "m1_polygons": 341,
+      "marker_polygons": 48,
+      "marker_breakdown": {
+        "line_end": 20,
+        "bridge_edge": 12,
+        "strap_edge": 8,
+        "pad_transition": 4,
+        "dense_cluster": 4
+      }
+    }
+  },
+  "variant_usage": {
+    "DRAM_M1_TILE_00": 64,
+    "DRAM_M1_TILE_01": 64,
+    "DRAM_M1_TILE_02": 64,
+    "DRAM_M1_TILE_03": 64
+  },
+  "top_level_m1_polygons": 7,
+  "top_level_marker_polygons": 4096,
+  "top_level_marker_breakdown": {
+    "sense_amp_corridor_edge": 2048,
+    "sense_amp_track_crossing": 1024,
+    "sense_amp_strap_neck": 512,
+    "sense_amp_boundary_feed": 512
+  },
+  "verification": {
+    "polygon_layer_pairs": [
+      [
+        1,
+        0
+      ],
+      [
+        999,
+        0
+      ]
+    ],
+    "top_bbox_um": {
+      "x0": 0.0,
+      "y0": 0.0,
+      "x1": 2000.0,
+      "y1": 2000.0,
+      "width": 2000.0,
+      "height": 2000.0
+    },
+    "instanced_m1_polygons": 87303,
+    "instanced_marker_polygons": 16384
+  }
+}
