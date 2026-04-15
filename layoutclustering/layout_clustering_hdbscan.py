@@ -9,13 +9,14 @@
 本优化版与原始 layout_clustering.py 的主要区别：
 1. 不再用固定网格切 clip，而是先挑选若干中心点，再构造中心矩形和外围上下文窗口。
 2. 特征提取时把中心矩形内部与外围上下文分开计算，并给予不同权重。
-3. 默认使用“高性能近似几何去重”而不是最重的逐窗口精确布尔裁剪。
-4. 将 clip shifting 的“边界对齐”思路合入候选中心生成阶段，并在窗口压缩阶段固定保留 shift-cover 压缩。
+3. split-layout 模式使用用户指定 marker 层作为初始窗口中心来源，marker 图形只作为 seed，不参与 pattern 特征。
+4. 默认使用“高性能近似几何去重”而不是最重的逐窗口精确布尔裁剪。
+5. 将 clip shifting 的“边界对齐”思路合入候选中心生成阶段，并在窗口压缩阶段固定保留 shift-cover 压缩。
 
 为什么默认采用近似方案：
 - 在大尺寸 OAS/GDS 上，单个窗口常会与数千个原始 polygon 相交。
 - 如果每个候选中心都做精确几何裁剪和增强哈希，通常会导致总耗时过长。
-- 因此当前默认策略会先做空间分桶、轻量邻域签名预去重，并限制每个窗口保留的局部几何元素数，
+- 因此当前默认策略会先做 marker-driven 候选生成、轻量邻域签名预去重，并限制每个窗口保留的局部几何元素数，
   从而在保留“中心窗口聚类”整体思路的同时，把流程压到可运行范围。
 
 当前 shift-cover 的接入方式：
@@ -24,15 +25,15 @@
 - 这样既保留 paper 的关键思想，又把运行时间控制在工程可接受范围内。
 
 当前默认性能策略：
-- candidate_bin_size_um = max(10um, outer_window_size * 2)
+- split-layout 时必须指定 --marker-layer layer/datatype，marker 层不进入窗口 pattern 几何
 - max_elements_per_window = 256
 - enable_coarse_prefilter = True
 - enable_clip_shifting = True
 - clip_shift_neighbor_limit = 128
 - clip_shift_boundary_tolerance_um = 0.02
 
-如果更关心几何保真度而不是吞吐量，可以适当减小 --candidate-bin-size-um、
-增大 --max-elements-per-window，或调整 --sample-similarity-threshold / --hash-precision-nm 做对比验证。
+如果更关心几何保真度而不是吞吐量，可以适当增大 --max-elements-per-window，
+或调整 --sample-similarity-threshold / --hash-precision-nm 做对比验证。
 
 工程说明：
 - 在部分 Windows 环境下，并行特征提取可能因进程池权限问题失败。
@@ -165,6 +166,14 @@ def _write_oas_library(lib: gdstk.Library, filepath: str) -> None:
 def _ensure_oas_input_path(filepath: str) -> None:
     if os.path.splitext(filepath)[1].lower() != ".oas":
         raise ValueError(f"当前版本仅支持 OASIS (.oas) 输入: {filepath}")
+
+
+def _parse_layer_spec(layer_spec: str) -> Tuple[int, int]:
+    try:
+        layer_str, datatype_str = str(layer_spec).split("/", 1)
+        return int(layer_str.strip()), int(datatype_str.strip())
+    except Exception as exc:
+        raise ValueError(f"Invalid marker layer '{layer_spec}', expected '<layer>/<datatype>'") from exc
 
 
 def _normalize_feature_block_weights(weights, default_weights=None):
@@ -327,7 +336,10 @@ def _safe_bbox_tuple(bbox):
     if bbox is None:
         return None
     try:
-        (min_x, min_y), (max_x, max_y) = bbox
+        if len(bbox) == 4 and not isinstance(bbox[0], (list, tuple, np.ndarray)):
+            min_x, min_y, max_x, max_y = bbox
+        else:
+            (min_x, min_y), (max_x, max_y) = bbox
         coords = [float(min_x), float(min_y), float(max_x), float(max_y)]
     except Exception:
         return None
@@ -412,41 +424,44 @@ def _geometry_bbox(element):
     return (min_x, min_y, max_x, max_y)
 
 
-def _build_layout_spatial_index(lib):
-    """为整版图建立R树索引，并返回可复用的几何元素列表"""
+def _build_layout_spatial_index(lib, marker_layer=None):
+    """为 pattern 图形建立 R 树索引；指定 marker_layer 时单独返回 marker 图形。"""
     spatial_index = index.Index()
     indexed_elements = []
+    marker_polygons = []
+    marker_layer_tuple = tuple(marker_layer) if marker_layer is not None else None
     element_counter = 0
 
-    for cell in lib.cells:
-        for poly in cell.polygons:
-            bbox = _geometry_bbox(poly)
-            if bbox is None:
-                continue
-            spatial_index.insert(element_counter, bbox)
-            indexed_elements.append({
-                "element": poly,
-                "type": "polygon",
-                "bbox": bbox,
-                "cell_name": cell.name,
-            })
-            element_counter += 1
+    def _handle_polygon(poly, cell_name):
+        nonlocal element_counter
+        bbox = _geometry_bbox(poly)
+        if bbox is None:
+            return
+        layer, datatype = _element_layer_datatype(poly)
+        if marker_layer_tuple is not None and (int(layer), int(datatype)) == marker_layer_tuple:
+            marker_polygons.append(poly)
+            return
+        spatial_index.insert(element_counter, bbox)
+        indexed_elements.append({
+            "element": poly,
+            "type": "polygon",
+            "bbox": bbox,
+            "cell_name": cell_name,
+        })
+        element_counter += 1
 
-        for path in cell.paths:
-            bbox = _geometry_bbox(path)
-            if bbox is None:
-                continue
-            spatial_index.insert(element_counter, bbox)
-            indexed_elements.append({
-                "element": path,
-                "type": "path",
-                "bbox": bbox,
-                "cell_name": cell.name,
-            })
-            element_counter += 1
+    top_cells = list(lib.top_level()) or list(lib.cells)
+    for cell in top_cells:
+        polygons = cell.get_polygons(apply_repetitions=True, include_paths=True, depth=None)
+        for poly in polygons:
+            _handle_polygon(poly, cell.name)
 
     if element_counter == 0:
+        if marker_layer_tuple is not None:
+            return None, [], None, marker_polygons
         return None, [], None
+    if marker_layer_tuple is not None:
+        return spatial_index, indexed_elements, _safe_bbox_tuple(spatial_index.bounds), marker_polygons
     return spatial_index, indexed_elements, _safe_bbox_tuple(spatial_index.bounds)
 
 
@@ -856,187 +871,68 @@ def _approx_clip_local_elements_to_bbox(element_ids, indexed_elements, bbox, cen
     return polygons
 
 
-def _select_candidate_element_ids(indexed_elements, bin_size_um, window_size_um=None):
-    """按空间粗分桶为中心点挑选代表元素，优先保留更适合局部窗口的几何。"""
-    if not indexed_elements:
-        return []
+def _select_marker_candidate_centers(marker_polygons, spatial_index, indexed_elements, window_size_um,
+                                     marker_layer=None, enable_clip_shifting=True,
+                                     clip_shift_directions=("left", "right", "up", "down"),
+                                     clip_shift_neighbor_limit=128,
+                                     clip_shift_boundary_tolerance_um=0.02):
+    candidates = []
+    skipped_invalid = 0
+    shifted_seed_count = 0
+    marker_layer_text = None
+    if marker_layer is not None:
+        marker_layer_text = f"{int(marker_layer[0])}/{int(marker_layer[1])}"
 
-    step = max(float(bin_size_um), 1e-6)
-    target_span = max(float(window_size_um) if window_size_um is not None else step, 1e-6)
-    bin_map = {}
-    for elem_id, item in enumerate(indexed_elements):
-        cx, cy = _bbox_center(item["bbox"])
-        key = (int(math.floor(cx / step)), int(math.floor(cy / step)))
-        bbox = item["bbox"]
-        width = max(0.0, float(bbox[2] - bbox[0]))
-        height = max(0.0, float(bbox[3] - bbox[1]))
-        area = width * height
-        max_span = max(width, height)
-        min_span = min(width, height)
-        oversize = max(0.0, max_span - target_span)
-        fit_delta = abs(max_span - target_span * 0.5)
-        compactness = min_span / max(max_span, 1e-6)
-        score = (
-            -oversize,
-            -fit_delta,
-            compactness,
-            area,
-            -elem_id,
-        )
-        current = bin_map.get(key)
-        if current is None or score > current[0]:
-            bin_map[key] = (score, elem_id)
+    for marker_idx, marker in enumerate(marker_polygons or []):
+        marker_bbox = _geometry_bbox(marker)
+        if marker_bbox is None:
+            skipped_invalid += 1
+            continue
+        marker_center = _bbox_center(marker_bbox)
 
-    selected = sorted(v[1] for v in bin_map.values())
-    return selected
-
-
-def _bbox_gap_distance(bbox_a, bbox_b):
-    dx = max(float(bbox_a[0]) - float(bbox_b[2]), float(bbox_b[0]) - float(bbox_a[2]), 0.0)
-    dy = max(float(bbox_a[1]) - float(bbox_b[3]), float(bbox_b[1]) - float(bbox_a[3]), 0.0)
-    return float(math.hypot(dx, dy))
-
-
-def _generate_relation_seed_specs(seed_ids, indexed_elements, spatial_index,
-                                  window_size_um, gap_threshold_um=0.08,
-                                  relation_seed_ratio=0.2):
-    if not seed_ids:
-        return []
-
-    budget = int(math.ceil(len(seed_ids) * max(0.0, float(relation_seed_ratio)) * 0.5))
-    if budget <= 0:
-        return []
-
-    scan_side = max(float(window_size_um) * 2.0, float(gap_threshold_um) * 8.0, 1e-6)
-    pair_records = []
-    seen_pairs = set()
-
-    for elem_id in seed_ids:
-        seed_bbox = indexed_elements[elem_id]["bbox"]
-        seed_center = _bbox_center(seed_bbox)
-        scan_bbox = _make_centered_bbox(seed_center, scan_side, scan_side)
-        neighbor_ids = _select_relevant_element_ids(
-            spatial_index,
-            indexed_elements,
-            scan_bbox,
-            center_xy=seed_center,
-            max_elements=24,
-        )
-        best_record = None
-        best_pair_key = None
-        for nid in neighbor_ids:
-            if nid == elem_id:
-                continue
-            pair_key = tuple(sorted((int(elem_id), int(nid))))
-            if pair_key in seen_pairs:
-                continue
-            neighbor_bbox = indexed_elements[nid]["bbox"]
-            gap = _bbox_gap_distance(seed_bbox, neighbor_bbox)
-            if gap > float(gap_threshold_um):
-                continue
-            other_center = _bbox_center(neighbor_bbox)
-            center_dist = math.hypot(seed_center[0] - other_center[0], seed_center[1] - other_center[1])
-            union_bbox = (
-                min(float(seed_bbox[0]), float(neighbor_bbox[0])),
-                min(float(seed_bbox[1]), float(neighbor_bbox[1])),
-                max(float(seed_bbox[2]), float(neighbor_bbox[2])),
-                max(float(seed_bbox[3]), float(neighbor_bbox[3])),
+        if enable_clip_shifting:
+            candidate = _compute_shifted_center_for_seed(
+                spatial_index,
+                indexed_elements,
+                None,
+                window_size_um=window_size_um,
+                shift_directions=clip_shift_directions,
+                neighbor_limit=clip_shift_neighbor_limit,
+                boundary_tolerance_um=clip_shift_boundary_tolerance_um,
+                seed_center_override=marker_center,
+                seed_bbox_override=marker_bbox,
             )
-            midpoint = ((seed_center[0] + other_center[0]) * 0.5, (seed_center[1] + other_center[1]) * 0.5)
-            score = (-(gap), -(center_dist), -pair_key[1])
-            record = {
-                "elem_id": int(elem_id),
-                "seed_center": (float(midpoint[0]), float(midpoint[1])),
-                "seed_bbox": union_bbox,
-                "score": score,
-            }
-            if best_record is None or record["score"] > best_record["score"]:
-                best_record = record
-                best_pair_key = pair_key
-        if best_record is not None:
-            seen_pairs.add(best_pair_key)
-            pair_records.append(best_record)
-
-    pair_records.sort(key=lambda item: item["score"], reverse=True)
-    return pair_records[:budget]
-
-
-def _generate_hotspot_seed_specs(seed_ids, indexed_elements, window_size_um,
-                                 relation_seed_ratio=0.2):
-    if not seed_ids:
-        return []
-
-    budget = int(math.ceil(len(seed_ids) * max(0.0, float(relation_seed_ratio)) * 0.5))
-    if budget <= 0:
-        return []
-
-    hotspot_records = []
-    for elem_id in seed_ids:
-        bbox = indexed_elements[elem_id]["bbox"]
-        cx, cy = _bbox_center(bbox)
-        width = max(0.0, float(bbox[2] - bbox[0]))
-        height = max(0.0, float(bbox[3] - bbox[1]))
-        max_span = max(width, height)
-        min_span = min(width, height)
-        if max_span <= max(float(window_size_um) * 0.4, 1e-6):
-            continue
-
-        aspect_ratio = max_span / max(min_span, 1e-6)
-        hotspot_points = []
-        if aspect_ratio >= 3.0:
-            if width >= height:
-                hotspot_points = [(float(bbox[0]), cy), (float(bbox[2]), cy)]
-            else:
-                hotspot_points = [(cx, float(bbox[1])), (cx, float(bbox[3]))]
         else:
-            hotspot_points = [
-                (float(bbox[0]), float(bbox[1])),
-                (float(bbox[0]), float(bbox[3])),
-                (float(bbox[2]), float(bbox[1])),
-                (float(bbox[2]), float(bbox[3])),
-            ]
+            candidate = {
+                "elem_id": int(marker_idx),
+                "seed_center": (float(marker_center[0]), float(marker_center[1])),
+                "center": (float(marker_center[0]), float(marker_center[1])),
+                "center_shift": (0.0, 0.0),
+            }
 
-        score = (aspect_ratio, max_span / max(float(window_size_um), 1e-6), -int(elem_id))
-        for hotspot_center in hotspot_points[:2 if aspect_ratio >= 3.0 else 4]:
-            hotspot_records.append({
-                "elem_id": int(elem_id),
-                "seed_center": (float(hotspot_center[0]), float(hotspot_center[1])),
-                "seed_bbox": bbox,
-                "score": score,
-            })
+        candidate["elem_id"] = int(marker_idx)
+        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9:
+            shifted_seed_count += 1
+        candidate["seed_kind"] = "marker"
+        candidate["marker_id"] = f"marker_{int(marker_idx):06d}"
+        candidate["marker_bbox"] = tuple(float(v) for v in marker_bbox)
+        candidate["marker_center"] = (float(marker_center[0]), float(marker_center[1]))
+        if marker_layer_text is not None:
+            candidate["marker_layer"] = marker_layer_text
+        candidates.append(candidate)
 
-    hotspot_records.sort(key=lambda item: item["score"], reverse=True)
-    selected = []
-    seen_keys = set()
-    quant = max(float(window_size_um) * 0.05, 1e-6)
-    for record in hotspot_records:
-        key = (
-            int(round(record["seed_center"][0] / quant)),
-            int(round(record["seed_center"][1] / quant)),
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        selected.append(record)
-        if len(selected) >= budget:
-            break
-    return selected
-
-
-def _dedup_candidate_entries(candidate_entries, quant_step_um=0.01):
-    if not candidate_entries:
-        return []
-    deduped = []
-    seen = set()
-    q = max(float(quant_step_um), 1e-6)
-    for candidate in candidate_entries:
-        center = candidate["center"]
-        key = (int(round(center[0] / q)), int(round(center[1] / q)))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(candidate)
-    return deduped
+    return candidates, {
+        "initial_seed_count": int(len(marker_polygons or [])),
+        "marker_count": int(len(marker_polygons or [])),
+        "marker_candidate_count": int(len(candidates)),
+        "marker_skipped_invalid_count": int(skipped_invalid),
+        "marker_layer": marker_layer_text,
+        "shifted_seed_count": int(shifted_seed_count),
+        "clip_shifting_enabled": bool(enable_clip_shifting),
+        "clip_shift_directions": list(_normalize_shift_directions(clip_shift_directions)),
+        "clip_shift_neighbor_limit": int(clip_shift_neighbor_limit),
+        "clip_shift_boundary_tolerance_um": float(clip_shift_boundary_tolerance_um),
+    }
 
 
 def _normalize_shift_directions(shift_directions):
@@ -1158,8 +1054,13 @@ def _compute_shifted_center_for_seed(spatial_index, indexed_elements, elem_id,
                                      max_shift_values_per_axis=12,
                                      seed_center_override=None,
                                      seed_bbox_override=None):
-    seed_item = indexed_elements[elem_id]
-    seed_bbox = seed_bbox_override if seed_bbox_override is not None else seed_item["bbox"]
+    if elem_id is None:
+        if seed_center_override is None or seed_bbox_override is None:
+            raise ValueError("marker clip shifting requires seed center and bbox")
+        seed_bbox = seed_bbox_override
+    else:
+        seed_item = indexed_elements[elem_id]
+        seed_bbox = seed_bbox_override if seed_bbox_override is not None else seed_item["bbox"]
     seed_center = tuple(float(v) for v in (
         seed_center_override if seed_center_override is not None else _bbox_center(seed_bbox)
     ))
@@ -1222,155 +1123,10 @@ def _compute_shifted_center_for_seed(spatial_index, indexed_elements, elem_id,
 
     shifted_center = (float(seed_center[0] + best_dx), float(seed_center[1] + best_dy))
     return {
-        "elem_id": int(elem_id),
+        "elem_id": -1 if elem_id is None else int(elem_id),
         "seed_center": (float(seed_center[0]), float(seed_center[1])),
         "center": shifted_center,
         "center_shift": (float(best_dx), float(best_dy)),
-    }
-
-
-def _select_candidate_centers(indexed_elements, spatial_index, window_size_um,
-                              candidate_bin_size_um=None,
-                              relation_seed_ratio=0.2,
-                              relation_gap_threshold_um=0.08,
-                              enable_clip_shifting=True,
-                              clip_shift_directions=("left", "right", "up", "down"),
-                              clip_shift_neighbor_limit=128,
-                              clip_shift_boundary_tolerance_um=0.02):
-    outer_candidate_bin = float(candidate_bin_size_um) if candidate_bin_size_um is not None else max(float(window_size_um) * 2.0, 10.0, 1e-6)
-    element_seed_ids = _select_candidate_element_ids(
-        indexed_elements,
-        outer_candidate_bin,
-        window_size_um=window_size_um,
-    )
-    relation_seed_specs = _generate_relation_seed_specs(
-        element_seed_ids,
-        indexed_elements,
-        spatial_index,
-        window_size_um=window_size_um,
-        gap_threshold_um=relation_gap_threshold_um,
-        relation_seed_ratio=relation_seed_ratio,
-    )
-    hotspot_seed_specs = _generate_hotspot_seed_specs(
-        element_seed_ids,
-        indexed_elements,
-        window_size_um=window_size_um,
-        relation_seed_ratio=relation_seed_ratio,
-    )
-
-    if not enable_clip_shifting:
-        candidates = [
-            {
-                "elem_id": int(elem_id),
-                "seed_center": _bbox_center(indexed_elements[elem_id]["bbox"]),
-                "center": _bbox_center(indexed_elements[elem_id]["bbox"]),
-                "center_shift": (0.0, 0.0),
-                "seed_kind": "element",
-            }
-            for elem_id in element_seed_ids
-        ]
-        for spec in relation_seed_specs:
-            center = tuple(float(v) for v in spec["seed_center"])
-            candidates.append({
-                "elem_id": int(spec["elem_id"]),
-                "seed_center": center,
-                "center": center,
-                "center_shift": (0.0, 0.0),
-                "seed_kind": "relation",
-            })
-        for spec in hotspot_seed_specs:
-            center = tuple(float(v) for v in spec["seed_center"])
-            candidates.append({
-                "elem_id": int(spec["elem_id"]),
-                "seed_center": center,
-                "center": center,
-                "center_shift": (0.0, 0.0),
-                "seed_kind": "hotspot",
-            })
-        candidates = _dedup_candidate_entries(candidates, quant_step_um=max(outer_candidate_bin * 0.02, 0.01))
-        return candidates, {
-            "initial_seed_count": int(len(candidates)),
-            "element_seed_count": int(len(element_seed_ids)),
-            "relation_seed_count": int(len(relation_seed_specs)),
-            "hotspot_seed_count": int(len(hotspot_seed_specs)),
-            "relation_seed_ratio": float(relation_seed_ratio),
-            "relation_gap_threshold_um": float(relation_gap_threshold_um),
-            "shifted_seed_count": 0,
-            "candidate_bin_size_um": float(outer_candidate_bin),
-            "clip_shifting_enabled": False,
-        }
-
-    candidates = []
-    shifted_seed_count = 0
-    for elem_id in element_seed_ids:
-        candidate = _compute_shifted_center_for_seed(
-            spatial_index,
-            indexed_elements,
-            elem_id,
-            window_size_um=window_size_um,
-            shift_directions=clip_shift_directions,
-            neighbor_limit=clip_shift_neighbor_limit,
-            boundary_tolerance_um=clip_shift_boundary_tolerance_um,
-        )
-        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9:
-            shifted_seed_count += 1
-        candidate["seed_kind"] = "element"
-        candidates.append(candidate)
-
-    for spec in relation_seed_specs:
-        candidate = _compute_shifted_center_for_seed(
-            spatial_index,
-            indexed_elements,
-            spec["elem_id"],
-            window_size_um=window_size_um,
-            shift_directions=clip_shift_directions,
-            neighbor_limit=clip_shift_neighbor_limit,
-            boundary_tolerance_um=clip_shift_boundary_tolerance_um,
-            seed_center_override=spec["seed_center"],
-            seed_bbox_override=spec.get("seed_bbox"),
-        )
-        candidate["seed_kind"] = "relation"
-        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9:
-            shifted_seed_count += 1
-        candidates.append(candidate)
-
-    for spec in hotspot_seed_specs:
-        candidate = _compute_shifted_center_for_seed(
-            spatial_index,
-            indexed_elements,
-            spec["elem_id"],
-            window_size_um=window_size_um,
-            shift_directions=clip_shift_directions,
-            neighbor_limit=clip_shift_neighbor_limit,
-            boundary_tolerance_um=clip_shift_boundary_tolerance_um,
-            seed_center_override=spec["seed_center"],
-            seed_bbox_override=spec.get("seed_bbox"),
-        )
-        candidate["seed_kind"] = "hotspot"
-        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9:
-            shifted_seed_count += 1
-        candidates.append(candidate)
-
-    candidates = _dedup_candidate_entries(candidates, quant_step_um=max(outer_candidate_bin * 0.02, 0.01))
-    dedup_shifted_seed_count = sum(
-        1
-        for candidate in candidates
-        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9
-    )
-
-    return candidates, {
-        "initial_seed_count": int(len(candidates)),
-        "element_seed_count": int(len(element_seed_ids)),
-        "relation_seed_count": int(len(relation_seed_specs)),
-        "hotspot_seed_count": int(len(hotspot_seed_specs)),
-        "relation_seed_ratio": float(relation_seed_ratio),
-        "relation_gap_threshold_um": float(relation_gap_threshold_um),
-        "shifted_seed_count": int(dedup_shifted_seed_count),
-        "candidate_bin_size_um": float(outer_candidate_bin),
-        "clip_shifting_enabled": True,
-        "clip_shift_directions": list(_normalize_shift_directions(clip_shift_directions)),
-        "clip_shift_neighbor_limit": int(clip_shift_neighbor_limit),
-        "clip_shift_boundary_tolerance_um": float(clip_shift_boundary_tolerance_um),
     }
 
 
@@ -1496,7 +1252,7 @@ def _build_shift_candidate_record(origin_idx, origin_record, center, indexed_ele
     signature = _window_signature(outer_polygons, outer_bbox, n_bins=max(4, int(signature_bins)))
     seed_center = origin_record["sample"].seed_center or origin_record["sample"].center
 
-    return {
+    candidate_record = {
         "origin_idx": int(origin_idx),
         "center": center,
         "seed_center": (float(seed_center[0]), float(seed_center[1])),
@@ -1521,6 +1277,10 @@ def _build_shift_candidate_record(origin_idx, origin_record, center, indexed_ele
         ),
         "seed_kind_votes": _normalize_seed_kind_votes(origin_record.get("seed_kind_votes")),
     }
+    for key in ("marker_id", "marker_layer", "marker_center", "marker_bbox"):
+        if key in origin_record:
+            candidate_record[key] = origin_record[key]
+    return candidate_record
 
 
 def _generate_pattern_shift_candidates_for_record(origin_idx, origin_record, spatial_index, indexed_elements,
@@ -1549,6 +1309,9 @@ def _generate_pattern_shift_candidates_for_record(origin_idx, origin_record, spa
         "generated_by_shift": False,
         "shift_distance_um": 0.0,
     }
+    for key in ("marker_id", "marker_layer", "marker_center", "marker_bbox"):
+        if key in origin_record:
+            base_candidate[key] = origin_record[key]
 
     raw_ids = list(base_sample.raw_instance_ids)
     if not raw_ids:
@@ -1660,10 +1423,6 @@ def _candidate_matches_window_record(candidate, target_record, signature_floor=0
     inv_dist = _invariant_relative_distance(candidate["invariants"], target_record["invariants"])
     if inv_dist > float(invariant_dist_limit):
         return False
-
-    if candidate.get("generated_by_shift", False):
-        xor_ratio = _window_xor_ratio(candidate, target_record)
-        return bool(xor_ratio <= max(0.0, 1.0 - float(area_match_ratio)))
 
     sig_sim = _cosine_similarity_1d(candidate["signature"], target_record["signature"])
     if sig_sim < float(signature_floor):
@@ -1850,6 +1609,10 @@ def _compress_window_records_with_shift_cover(window_records, spatial_index, ind
                 covered_window_ids=covered_window_ids,
                 origin_window_id=str(origin_record["sample"].sample_id),
                 seed_kind_votes=merged_seed_kind_votes,
+                marker_id=candidate.get("marker_id"),
+                marker_layer=candidate.get("marker_layer"),
+                marker_center=candidate.get("marker_center"),
+                marker_bbox=candidate.get("marker_bbox"),
             )
         )
 
@@ -1915,6 +1678,10 @@ def _build_candidate_window_record(candidate, spatial_index, indexed_elements, *
         raw_instance_centers=[(float(center[0]), float(center[1]))],
         seed_kind=seed_kind,
     )
+    marker_meta = {}
+    for key in ("marker_id", "marker_layer", "marker_center", "marker_bbox"):
+        if key in candidate:
+            marker_meta[key] = candidate[key]
     return _build_window_record(
         sample,
         outer_polygons,
@@ -1924,6 +1691,7 @@ def _build_candidate_window_record(candidate, spatial_index, indexed_elements, *
         invariant_key,
         stable_bucket_key=dedup_bucket_key,
         seed_kind_votes=_seed_kind_vote_counter(seed_kind),
+        **marker_meta,
     )
 
 
@@ -2081,6 +1849,10 @@ def _materialize_window_samples(window_records):
         sample_lib.add(sample_cell)
 
         sample_info = sample.to_dict()
+        for key in ("marker_id", "marker_layer", "marker_center", "marker_bbox"):
+            value = record.get(key)
+            if value is not None:
+                sample_info[key] = list(value) if isinstance(value, tuple) else value
         compression_trace = {}
         if "generated_by_pattern_shift" in record:
             compression_trace["generated_by_pattern_shift"] = bool(record.get("generated_by_pattern_shift", False))
@@ -2108,28 +1880,25 @@ def _materialize_window_samples(window_records):
 def _build_window_generation_metadata(indexed_elements, center_meta, *,
                                       total_candidates, unique_window_count,
                                       exact_hash_merged, similar_window_merged,
-                                      dedup_bucket_count, candidate_bin_size_um,
-                                      window_size_um, context_width_um,
+                                      dedup_bucket_count, window_size_um, context_width_um,
                                       max_elements_per_window, hash_precision_nm,
                                       enable_clip_shifting, shifted_seed_count):
     return {
         "original_element_count": int(len(indexed_elements)),
         "raw_center_count": int(total_candidates),
+        "initial_seed_count": int(center_meta.get("initial_seed_count", total_candidates)),
         "unique_window_count": int(unique_window_count),
         "compression_ratio": float(unique_window_count) / float(max(1, total_candidates)),
-        "candidate_bin_size_um": float(center_meta.get(
-            "candidate_bin_size_um",
-            candidate_bin_size_um if candidate_bin_size_um is not None else max((window_size_um + 2.0 * context_width_um) * 2.0, 10.0, 1e-6),
-        )),
+        "marker_layer": center_meta.get("marker_layer"),
+        "marker_count": int(center_meta.get("marker_count", total_candidates)),
+        "marker_candidate_count": int(center_meta.get("marker_candidate_count", total_candidates)),
+        "marker_skipped_invalid_count": int(center_meta.get("marker_skipped_invalid_count", 0)),
         "max_elements_per_window": int(max_elements_per_window),
         "window_size_um": float(window_size_um),
         "context_width_um": float(context_width_um),
         "hash_precision_nm": float(hash_precision_nm),
         "clip_shifting_enabled": bool(center_meta.get("clip_shifting_enabled", enable_clip_shifting)),
         "shifted_seed_count": int(shifted_seed_count),
-        "element_seed_count": int(center_meta.get("element_seed_count", total_candidates)),
-        "relation_seed_count": int(center_meta.get("relation_seed_count", 0)),
-        "hotspot_seed_count": int(center_meta.get("hotspot_seed_count", 0)),
         "dedup_bucket_count": int(dedup_bucket_count),
         "exact_hash_merged": int(exact_hash_merged),
         "similar_window_merged": int(similar_window_merged),
@@ -2146,9 +1915,7 @@ def generate_layout_window_samples(
         signature_bins=12,
         coarse_dedup_quant_um=0.02,
         enable_coarse_prefilter=True,
-        candidate_bin_size_um=None,
-        relation_seed_ratio=0.2,
-        relation_gap_threshold_um=0.08,
+        marker_layer=None,
         max_elements_per_window=256,
         enable_clip_shifting=True,
         clip_shift_directions=("left", "right", "up", "down"),
@@ -2157,7 +1924,7 @@ def generate_layout_window_samples(
         return_metadata=False,
         source_name="layout"):
     """
-    基于元素中心生成候选窗口，并使用增强顶点哈希+几何不变量去重。
+    基于 marker 层生成候选窗口，并使用增强顶点哈希+几何不变量去重。
 
     每个样本保留外扩窗口(中心矩形 + 一圈上下文)的几何；特征提取时再拆分内圈/外圈。
 
@@ -2167,42 +1934,49 @@ def generate_layout_window_samples(
     3. 真正判定是否合并时，仍然同时检查增强哈希 / 几何不变量距离 / 签名相似度。
 
     clip shifting 合入方式：
-    1. 先按空间分桶挑选候选 seed。
-    2. 再对每个 seed 做局部边界对齐式微调，得到最终中心。
+    1. 先用 marker bbox center 作为候选 seed。
+    2. 再对每个 marker seed 做局部边界对齐式微调，得到最终中心。
     3. 只有当 shift 确实改善了窗口边界与局部几何边界的贴合时，才接受平移。
 
     性能说明：
-    1. 候选中心不会直接取所有几何元素，而是先按空间分桶挑代表中心。
-    2. 对每个代表中心，按 clip shifting 思路在允许范围内做边界对齐式平移，选出更优中心。
+    1. marker 图形只作为窗口 seed，不进入 pattern 几何索引。
+    2. 对每个 marker 中心，按 clip shifting 思路在允许范围内做边界对齐式平移，选出更优中心。
     3. 在精确窗口去重前，先使用邻域相对 bbox 的轻量描述符做预去重。
     4. 每个窗口只保留最多 max_elements_per_window 个最相关局部几何。
-
-    这三步都是为了让大版图样本在工程上可跑通；如果希望更接近原始全量几何，
-    可以放宽 candidate_bin_size_um / max_elements_per_window，代价是耗时显著增加。
     """
-    spatial_index, indexed_elements, layout_bbox = _build_layout_spatial_index(lib)
+    if marker_layer is None:
+        raise ValueError("marker-driven split-layout requires --marker-layer <layer>/<datatype>")
+    marker_layer_tuple = _parse_layer_spec(marker_layer) if isinstance(marker_layer, str) else tuple(marker_layer)
+
+    spatial_index, indexed_elements, layout_bbox, marker_polygons = _build_layout_spatial_index(
+        lib,
+        marker_layer=marker_layer_tuple,
+    )
+    if not marker_polygons:
+        raise ValueError(f"No marker polygons found on marker layer {marker_layer_tuple[0]}/{marker_layer_tuple[1]}")
     if spatial_index is None or not indexed_elements:
-        print("警告: 版图中没有找到有效的polygon/path，无法生成中心窗口样本")
-        return ([], [], {}) if return_metadata else ([], [])
+        raise ValueError("No pattern polygons found outside the marker layer; cannot build marker-driven windows")
 
     quant_step_um = max(1e-6, float(hash_precision_nm) * 1e-3)
-    candidate_entries, center_meta = _select_candidate_centers(
-        indexed_elements,
+    candidate_entries, center_meta = _select_marker_candidate_centers(
+        marker_polygons,
         spatial_index,
+        indexed_elements,
         window_size_um=window_size_um,
-        candidate_bin_size_um=candidate_bin_size_um,
-        relation_seed_ratio=relation_seed_ratio,
-        relation_gap_threshold_um=relation_gap_threshold_um,
+        marker_layer=marker_layer_tuple,
         enable_clip_shifting=enable_clip_shifting,
         clip_shift_directions=clip_shift_directions,
         clip_shift_neighbor_limit=clip_shift_neighbor_limit,
         clip_shift_boundary_tolerance_um=clip_shift_boundary_tolerance_um,
     )
     total_candidates = len(candidate_entries)
-    processed = 0
+    if total_candidates <= 0:
+        raise ValueError(
+            f"No valid marker candidates found on marker layer {marker_layer_tuple[0]}/{marker_layer_tuple[1]}"
+        )
     print(
-        f"开始基于几何中心生成窗口样本，原始元素数: {len(indexed_elements)}, "
-        f"候选中心数: {total_candidates}"
+        f"开始基于 marker 层生成窗口样本，pattern 元素数: {len(indexed_elements)}, "
+        f"marker 数: {len(marker_polygons)}, 候选中心数: {total_candidates}"
     )
     raw_records, build_stats = _build_initial_window_records(
         candidate_entries,
@@ -2246,7 +2020,6 @@ def generate_layout_window_samples(
         exact_hash_merged=dedup_stats["exact_hash_merged"],
         similar_window_merged=dedup_stats["similar_window_merged"],
         dedup_bucket_count=dedup_stats["dedup_bucket_count"],
-        candidate_bin_size_um=candidate_bin_size_um,
         window_size_um=window_size_um,
         context_width_um=context_width_um,
         max_elements_per_window=max_elements_per_window,
@@ -3304,9 +3077,7 @@ class LayoutClusteringPipeline:
         self.window_signature_bins = self._cfg_int('window_signature_bins', 20, minimum=1)
         self.enable_coarse_prefilter = self._cfg_bool('enable_coarse_prefilter', True)
         self.coarse_prefilter_quant_um = self._cfg_float('coarse_prefilter_quant_um', 0.02, minimum=0.0)
-        self.candidate_bin_size_um = self._cfg('candidate_bin_size_um', None)
-        self.relation_seed_ratio = self._cfg_float('relation_seed_ratio', 0.2, minimum=0.0)
-        self.relation_gap_threshold_um = self._cfg_float('relation_gap_threshold_um', 0.08, minimum=0.0)
+        self.marker_layer = self._cfg('marker_layer', None)
         self.max_elements_per_window = self._cfg_int('max_elements_per_window', 256, minimum=1)
         self.enable_clip_shifting = self._cfg_bool('enable_clip_shifting', True)
         self.clip_shift_directions = self._cfg('clip_shift_directions', "left,right,up,down")
@@ -3410,9 +3181,7 @@ class LayoutClusteringPipeline:
             signature_bins=self.window_signature_bins,
             coarse_dedup_quant_um=self.coarse_prefilter_quant_um,
             enable_coarse_prefilter=self.enable_coarse_prefilter,
-            candidate_bin_size_um=self.candidate_bin_size_um,
-            relation_seed_ratio=self.relation_seed_ratio,
-            relation_gap_threshold_um=self.relation_gap_threshold_um,
+            marker_layer=self.marker_layer,
             max_elements_per_window=self.max_elements_per_window,
             enable_clip_shifting=self.enable_clip_shifting,
             clip_shift_directions=self.clip_shift_directions,
@@ -3442,25 +3211,26 @@ class LayoutClusteringPipeline:
                                dedup_meta_template: Dict[str, Any],
                                dedup_stats: Dict[str, int]) -> None:
         for key in (
-                'candidate_bin_size_um',
                 'max_elements_per_window',
                 'window_size_um',
                 'context_width_um',
                 'hash_precision_nm',
                 'clip_shifting_enabled',
+                'marker_layer',
         ):
             if key in split_meta and key not in dedup_meta_template:
                 dedup_meta_template[key] = split_meta[key]
         for key in (
                 'raw_center_count',
+                'initial_seed_count',
                 'unique_window_count',
                 'exact_hash_merged',
                 'similar_window_merged',
                 'original_element_count',
                 'shifted_seed_count',
-                'element_seed_count',
-                'relation_seed_count',
-                'hotspot_seed_count',
+                'marker_count',
+                'marker_candidate_count',
+                'marker_skipped_invalid_count',
                 'dedup_bucket_count',
         ):
             dedup_stats[key] += int(split_meta.get(key, 0))
@@ -3472,11 +3242,13 @@ class LayoutClusteringPipeline:
         if not split_large_layout:
             self._append_direct_file(filepath, temp_dir, processed_files, processed_infos, weights)
             return
+        if not self.marker_layer:
+            raise ValueError("--split-layout requires --marker-layer <layer>/<datatype>")
 
         try:
             is_large, width, height = check_if_large_layout(filepath)
             if is_large:
-                print(f"检测到大版图 ({width:.2f} x {height:.2f} um)，开始基于中心窗口采样...")
+                print(f"检测到大版图 ({width:.2f} x {height:.2f} um)，开始基于 marker 窗口采样...")
                 split_meta = self._append_window_files(
                     filepath,
                     temp_dir,
@@ -3490,6 +3262,7 @@ class LayoutClusteringPipeline:
             print(f"文件不是大版图 ({width:.2f} x {height:.2f} um)，按原始文件处理")
         except Exception as e:
             print(f"中心窗口采样失败: {e}")
+            raise
 
         self._append_direct_file(filepath, temp_dir, processed_files, processed_infos, weights)
 
@@ -3497,14 +3270,11 @@ class LayoutClusteringPipeline:
                                   dedup_stats: Dict[str, int]) -> Dict[str, Any]:
         return {
             'raw_center_count': int(dedup_stats['raw_center_count']),
+            'initial_seed_count': int(dedup_stats.get('initial_seed_count', dedup_stats['raw_center_count'])),
             'unique_window_count': int(dedup_stats['unique_window_count']),
             'compression_ratio': float(dedup_stats['unique_window_count']) / float(max(1, dedup_stats['raw_center_count'])),
             'exact_hash_merged': int(dedup_stats['exact_hash_merged']),
             'similar_window_merged': int(dedup_stats['similar_window_merged']),
-            'candidate_bin_size_um': dedup_meta_template.get(
-                'candidate_bin_size_um',
-                None if self.candidate_bin_size_um is None else float(self.candidate_bin_size_um)
-            ),
             'max_elements_per_window': int(dedup_meta_template.get('max_elements_per_window', self.max_elements_per_window)),
             'window_size_um': float(dedup_meta_template.get('window_size_um', self.clip_size_um)),
             'context_width_um': float(dedup_meta_template.get('context_width_um', self.context_width_um)),
@@ -3512,9 +3282,10 @@ class LayoutClusteringPipeline:
             'hash_precision_nm': float(dedup_meta_template.get('hash_precision_nm', self.hash_precision_nm)),
             'clip_shifting_enabled': bool(dedup_meta_template.get('clip_shifting_enabled', self.enable_clip_shifting)),
             'shifted_seed_count': int(dedup_stats.get('shifted_seed_count', 0)),
-            'element_seed_count': int(dedup_stats.get('element_seed_count', dedup_stats['raw_center_count'])),
-            'relation_seed_count': int(dedup_stats.get('relation_seed_count', 0)),
-            'hotspot_seed_count': int(dedup_stats.get('hotspot_seed_count', 0)),
+            'marker_layer': dedup_meta_template.get('marker_layer', self.marker_layer),
+            'marker_count': int(dedup_stats.get('marker_count', 0)),
+            'marker_candidate_count': int(dedup_stats.get('marker_candidate_count', 0)),
+            'marker_skipped_invalid_count': int(dedup_stats.get('marker_skipped_invalid_count', 0)),
             'dedup_bucket_count': int(dedup_stats.get('dedup_bucket_count', 0)),
         }
 
@@ -3730,14 +3501,15 @@ class LayoutClusteringPipeline:
 
         dedup_stats = {
             'raw_center_count': 0,
+            'initial_seed_count': 0,
             'unique_window_count': 0,
             'exact_hash_merged': 0,
             'similar_window_merged': 0,
             'original_element_count': 0,
             'shifted_seed_count': 0,
-            'element_seed_count': 0,
-            'relation_seed_count': 0,
-            'hotspot_seed_count': 0,
+            'marker_count': 0,
+            'marker_candidate_count': 0,
+            'marker_skipped_invalid_count': 0,
             'dedup_bucket_count': 0,
         }
         dedup_meta_template = {}
@@ -4203,13 +3975,13 @@ python layout_clustering_hdbscan.py ./input_data --output results.json
 python layout_clustering_hdbscan.py ./design.oas --output results.json
 
 3) 大版图中心窗口采样 + 聚类
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --clip-size 1.35 --context-width 0.675 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --clip-size 1.35 --context-width 0.675 --output results.json
 
 4) 调整聚类粒度
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --min-cluster-size 8 --min-samples 4 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --min-cluster-size 8 --min-samples 4 --output results.json
 
-5) 调整窗口去重与候选中心分桶
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --sample-similarity-threshold 0.97 --candidate-bin-size-um 6.0 --hash-precision-nm 5.0 --output results.json
+5) 调整窗口去重
+python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --sample-similarity-threshold 0.97 --hash-precision-nm 5.0 --output results.json
 
 6) 并行特征提取与窗口局部几何上限
 python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-elements-per-window 512 --output results.json
@@ -4217,9 +3989,9 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
 
 注意:
 - HDBSCAN版本直接对全样本特征做聚类，不构建完整NxN相似度矩阵
-- 对于大版图，优先调整 --split-layout / --clip-size / --context-width
-- 默认启用了高性能近似几何去重；如果想保留更多局部几何，可减小 --candidate-bin-size-um 或增大 --max-elements-per-window
-- 普通帮助仅展示常用参数；旧版高级参数仍可解析，用于复现实验
+- 对于大版图，--split-layout 必须配合 --marker-layer layer/datatype 使用，marker 层只用于窗口 seed
+- 默认启用了高性能近似几何去重；如果想保留更多局部几何，可增大 --max-elements-per-window
+- 普通帮助仅展示常用参数；仍生效的高级参数隐藏解析，已断开的旧 seed/bin 参数不再保留
         """
     )
     parser.add_argument("input", help="输入文件或目录路径")
@@ -4245,6 +4017,8 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
 
     # 中心窗口采样选项
     parser.add_argument("--split-layout", action="store_true", help="对大版图启用中心窗口采样")
+    parser.add_argument("--marker-layer", "--hotspot-layer", dest="marker_layer", default=None,
+                        help="marker 层，格式 layer/datatype；--split-layout 时必填，--hotspot-layer 为兼容别名")
     parser.add_argument("--clip-size", type=float, default=1.35, help="中心矩形的边长 (微米, 默认: 1.35)")
     parser.add_argument("--context-width", type=float, default=0.675,
                         help="中心矩形外围上下文宽度 (微米, 默认: 0.675)")
@@ -4263,12 +4037,6 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
     parser.add_argument("--disable-coarse-prefilter", action="store_true",
                         help=argparse.SUPPRESS)
     parser.add_argument("--coarse-prefilter-quant-um", type=float, default=0.02,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--candidate-bin-size-um", type=float, default=None,
-                        help="候选中心点空间分桶尺寸；默认自动取 max(10um, 外扩窗口边长的2倍)")
-    parser.add_argument("--relation-seed-ratio", type=float, default=0.2,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--relation-gap-threshold-um", type=float, default=0.08,
                         help=argparse.SUPPRESS)
     parser.add_argument("--max-elements-per-window", type=int, default=256,
                         help="每个窗口保留的最大局部几何元素数 (默认: 256)")
@@ -4302,6 +4070,13 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
     parser.add_argument("--hash-precision-nm", type=float, default=5.0,
                         help="增强顶点哈希量化精度（纳米，仅影响精确哈希，默认: 5.0）")
     args = parser.parse_args()
+    if args.split_layout and not args.marker_layer:
+        parser.error("--split-layout requires --marker-layer <layer>/<datatype>")
+    if args.marker_layer is not None:
+        try:
+            _parse_layer_spec(args.marker_layer)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     # 创建配置字典
     config = {
@@ -4319,9 +4094,7 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
         "window_signature_bins": args.window_signature_bins,
         "enable_coarse_prefilter": (not args.disable_coarse_prefilter),
         "coarse_prefilter_quant_um": args.coarse_prefilter_quant_um,
-        "candidate_bin_size_um": args.candidate_bin_size_um,
-        "relation_seed_ratio": args.relation_seed_ratio,
-        "relation_gap_threshold_um": args.relation_gap_threshold_um,
+        "marker_layer": args.marker_layer,
         "max_elements_per_window": args.max_elements_per_window,
         "enable_clip_shifting": (not args.disable_clip_shifting),
         "clip_shift_directions": args.clip_shift_directions,

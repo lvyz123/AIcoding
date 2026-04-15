@@ -24,6 +24,67 @@ def _points_from(polygons):
 
 
 class HDBSCANWindowGeometryRegressionTests(unittest.TestCase):
+    def test_parse_marker_layer_spec(self):
+        self.assertEqual(hdbscan_mod._parse_layer_spec("999/0"), (999, 0))
+        self.assertEqual(hdbscan_mod._parse_layer_spec(" 12 / 34 "), (12, 34))
+        with self.assertRaises(ValueError):
+            hdbscan_mod._parse_layer_spec("999")
+        with self.assertRaises(ValueError):
+            hdbscan_mod._parse_layer_spec("abc/0")
+
+    def test_marker_layer_is_excluded_from_pattern_index(self):
+        lib = gdstk.Library()
+        cell = gdstk.Cell("TOP")
+        cell.add(gdstk.rectangle((0.0, 0.0), (1.0, 1.0), layer=1, datatype=0))
+        cell.add(gdstk.rectangle((0.45, 0.45), (0.55, 0.55), layer=999, datatype=0))
+        lib.add(cell)
+
+        spatial_index, indexed_elements, layout_bbox, marker_polygons = hdbscan_mod._build_layout_spatial_index(
+            lib,
+            marker_layer=(999, 0),
+        )
+
+        self.assertIsNotNone(spatial_index)
+        self.assertEqual(len(indexed_elements), 1)
+        self.assertEqual(len(marker_polygons), 1)
+        self.assertEqual(hdbscan_mod._element_layer_datatype(indexed_elements[0]["element"]), (1, 0))
+        self.assertEqual(hdbscan_mod._element_layer_datatype(marker_polygons[0]), (999, 0))
+        self.assertEqual(layout_bbox, (0.0, 0.0, 1.0, 1.0))
+
+    def test_marker_candidate_uses_every_marker_bbox_center(self):
+        lib = gdstk.Library()
+        cell = gdstk.Cell("TOP")
+        cell.add(gdstk.rectangle((0.4, 0.4), (0.6, 0.6), layer=1, datatype=0))
+        cell.add(gdstk.rectangle((0.45, 0.45), (0.55, 0.55), layer=999, datatype=0))
+        cell.add(gdstk.rectangle((5.0, 5.0), (5.1, 5.1), layer=999, datatype=0))
+        lib.add(cell)
+
+        spatial_index, indexed_elements, _, marker_polygons = hdbscan_mod._build_layout_spatial_index(
+            lib,
+            marker_layer=(999, 0),
+        )
+        candidates, meta = hdbscan_mod._select_marker_candidate_centers(
+            marker_polygons,
+            spatial_index,
+            indexed_elements,
+            window_size_um=0.5,
+            marker_layer=(999, 0),
+            enable_clip_shifting=False,
+        )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(meta["marker_count"], 2)
+        self.assertEqual(meta["marker_candidate_count"], 2)
+        self.assertEqual(meta["marker_skipped_invalid_count"], 0)
+        self.assertEqual(candidates[0]["seed_kind"], "marker")
+        self.assertEqual(candidates[0]["marker_layer"], "999/0")
+        self.assertEqual(candidates[0]["seed_center"], (0.5, 0.5))
+        self.assertEqual(candidates[0]["center"], (0.5, 0.5))
+        self.assertAlmostEqual(candidates[1]["seed_center"][0], 5.05)
+        self.assertAlmostEqual(candidates[1]["seed_center"][1], 5.05)
+        self.assertAlmostEqual(candidates[1]["center"][0], 5.05)
+        self.assertAlmostEqual(candidates[1]["center"][1], 5.05)
+
     def test_window_xor_ratio_matches_translated_local_patterns(self):
         polygons_a = [gdstk.rectangle((10.0, 10.0), (11.0, 11.0), layer=1, datatype=0)]
         polygons_b = [gdstk.rectangle((20.0, 20.0), (21.0, 21.0), layer=1, datatype=0)]
@@ -220,6 +281,33 @@ class HDBSCANWindowGeometryRegressionTests(unittest.TestCase):
         self.assertEqual(merged_sample.duplicate_count, 2)
         self.assertEqual(set(merged_records[0]["covered_window_ids"]), {"origin", "target"})
         self.assertTrue(merged_records[0]["generated_by_pattern_shift"])
+
+    def test_shift_candidate_matching_uses_signature_gate_before_xor(self):
+        candidate = {
+            "pattern_hash": "candidate",
+            "invariants": np.ones(9, dtype=np.float64),
+            "signature": np.zeros(16, dtype=np.float32),
+            "generated_by_shift": True,
+            "normalized_polygons": [gdstk.rectangle((0.0, 0.0), (1.0, 1.0))],
+            "window_area": 1.0,
+        }
+        target = {
+            "pattern_hash": "target",
+            "invariants": np.ones(9, dtype=np.float64),
+            "signature": np.ones(16, dtype=np.float32),
+            "normalized_polygons": [gdstk.rectangle((0.0, 0.0), (1.0, 1.0))],
+            "window_area": 1.0,
+        }
+
+        self.assertFalse(
+            hdbscan_mod._candidate_matches_window_record(
+                candidate,
+                target,
+                signature_floor=0.5,
+                area_match_ratio=0.92,
+                invariant_dist_limit=0.12,
+            )
+        )
 
     def test_zero_signature_vectors_are_not_similarity_evidence(self):
         self.assertEqual(
