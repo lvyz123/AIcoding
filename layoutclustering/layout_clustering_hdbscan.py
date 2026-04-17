@@ -9,9 +9,9 @@
 本优化版与原始 layout_clustering.py 的主要区别：
 1. 不再用固定网格切 clip，而是先挑选若干中心点，再构造中心矩形和外围上下文窗口。
 2. 特征提取时把中心矩形内部与外围上下文分开计算，并给予不同权重。
-3. split-layout 模式使用用户指定 marker 层作为初始窗口中心来源，marker 图形只作为 seed，不参与 pattern 特征。
+3. 指定 marker 层时使用 marker 作为初始窗口中心来源，marker 图形只作为 seed，不参与 pattern 特征。
 4. 默认使用“高性能近似几何去重”而不是最重的逐窗口精确布尔裁剪。
-5. 将 clip shifting 的“边界对齐”思路合入候选中心生成阶段，并在窗口压缩阶段固定保留 shift-cover 压缩。
+5. 初始窗口固定为 marker-centered，窗口压缩阶段使用 marker-limited systematic shift-cover。
 
 为什么默认采用近似方案：
 - 在大尺寸 OAS/GDS 上，单个窗口常会与数千个原始 polygon 相交。
@@ -20,12 +20,12 @@
   从而在保留“中心窗口聚类”整体思路的同时，把流程压到可运行范围。
 
 当前 shift-cover 的接入方式：
-- 候选中心阶段只做 center micro-shift，不在候选池展开大量 shifted clip。
-- 窗口压缩阶段仍固定保留内部的 shift-cover 压缩，用于减少高度可覆盖的重复窗口。
+- 候选中心阶段严格使用 marker bbox center，不做初始中心位移。
+- 窗口压缩阶段使用 marker bbox 限定的单轴 systematic shift-cover，减少可平移覆盖的位置冗余。
 - 这样既保留 paper 的关键思想，又把运行时间控制在工程可接受范围内。
 
 当前默认性能策略：
-- split-layout 时必须指定 --marker-layer layer/datatype，marker 层不进入窗口 pattern 几何
+- 指定 --marker-layer layer/datatype 时启用 marker-driven 窗口采样，marker 层不进入窗口 pattern 几何
 - max_elements_per_window = 256
 - enable_coarse_prefilter = True
 - enable_clip_shifting = True
@@ -74,7 +74,7 @@ import hdbscan
 from sklearn.metrics.pairwise import cosine_similarity, pairwise_distances
 from sklearn.preprocessing import RobustScaler, normalize
 from sklearn.feature_selection import VarianceThreshold
-from scipy.ndimage import rotate as ndimage_rotate
+from scipy.ndimage import binary_dilation, binary_erosion, rotate as ndimage_rotate
 
 try:
     from skimage.transform import radon as skimage_radon
@@ -94,6 +94,11 @@ DEFAULT_OUTER_BLOCK_WEIGHTS = {
 DEFAULT_SEED_KIND = "element"
 DEFAULT_POSTMERGE_OUTLIER_THRESHOLD = 0.90
 MAX_INTERPRET_SIMILARITY_SAMPLES = 200
+DEFAULT_GEOMETRY_MATCH_MODE = "acc"
+DEFAULT_GEOMETRY_PIXEL_SIZE_NM = 10.0
+DEFAULT_EDGE_TOLERANCE_UM = 0.02
+DEFAULT_DEDUP_PREFILTER_INVARIANT_LIMIT = 0.06
+DEFAULT_SHIFT_PREFILTER_INVARIANT_LIMIT = 0.12
 
 
 def _ascii_safe_token(value: str, fallback: str = "layout") -> str:
@@ -297,7 +302,7 @@ class LayoutWindowSample:
 
     `center` 是最终用于提取窗口的中心；
     `seed_center` 是原始候选 seed 的中心；
-    `center_shift` 记录 clip shifting 风格的中心微调量。
+    `center_shift` 记录 shift-cover 选中窗口相对 seed 的 systematic shift。
     """
 
     sample_id: str
@@ -876,9 +881,9 @@ def _select_marker_candidate_centers(marker_polygons, spatial_index, indexed_ele
                                      clip_shift_directions=("left", "right", "up", "down"),
                                      clip_shift_neighbor_limit=128,
                                      clip_shift_boundary_tolerance_um=0.02):
+    del spatial_index, indexed_elements, window_size_um
     candidates = []
     skipped_invalid = 0
-    shifted_seed_count = 0
     marker_layer_text = None
     if marker_layer is not None:
         marker_layer_text = f"{int(marker_layer[0])}/{int(marker_layer[1])}"
@@ -889,30 +894,12 @@ def _select_marker_candidate_centers(marker_polygons, spatial_index, indexed_ele
             skipped_invalid += 1
             continue
         marker_center = _bbox_center(marker_bbox)
-
-        if enable_clip_shifting:
-            candidate = _compute_shifted_center_for_seed(
-                spatial_index,
-                indexed_elements,
-                None,
-                window_size_um=window_size_um,
-                shift_directions=clip_shift_directions,
-                neighbor_limit=clip_shift_neighbor_limit,
-                boundary_tolerance_um=clip_shift_boundary_tolerance_um,
-                seed_center_override=marker_center,
-                seed_bbox_override=marker_bbox,
-            )
-        else:
-            candidate = {
-                "elem_id": int(marker_idx),
-                "seed_center": (float(marker_center[0]), float(marker_center[1])),
-                "center": (float(marker_center[0]), float(marker_center[1])),
-                "center_shift": (0.0, 0.0),
-            }
-
-        candidate["elem_id"] = int(marker_idx)
-        if abs(candidate["center_shift"][0]) > 1e-9 or abs(candidate["center_shift"][1]) > 1e-9:
-            shifted_seed_count += 1
+        candidate = {
+            "elem_id": int(marker_idx),
+            "seed_center": (float(marker_center[0]), float(marker_center[1])),
+            "center": (float(marker_center[0]), float(marker_center[1])),
+            "center_shift": (0.0, 0.0),
+        }
         candidate["seed_kind"] = "marker"
         candidate["marker_id"] = f"marker_{int(marker_idx):06d}"
         candidate["marker_bbox"] = tuple(float(v) for v in marker_bbox)
@@ -927,7 +914,7 @@ def _select_marker_candidate_centers(marker_polygons, spatial_index, indexed_ele
         "marker_candidate_count": int(len(candidates)),
         "marker_skipped_invalid_count": int(skipped_invalid),
         "marker_layer": marker_layer_text,
-        "shifted_seed_count": int(shifted_seed_count),
+        "shifted_seed_count": 0,
         "clip_shifting_enabled": bool(enable_clip_shifting),
         "clip_shift_directions": list(_normalize_shift_directions(clip_shift_directions)),
         "clip_shift_neighbor_limit": int(clip_shift_neighbor_limit),
@@ -946,19 +933,19 @@ def _normalize_shift_directions(shift_directions):
     return tuple(valid) if valid else ("left", "right", "up", "down")
 
 
-def _axis_shift_interval(seed_bbox, seed_center, half_span, axis, shift_directions):
-    cx, cy = seed_center
+def _marker_shift_interval(marker_bbox, marker_center, axis, shift_directions):
+    cx, cy = marker_center
     dirs = set(_normalize_shift_directions(shift_directions))
     if axis == "x":
-        low = float(seed_bbox[2] - (cx + half_span))
-        high = float(seed_bbox[0] - (cx - half_span))
+        low = float(marker_bbox[0] - cx)
+        high = float(marker_bbox[2] - cx)
         if "left" not in dirs:
             low = max(low, 0.0)
         if "right" not in dirs:
             high = min(high, 0.0)
     else:
-        low = float(seed_bbox[3] - (cy + half_span))
-        high = float(seed_bbox[1] - (cy - half_span))
+        low = float(marker_bbox[1] - cy)
+        high = float(marker_bbox[3] - cy)
         if "down" not in dirs:
             low = max(low, 0.0)
         if "up" not in dirs:
@@ -989,145 +976,6 @@ def _collect_axis_shift_values(center_coord, half_span, edge_values, shift_inter
     if max_count is not None and len(ordered) > int(max_count):
         return ordered[:int(max_count)]
     return ordered
-
-
-def _score_axis_shift(center_coord, shift_value, half_span, edge_values, tolerance_um):
-    left_boundary = center_coord + shift_value - half_span
-    right_boundary = center_coord + shift_value + half_span
-    touch_count = 0
-    best_gap = float("inf")
-    for edge in edge_values:
-        gap = min(abs(edge - left_boundary), abs(edge - right_boundary))
-        if gap <= tolerance_um:
-            touch_count += 1
-        if gap < best_gap:
-            best_gap = gap
-    if not edge_values:
-        best_gap = float("inf")
-    return touch_count, -best_gap, -abs(shift_value)
-
-
-def _choose_axis_shift(center_coord, half_span, edge_values, shift_values, tolerance_um):
-    if not shift_values:
-        return 0.0
-
-    zero_score = _score_axis_shift(center_coord, 0.0, half_span, edge_values, tolerance_um)
-    best_shift = max(
-        shift_values,
-        key=lambda s: _score_axis_shift(center_coord, s, half_span, edge_values, tolerance_um),
-    )
-    best_score = _score_axis_shift(center_coord, best_shift, half_span, edge_values, tolerance_um)
-    zero_touch, zero_neg_gap, _ = zero_score
-    best_touch, best_neg_gap, _ = best_score
-    zero_gap = -zero_neg_gap
-    best_gap = -best_neg_gap
-
-    if abs(best_shift) <= 1e-9:
-        return 0.0
-    if best_touch <= 0:
-        return 0.0
-    if best_touch < zero_touch:
-        return 0.0
-    if best_touch == zero_touch and best_gap >= zero_gap - max(float(tolerance_um) * 0.5, 1e-6):
-        return 0.0
-    return float(best_shift)
-
-
-def _build_shift_anchor_bbox(seed_bbox, seed_center, window_size_um, anchor_scale=0.5):
-    """
-    为 clip shifting 构造局部 anchor bbox。
-
-    直接使用完整 seed bbox 时，若元素跨度远大于窗口尺寸，平移范围会退化为 0。
-    这里退回到 seed 中心附近的局部 marker，尽量贴近论文里 marker/clip 的关系。
-    """
-    sx = max(0.0, float(seed_bbox[2] - seed_bbox[0]))
-    sy = max(0.0, float(seed_bbox[3] - seed_bbox[1]))
-    target_span = max(float(window_size_um) * float(anchor_scale), float(window_size_um) * 0.1, 1e-6)
-    anchor_w = min(sx, target_span) if sx > 0 else target_span
-    anchor_h = min(sy, target_span) if sy > 0 else target_span
-    return _make_centered_bbox(seed_center, anchor_w, anchor_h)
-
-
-def _compute_shifted_center_for_seed(spatial_index, indexed_elements, elem_id,
-                                     window_size_um, shift_directions,
-                                     neighbor_limit=128, boundary_tolerance_um=0.02,
-                                     max_shift_values_per_axis=12,
-                                     seed_center_override=None,
-                                     seed_bbox_override=None):
-    if elem_id is None:
-        if seed_center_override is None or seed_bbox_override is None:
-            raise ValueError("marker clip shifting requires seed center and bbox")
-        seed_bbox = seed_bbox_override
-    else:
-        seed_item = indexed_elements[elem_id]
-        seed_bbox = seed_bbox_override if seed_bbox_override is not None else seed_item["bbox"]
-    seed_center = tuple(float(v) for v in (
-        seed_center_override if seed_center_override is not None else _bbox_center(seed_bbox)
-    ))
-    anchor_bbox = _build_shift_anchor_bbox(seed_bbox, seed_center, window_size_um)
-    half_span = float(window_size_um) / 2.0
-
-    scan_side = max(float(window_size_um) * 2.0, 1e-6)
-    scan_bbox = _make_centered_bbox(seed_center, scan_side, scan_side)
-    neighbor_ids = _select_relevant_element_ids(
-        spatial_index,
-        indexed_elements,
-        scan_bbox,
-        center_xy=seed_center,
-        max_elements=max(8, int(neighbor_limit)),
-    )
-
-    x_edges = []
-    y_edges = []
-    for nid in neighbor_ids:
-        bbox = indexed_elements[nid]["bbox"]
-        x_edges.extend([float(bbox[0]), float(bbox[2])])
-        y_edges.extend([float(bbox[1]), float(bbox[3])])
-
-    x_interval = _axis_shift_interval(anchor_bbox, seed_center, half_span, "x", shift_directions)
-    y_interval = _axis_shift_interval(anchor_bbox, seed_center, half_span, "y", shift_directions)
-
-    x_shifts = _collect_axis_shift_values(
-        seed_center[0],
-        half_span,
-        x_edges,
-        x_interval,
-        max_count=max_shift_values_per_axis,
-    )
-    y_shifts = _collect_axis_shift_values(
-        seed_center[1],
-        half_span,
-        y_edges,
-        y_interval,
-        max_count=max_shift_values_per_axis,
-    )
-
-    best_dx = 0.0
-    best_dy = 0.0
-    if x_shifts:
-        best_dx = _choose_axis_shift(
-            seed_center[0],
-            half_span,
-            x_edges,
-            x_shifts,
-            boundary_tolerance_um,
-        )
-    if y_shifts:
-        best_dy = _choose_axis_shift(
-            seed_center[1],
-            half_span,
-            y_edges,
-            y_shifts,
-            boundary_tolerance_um,
-        )
-
-    shifted_center = (float(seed_center[0] + best_dx), float(seed_center[1] + best_dy))
-    return {
-        "elem_id": -1 if elem_id is None else int(elem_id),
-        "seed_center": (float(seed_center[0]), float(seed_center[1])),
-        "center": shifted_center,
-        "center_shift": (float(best_dx), float(best_dy)),
-    }
 
 
 def _polygon_list_area(polygons):
@@ -1164,27 +1012,172 @@ def _normalize_polygons_to_local_bbox(polygons, bbox):
     return normalized
 
 
-def _window_xor_ratio(record_a, record_b):
-    window_area = max(
-        float(record_a.get("window_area", 0.0)),
-        float(record_b.get("window_area", 0.0)),
-        1e-12,
+def _normalize_geometry_match_mode(mode):
+    value = str(mode or DEFAULT_GEOMETRY_MATCH_MODE).strip().lower()
+    if value not in {"acc", "ecc"}:
+        raise ValueError(f"Unsupported geometry match mode: {mode}")
+    return value
+
+
+def _geometry_prefilter_passes(record_a, record_b, invariant_dist_limit, signature_threshold):
+    inv_dist = _invariant_relative_distance(record_a["invariants"], record_b["invariants"])
+    if inv_dist > float(invariant_dist_limit):
+        return False
+
+    sig_sim = _cosine_similarity_1d(record_a["signature"], record_b["signature"])
+    return bool(sig_sim >= float(signature_threshold))
+
+
+def _record_window_dimensions_um(record):
+    bbox = record.get("outer_bbox")
+    sample = record.get("sample")
+    if bbox is None and sample is not None:
+        bbox = getattr(sample, "outer_bbox", None)
+    safe_bbox = _safe_bbox_tuple(bbox) if bbox is not None else None
+    if safe_bbox is not None:
+        width_um = max(1e-9, float(safe_bbox[2] - safe_bbox[0]))
+        height_um = max(1e-9, float(safe_bbox[3] - safe_bbox[1]))
+        return width_um, height_um
+
+    window_area = max(1e-12, float(record.get("window_area", 0.0)))
+    width_um = math.sqrt(window_area)
+    height_um = math.sqrt(window_area)
+    for poly in record.get("normalized_polygons", []) or []:
+        if poly is None or not hasattr(poly, "points"):
+            continue
+        points = np.asarray(poly.points, dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 2:
+            continue
+        width_um = max(width_um, float(np.max(points[:, 0])))
+        height_um = max(height_um, float(np.max(points[:, 1])))
+    return max(width_um, 1e-9), max(height_um, 1e-9)
+
+
+def _geometry_gate_shape(record_a, record_b, pixel_size_nm):
+    pixel_size_um = max(float(pixel_size_nm) * 1e-3, 1e-6)
+    width_a, height_a = _record_window_dimensions_um(record_a)
+    width_b, height_b = _record_window_dimensions_um(record_b)
+    width_um = max(width_a, width_b, pixel_size_um)
+    height_um = max(height_a, height_b, pixel_size_um)
+    width_px = max(1, int(math.ceil(width_um / pixel_size_um)))
+    height_px = max(1, int(math.ceil(height_um / pixel_size_um)))
+    return pixel_size_um, width_um, height_um, width_px, height_px
+
+
+def _rasterize_normalized_polygons(record, pixel_size_nm, width_px, height_px, width_um, height_um):
+    cache = record.setdefault("_geometry_gate_cache", {})
+    cache_key = (
+        round(float(pixel_size_nm), 6),
+        int(width_px),
+        int(height_px),
+        round(float(width_um), 9),
+        round(float(height_um), 9),
     )
-    polygons_a = record_a.get("normalized_polygons", [])
-    polygons_b = record_b.get("normalized_polygons", [])
+    if cache_key in cache:
+        return cache[cache_key]
+
+    mask = np.zeros((int(height_px), int(width_px)), dtype=bool)
+    polygons = [
+        poly for poly in (record.get("normalized_polygons", []) or [])
+        if poly is not None and hasattr(poly, "points") and len(poly.points) >= 3
+    ]
+    if not polygons:
+        cache[cache_key] = mask
+        return mask
+
+    cell_w = float(width_um) / float(max(1, width_px))
+    cell_h = float(height_um) / float(max(1, height_px))
+    xs = (np.arange(int(width_px), dtype=np.float64) + 0.5) * cell_w
+    ys = (np.arange(int(height_px), dtype=np.float64) + 0.5) * cell_h
+    grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+    points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+
     try:
-        xor_polygons = gdstk.boolean(polygons_a, polygons_b, "xor")
-        xor_area = _polygon_list_area(xor_polygons)
+        mask = np.asarray(gdstk.inside(points, polygons), dtype=bool).reshape((int(height_px), int(width_px)))
     except Exception:
-        try:
-            inter_polygons = gdstk.boolean(polygons_a, polygons_b, "and")
-            inter_area = _polygon_list_area(inter_polygons)
-        except Exception:
-            inter_area = 0.0
-        area_a = _polygon_list_area(polygons_a)
-        area_b = _polygon_list_area(polygons_b)
-        xor_area = max(0.0, area_a + area_b - 2.0 * inter_area)
-    return float(np.clip(xor_area / window_area, 0.0, 1.0))
+        for poly in polygons:
+            coords = np.asarray(poly.points, dtype=np.float64)
+            if coords.ndim != 2 or coords.shape[0] == 0 or coords.shape[1] < 2:
+                continue
+            x0 = max(0, int(math.floor(float(np.min(coords[:, 0])) / cell_w)))
+            x1 = min(int(width_px), int(math.ceil(float(np.max(coords[:, 0])) / cell_w)))
+            y0 = max(0, int(math.floor(float(np.min(coords[:, 1])) / cell_h)))
+            y1 = min(int(height_px), int(math.ceil(float(np.max(coords[:, 1])) / cell_h)))
+            if x0 < x1 and y0 < y1:
+                mask[y0:y1, x0:x1] = True
+
+    cache[cache_key] = mask
+    return mask
+
+
+def _disk_structure(radius_px):
+    radius = max(0, int(radius_px))
+    if radius <= 0:
+        return np.ones((1, 1), dtype=bool)
+    coords = np.arange(-radius, radius + 1)
+    yy, xx = np.meshgrid(coords, coords, indexing="ij")
+    return (xx * xx + yy * yy) <= radius * radius
+
+
+def _edge_mask(mask):
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return np.zeros_like(mask, dtype=bool)
+    eroded = binary_erosion(mask, structure=np.ones((3, 3), dtype=bool), border_value=0)
+    return mask & ~eroded
+
+
+def _ecc_masks_pass(mask_a, mask_b, pixel_size_um, edge_tolerance_um):
+    mask_a = np.asarray(mask_a, dtype=bool)
+    mask_b = np.asarray(mask_b, dtype=bool)
+    if np.array_equal(mask_a, mask_b):
+        return True
+    if not np.any(mask_a) or not np.any(mask_b):
+        return False
+
+    radius_px = int(math.ceil(max(0.0, float(edge_tolerance_um)) / max(float(pixel_size_um), 1e-9)))
+    structure = _disk_structure(radius_px)
+    dilated_a = binary_dilation(mask_a, structure=structure)
+    dilated_b = binary_dilation(mask_b, structure=structure)
+
+    residual_a = mask_a & ~dilated_b
+    residual_b = mask_b & ~dilated_a
+    if np.any(residual_a) or np.any(residual_b):
+        return False
+
+    edge_a = _edge_mask(mask_a)
+    edge_b = _edge_mask(mask_b)
+    if np.any(edge_a) and np.any(edge_b):
+        edge_support_a = binary_dilation(edge_a, structure=structure)
+        edge_support_b = binary_dilation(edge_b, structure=structure)
+        missing_edge_a = edge_a & ~edge_support_b
+        missing_edge_b = edge_b & ~edge_support_a
+        edge_miss_ratio = max(
+            float(np.count_nonzero(missing_edge_a)) / float(max(1, np.count_nonzero(edge_a))),
+            float(np.count_nonzero(missing_edge_b)) / float(max(1, np.count_nonzero(edge_b))),
+        )
+        if edge_miss_ratio > 0.02:
+            return False
+
+    return True
+
+
+def _geometry_gate_passes(record_a, record_b, mode, similarity_threshold, pixel_size_nm, edge_tolerance_um):
+    mode = _normalize_geometry_match_mode(mode)
+    pixel_size_um, width_um, height_um, width_px, height_px = _geometry_gate_shape(
+        record_a,
+        record_b,
+        pixel_size_nm,
+    )
+    mask_a = _rasterize_normalized_polygons(record_a, pixel_size_nm, width_px, height_px, width_um, height_um)
+    mask_b = _rasterize_normalized_polygons(record_b, pixel_size_nm, width_px, height_px, width_um, height_um)
+
+    if mode == "acc":
+        xor_ratio = float(np.count_nonzero(mask_a ^ mask_b)) / float(max(1, mask_a.size))
+        threshold = float(np.clip(float(similarity_threshold), 0.0, 1.0))
+        return bool(xor_ratio <= max(0.0, 1.0 - threshold) + 1e-12)
+
+    return _ecc_masks_pass(mask_a, mask_b, pixel_size_um, edge_tolerance_um)
 
 
 def _build_window_record(sample, outer_polygons, invariants, signature, pattern_hash, invariant_key, **extra_meta):
@@ -1240,10 +1233,6 @@ def _build_shift_candidate_record(origin_idx, origin_record, center, indexed_ele
         max_elements=max_elements_per_window,
     )
     if not outer_polygons:
-        return None
-
-    inner_polygons = _approx_clip_polygons_with_bbox(outer_polygons, inner_bbox, "and")
-    if not inner_polygons:
         return None
 
     invariants = _compute_window_invariants(outer_polygons)
@@ -1313,17 +1302,18 @@ def _generate_pattern_shift_candidates_for_record(origin_idx, origin_record, spa
         if key in origin_record:
             base_candidate[key] = origin_record[key]
 
-    raw_ids = list(base_sample.raw_instance_ids)
-    if not raw_ids:
+    marker_bbox = origin_record.get("marker_bbox")
+    marker_center = origin_record.get("marker_center")
+    if marker_bbox is None or marker_center is None:
+        return [base_candidate]
+    try:
+        marker_bbox = tuple(float(v) for v in marker_bbox)
+        marker_center = tuple(float(v) for v in marker_center)
+    except (TypeError, ValueError):
+        return [base_candidate]
+    if len(marker_bbox) != 4 or len(marker_center) != 2:
         return [base_candidate]
 
-    seed_elem_id = int(raw_ids[0])
-    if seed_elem_id < 0 or seed_elem_id >= len(indexed_elements):
-        return [base_candidate]
-
-    seed_center = base_sample.seed_center or base_center
-    seed_bbox = indexed_elements[seed_elem_id]["bbox"]
-    anchor_bbox = _build_shift_anchor_bbox(seed_bbox, seed_center, window_size_um)
     half_span = float(window_size_um) / 2.0
     outer_side = float(window_size_um) + 2.0 * float(context_width_um)
     scan_side = max(outer_side, float(window_size_um) * 2.0, 1e-6)
@@ -1343,8 +1333,8 @@ def _generate_pattern_shift_candidates_for_record(origin_idx, origin_record, spa
         x_edges.extend([float(bbox[0]), float(bbox[2])])
         y_edges.extend([float(bbox[1]), float(bbox[3])])
 
-    x_interval = _axis_shift_interval(anchor_bbox, base_center, half_span, "x", shift_directions)
-    y_interval = _axis_shift_interval(anchor_bbox, base_center, half_span, "y", shift_directions)
+    x_interval = _marker_shift_interval(marker_bbox, marker_center, "x", shift_directions)
+    y_interval = _marker_shift_interval(marker_bbox, marker_center, "y", shift_directions)
     x_shifts = _collect_axis_shift_values(base_center[0], half_span, x_edges, x_interval, max_count=12)
     y_shifts = _collect_axis_shift_values(base_center[1], half_span, y_edges, y_interval, max_count=12)
 
@@ -1416,20 +1406,24 @@ def _generate_pattern_shift_candidates_for_record(origin_idx, origin_record, spa
 
 
 def _candidate_matches_window_record(candidate, target_record, signature_floor=0.84,
-                                     area_match_ratio=0.92, invariant_dist_limit=0.12):
+                                     area_match_ratio=0.92, invariant_dist_limit=DEFAULT_SHIFT_PREFILTER_INVARIANT_LIMIT,
+                                     geometry_match_mode=DEFAULT_GEOMETRY_MATCH_MODE,
+                                     geometry_pixel_size_nm=DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
+                                     edge_tolerance_um=DEFAULT_EDGE_TOLERANCE_UM):
     if candidate["pattern_hash"] == target_record["pattern_hash"]:
         return True
 
-    inv_dist = _invariant_relative_distance(candidate["invariants"], target_record["invariants"])
-    if inv_dist > float(invariant_dist_limit):
+    if not _geometry_prefilter_passes(candidate, target_record, invariant_dist_limit, signature_floor):
         return False
 
-    sig_sim = _cosine_similarity_1d(candidate["signature"], target_record["signature"])
-    if sig_sim < float(signature_floor):
-        return False
-
-    xor_ratio = _window_xor_ratio(candidate, target_record)
-    return bool(xor_ratio <= max(0.0, 1.0 - float(area_match_ratio)))
+    return _geometry_gate_passes(
+        candidate,
+        target_record,
+        mode=geometry_match_mode,
+        similarity_threshold=area_match_ratio,
+        pixel_size_nm=geometry_pixel_size_nm,
+        edge_tolerance_um=edge_tolerance_um,
+    )
 
 
 def _greedy_select_cover_candidates(candidates, cluster_weights):
@@ -1487,13 +1481,16 @@ def _compress_window_records_with_shift_cover(window_records, spatial_index, ind
                                               window_size_um, context_width_um, max_elements_per_window,
                                               quant_step_um, signature_bins, similarity_threshold=0.96,
                                               shift_directions=("left", "right", "up", "down"),
-                                              neighbor_limit=128):
+                                              neighbor_limit=128,
+                                              geometry_match_mode=DEFAULT_GEOMETRY_MATCH_MODE,
+                                              geometry_pixel_size_nm=DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
+                                              edge_tolerance_um=DEFAULT_EDGE_TOLERANCE_UM):
     initial_count = int(len(window_records))
     if initial_count <= 1:
         return window_records
 
-    signature_floor = float(np.clip(float(similarity_threshold) - 0.10, 0.78, 0.92))
-    area_match_ratio = float(np.clip(float(similarity_threshold) - 0.04, 0.88, 0.96))
+    signature_floor = float(np.clip(float(similarity_threshold), 0.0, 1.0))
+    area_match_ratio = float(np.clip(float(similarity_threshold), 0.0, 1.0))
     bucket_rel_tol = 0.08
     bucket_neighbor_dims = 3
     pattern_shift_bucket_index = {}
@@ -1546,6 +1543,10 @@ def _compress_window_records_with_shift_cover(window_records, spatial_index, ind
                         target_record,
                         signature_floor=signature_floor,
                         area_match_ratio=area_match_ratio,
+                        invariant_dist_limit=DEFAULT_SHIFT_PREFILTER_INVARIANT_LIMIT,
+                        geometry_match_mode=geometry_match_mode,
+                        geometry_pixel_size_nm=geometry_pixel_size_nm,
+                        edge_tolerance_um=edge_tolerance_um,
                 ):
                     coverage.add(int(target_idx))
         candidate["coverage"] = coverage
@@ -1619,13 +1620,13 @@ def _compress_window_records_with_shift_cover(window_records, spatial_index, ind
     if len(assigned) < initial_count:
         for cluster_idx, record in enumerate(window_records):
             if cluster_idx not in assigned:
-                fallback_record = dict(record)
-                fallback_record.setdefault("generated_by_pattern_shift", False)
-                fallback_record.setdefault("shift_distance_um", 0.0)
-                fallback_record.setdefault("merged_window_count", 1)
-                fallback_record.setdefault("covered_window_ids", [str(record["sample"].sample_id)])
-                fallback_record.setdefault("origin_window_id", str(record["sample"].sample_id))
-                merged_records.append(fallback_record)
+                uncovered_record = dict(record)
+                uncovered_record.setdefault("generated_by_pattern_shift", False)
+                uncovered_record.setdefault("shift_distance_um", 0.0)
+                uncovered_record.setdefault("merged_window_count", 1)
+                uncovered_record.setdefault("covered_window_ids", [str(record["sample"].sample_id)])
+                uncovered_record.setdefault("origin_window_id", str(record["sample"].sample_id))
+                merged_records.append(uncovered_record)
 
     return merged_records
 
@@ -1651,10 +1652,6 @@ def _build_candidate_window_record(candidate, spatial_index, indexed_elements, *
         max_elements=max_elements_per_window,
     )
     if not outer_polygons:
-        return None
-
-    inner_polygons = _approx_clip_polygons_with_bbox(outer_polygons, inner_bbox, "and")
-    if not inner_polygons:
         return None
 
     invariants = _compute_window_invariants(outer_polygons)
@@ -1701,8 +1698,7 @@ def _build_initial_window_records(candidate_entries, spatial_index, indexed_elem
                                   coarse_dedup_quant_um, max_elements_per_window,
                                   quant_step_um, signature_bins):
     raw_records = []
-    coarse_skipped = 0
-    coarse_seen = set()
+    coarse_groups = {}
     total_candidates = len(candidate_entries)
     outer_side = float(window_size_um) + 2.0 * float(context_width_um)
 
@@ -1721,34 +1717,64 @@ def _build_initial_window_records(candidate_entries, spatial_index, indexed_elem
         center = candidate["center"]
         outer_bbox = _make_centered_bbox(center, outer_side, outer_side)
         if enable_coarse_prefilter:
-            coarse_sig = _coarse_window_descriptor(
+            group_key = _coarse_window_descriptor(
                 center,
                 outer_bbox,
                 spatial_index,
                 indexed_elements,
                 quant_step_um=float(coarse_dedup_quant_um),
             )
-            if coarse_sig in coarse_seen:
-                coarse_skipped += 1
-                continue
-            coarse_seen.add(coarse_sig)
+        else:
+            group_key = ("candidate", processed - 1)
+        coarse_groups.setdefault(group_key, []).append((processed - 1, candidate))
+
+    invalid_group_count = 0
+    invalid_candidate_count = 0
+    for group in coarse_groups.values():
+        representative_idx, representative = group[0]
 
         record = _build_candidate_window_record(
-            candidate,
+            representative,
             spatial_index,
             indexed_elements,
             source_name=source_name,
-            source_window_id=f"window_candidate_{processed - 1:06d}",
+            source_window_id=f"window_candidate_{representative_idx:06d}",
             window_size_um=window_size_um,
             context_width_um=context_width_um,
             max_elements_per_window=max_elements_per_window,
             quant_step_um=quant_step_um,
             signature_bins=signature_bins,
         )
-        if record is not None:
-            raw_records.append(record)
+        if record is None:
+            invalid_group_count += 1
+            invalid_candidate_count += len(group)
+            continue
 
-    return raw_records, {"coarse_prefilter_skipped": int(coarse_skipped)}
+        sample = record["sample"]
+        sample.duplicate_count = int(len(group))
+        sample.raw_instance_ids = [int(candidate["elem_id"]) for _, candidate in group]
+        sample.raw_instance_centers = [
+            (float(candidate["center"][0]), float(candidate["center"][1]))
+            for _, candidate in group
+        ]
+        seed_kind_votes = Counter()
+        for _, candidate in group:
+            seed_kind_votes.update(
+                _seed_kind_vote_counter(
+                    _normalize_seed_kind(candidate.get("seed_kind", DEFAULT_SEED_KIND))
+                )
+            )
+        record["seed_kind_votes"] = seed_kind_votes
+        _sync_record_seed_kind(record)
+        raw_records.append(record)
+
+    group_count = int(len(coarse_groups))
+    return raw_records, {
+        "coarse_prefilter_group_count": group_count,
+        "coarse_prefilter_merged_count": int(max(0, total_candidates - group_count)),
+        "coarse_prefilter_invalid_group_count": int(invalid_group_count),
+        "coarse_prefilter_invalid_candidate_count": int(invalid_candidate_count),
+    }
 
 
 def _deduplicate_window_records(window_records, *, enable_geometry_dedup, similarity_threshold):
@@ -1774,9 +1800,12 @@ def _deduplicate_window_records(window_records, *, enable_geometry_dedup, simila
                 matched = existing
                 matched_reason = "exact"
                 break
-            inv_dist = _invariant_relative_distance(record["invariants"], existing["invariants"])
-            sig_sim = _cosine_similarity_1d(record["signature"], existing["signature"])
-            if inv_dist <= 0.06 and sig_sim >= float(similarity_threshold):
+            if _geometry_prefilter_passes(
+                    record,
+                    existing,
+                    DEFAULT_DEDUP_PREFILTER_INVARIANT_LIMIT,
+                    float(similarity_threshold),
+            ):
                 matched = existing
                 matched_reason = "similar"
                 break
@@ -1816,10 +1845,14 @@ def _deduplicate_window_records(window_records, *, enable_geometry_dedup, simila
 def _compress_window_records(window_records, spatial_index, indexed_elements, *,
                              window_size_um, context_width_um, max_elements_per_window,
                              quant_step_um, signature_bins, similarity_threshold,
-                             clip_shift_directions, clip_shift_neighbor_limit):
-    if len(window_records) <= 1:
-        return window_records
-    print("\n开始执行固定 shift-cover 窗口压缩...")
+                             clip_shift_directions, clip_shift_neighbor_limit,
+                             enable_shift_cover=True,
+                             geometry_match_mode=DEFAULT_GEOMETRY_MATCH_MODE,
+                             geometry_pixel_size_nm=DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
+                             edge_tolerance_um=DEFAULT_EDGE_TOLERANCE_UM):
+    if len(window_records) <= 1 or not enable_shift_cover:
+        return list(window_records)
+    print("\n开始执行 marker-limited shift-cover 窗口压缩...")
     return _compress_window_records_with_shift_cover(
         window_records,
         spatial_index,
@@ -1832,6 +1865,9 @@ def _compress_window_records(window_records, spatial_index, indexed_elements, *,
         similarity_threshold=similarity_threshold,
         shift_directions=clip_shift_directions,
         neighbor_limit=clip_shift_neighbor_limit,
+        geometry_match_mode=geometry_match_mode,
+        geometry_pixel_size_nm=geometry_pixel_size_nm,
+        edge_tolerance_um=edge_tolerance_um,
     )
 
 
@@ -1867,10 +1903,6 @@ def _materialize_window_samples(window_records):
         if compression_trace:
             sample_info["compression_trace"] = dict(compression_trace)
 
-            # Legacy mirror: keep top-level fields for one compatibility cycle so
-            # existing review / post-processing scripts keep working unchanged.
-            sample_info.update(compression_trace)
-
         sample_libs.append(sample_lib)
         sample_infos.append(sample_info)
 
@@ -1878,11 +1910,14 @@ def _materialize_window_samples(window_records):
 
 
 def _build_window_generation_metadata(indexed_elements, center_meta, *,
-                                      total_candidates, unique_window_count,
-                                      exact_hash_merged, similar_window_merged,
-                                      dedup_bucket_count, window_size_um, context_width_um,
-                                      max_elements_per_window, hash_precision_nm,
-                                      enable_clip_shifting, shifted_seed_count):
+                                       total_candidates, unique_window_count,
+                                       exact_hash_merged, similar_window_merged,
+                                       dedup_bucket_count, window_size_um, context_width_um,
+                                       max_elements_per_window, hash_precision_nm,
+                                       enable_clip_shifting, shifted_seed_count,
+                                       geometry_match_mode, geometry_pixel_size_nm,
+                                       edge_tolerance_um, prefilter_invariant_dist_limit,
+                                       prefilter_signature_threshold):
     return {
         "original_element_count": int(len(indexed_elements)),
         "raw_center_count": int(total_candidates),
@@ -1902,6 +1937,11 @@ def _build_window_generation_metadata(indexed_elements, center_meta, *,
         "dedup_bucket_count": int(dedup_bucket_count),
         "exact_hash_merged": int(exact_hash_merged),
         "similar_window_merged": int(similar_window_merged),
+        "geometry_match_mode": _normalize_geometry_match_mode(geometry_match_mode),
+        "geometry_pixel_size_nm": float(geometry_pixel_size_nm),
+        "edge_tolerance_um": float(edge_tolerance_um),
+        "geometry_prefilter_invariant_dist_limit": float(prefilter_invariant_dist_limit),
+        "geometry_prefilter_signature_threshold": float(prefilter_signature_threshold),
     }
 
 def generate_layout_window_samples(
@@ -1921,6 +1961,9 @@ def generate_layout_window_samples(
         clip_shift_directions=("left", "right", "up", "down"),
         clip_shift_neighbor_limit=128,
         clip_shift_boundary_tolerance_um=0.02,
+        geometry_match_mode=DEFAULT_GEOMETRY_MATCH_MODE,
+        geometry_pixel_size_nm=DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
+        edge_tolerance_um=DEFAULT_EDGE_TOLERANCE_UM,
         return_metadata=False,
         source_name="layout"):
     """
@@ -1934,18 +1977,17 @@ def generate_layout_window_samples(
     3. 真正判定是否合并时，仍然同时检查增强哈希 / 几何不变量距离 / 签名相似度。
 
     clip shifting 合入方式：
-    1. 先用 marker bbox center 作为候选 seed。
-    2. 再对每个 marker seed 做局部边界对齐式微调，得到最终中心。
-    3. 只有当 shift 确实改善了窗口边界与局部几何边界的贴合时，才接受平移。
+    1. 初始窗口严格使用 marker bbox center，不在采样阶段移动窗口。
+    2. shift-cover 阶段仅在 marker bbox 相对 marker center 的小范围内生成单轴 systematic shift。
+    3. shifted candidate 仍需通过 hash / unified prefilter / ACC/ECC gate 后才参与覆盖合并。
 
     性能说明：
     1. marker 图形只作为窗口 seed，不进入 pattern 几何索引。
-    2. 对每个 marker 中心，按 clip shifting 思路在允许范围内做边界对齐式平移，选出更优中心。
-    3. 在精确窗口去重前，先使用邻域相对 bbox 的轻量描述符做预去重。
-    4. 每个窗口只保留最多 max_elements_per_window 个最相关局部几何。
+    2. 在精确窗口去重前，先使用邻域相对 bbox 的轻量描述符做预去重。
+    3. 每个窗口只保留最多 max_elements_per_window 个最相关局部几何。
     """
     if marker_layer is None:
-        raise ValueError("marker-driven split-layout requires --marker-layer <layer>/<datatype>")
+        raise ValueError("marker-driven window sampling requires --marker-layer <layer>/<datatype>")
     marker_layer_tuple = _parse_layer_spec(marker_layer) if isinstance(marker_layer, str) else tuple(marker_layer)
 
     spatial_index, indexed_elements, layout_bbox, marker_polygons = _build_layout_spatial_index(
@@ -1957,6 +1999,9 @@ def generate_layout_window_samples(
     if spatial_index is None or not indexed_elements:
         raise ValueError("No pattern polygons found outside the marker layer; cannot build marker-driven windows")
 
+    geometry_match_mode = _normalize_geometry_match_mode(geometry_match_mode)
+    geometry_pixel_size_nm = max(1e-6, float(geometry_pixel_size_nm))
+    edge_tolerance_um = max(0.0, float(edge_tolerance_um))
     quant_step_um = max(1e-6, float(hash_precision_nm) * 1e-3)
     candidate_entries, center_meta = _select_marker_candidate_centers(
         marker_polygons,
@@ -2009,6 +2054,10 @@ def generate_layout_window_samples(
         similarity_threshold=similarity_threshold,
         clip_shift_directions=clip_shift_directions,
         clip_shift_neighbor_limit=clip_shift_neighbor_limit,
+        enable_shift_cover=enable_clip_shifting,
+        geometry_match_mode=geometry_match_mode,
+        geometry_pixel_size_nm=geometry_pixel_size_nm,
+        edge_tolerance_um=edge_tolerance_um,
     )
     sample_libs, sample_infos = _materialize_window_samples(window_records)
 
@@ -2026,50 +2075,22 @@ def generate_layout_window_samples(
         hash_precision_nm=hash_precision_nm,
         enable_clip_shifting=enable_clip_shifting,
         shifted_seed_count=int(center_meta.get("shifted_seed_count", 0)),
+        geometry_match_mode=geometry_match_mode,
+        geometry_pixel_size_nm=geometry_pixel_size_nm,
+        edge_tolerance_um=edge_tolerance_um,
+        prefilter_invariant_dist_limit=DEFAULT_SHIFT_PREFILTER_INVARIANT_LIMIT,
+        prefilter_signature_threshold=float(np.clip(float(similarity_threshold), 0.0, 1.0)),
     )
-    metadata["coarse_prefilter_skipped"] = int(build_stats["coarse_prefilter_skipped"])
+    metadata["coarse_prefilter_group_count"] = int(build_stats["coarse_prefilter_group_count"])
+    metadata["coarse_prefilter_merged_count"] = int(build_stats["coarse_prefilter_merged_count"])
+    metadata["coarse_prefilter_invalid_group_count"] = int(build_stats["coarse_prefilter_invalid_group_count"])
+    metadata["coarse_prefilter_invalid_candidate_count"] = int(build_stats["coarse_prefilter_invalid_candidate_count"])
     metadata["layout_bbox"] = list(layout_bbox) if layout_bbox is not None else None
 
     print(f"\n共处理 {total_candidates} 个候选中心，去重后保留 {len(sample_infos)} 个窗口样本")
     if return_metadata:
         return sample_libs, sample_infos, metadata
     return sample_libs, sample_infos
-
-
-def check_if_large_layout(filepath, size_threshold=10):
-    """
-    检查版图是否为大版图
-    :param filepath: 文件路径
-    :param size_threshold: 尺寸阈值（微米），超过此值认为是大版图
-    :return: (is_large, width, height)
-    """
-    try:
-        lib = _read_oas_only_library(filepath)
-
-        # 获取所有单元格的边界框
-        all_bboxes = []
-        for cell in lib.cells:
-            bbox = cell.bounding_box()
-            if bbox is not None:
-                all_bboxes.append(bbox)
-
-        if not all_bboxes:
-            return False, 0, 0
-
-        # 计算整体边界框
-        min_x = min(bbox[0][0] for bbox in all_bboxes)
-        min_y = min(bbox[0][1] for bbox in all_bboxes)
-        max_x = max(bbox[1][0] for bbox in all_bboxes)
-        max_y = max(bbox[1][1] for bbox in all_bboxes)
-
-        width = max_x - min_x
-        height = max_y - min_y
-        is_large = width > size_threshold or height > size_threshold
-        return is_large, width, height
-    except Exception as e:
-        print(f"检查版图尺寸时出错 {filepath}: {e}")
-        return False, 0, 0
-
 
 class LayerOperationProcessor:
     """处理层操作的类"""
@@ -3083,12 +3104,25 @@ class LayoutClusteringPipeline:
         self.clip_shift_directions = self._cfg('clip_shift_directions', "left,right,up,down")
         self.clip_shift_neighbor_limit = self._cfg_int('clip_shift_neighbor_limit', 128, minimum=1)
         self.clip_shift_boundary_tolerance_um = self._cfg_float('clip_shift_boundary_tolerance_um', 0.02, minimum=0.0)
-        self.split_progress_every = self._cfg_int('split_progress_every', 200, minimum=1)
+        self.window_progress_every = self._cfg_int('window_progress_every', 200, minimum=1)
         self.feature_progress_every = self._cfg_int('feature_progress_every', 50, minimum=1)
         self.feature_workers = self._cfg_int('feature_workers', 2, minimum=1)
         self.feature_parallel_threshold = self._cfg_int('feature_parallel_threshold', 64, minimum=1)
         self.enable_geometry_dedup = self._cfg_bool('enable_geometry_dedup', True)
         self.hash_precision_nm = self._cfg_float('hash_precision_nm', 5.0, minimum=0.0)
+        self.geometry_match_mode = _normalize_geometry_match_mode(
+            self._cfg('geometry_match_mode', DEFAULT_GEOMETRY_MATCH_MODE)
+        )
+        self.geometry_pixel_size_nm = self._cfg_float(
+            'geometry_pixel_size_nm',
+            DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
+            minimum=1e-6,
+        )
+        self.edge_tolerance_um = self._cfg_float(
+            'edge_tolerance_um',
+            DEFAULT_EDGE_TOLERANCE_UM,
+            minimum=0.0,
+        )
 
     def _init_runtime_state(self) -> None:
         self.filepaths = []
@@ -3170,11 +3204,11 @@ class LayoutClusteringPipeline:
             print(f" 对文件 {os.path.basename(filepath)} 应用层操作...")
             lib = self.feature_extractor.layer_processor.apply_layer_operations(lib)
 
-        sample_libs, sample_infos, split_meta = generate_layout_window_samples(
+        sample_libs, sample_infos, window_meta = generate_layout_window_samples(
             lib,
             window_size_um=self.clip_size_um,
             context_width_um=self.context_width_um,
-            progress_every=self.split_progress_every,
+            progress_every=self.window_progress_every,
             enable_geometry_dedup=self.enable_geometry_dedup,
             hash_precision_nm=self.hash_precision_nm,
             similarity_threshold=self.sample_similarity_threshold,
@@ -3187,6 +3221,9 @@ class LayoutClusteringPipeline:
             clip_shift_directions=self.clip_shift_directions,
             clip_shift_neighbor_limit=self.clip_shift_neighbor_limit,
             clip_shift_boundary_tolerance_um=self.clip_shift_boundary_tolerance_um,
+            geometry_match_mode=self.geometry_match_mode,
+            geometry_pixel_size_nm=self.geometry_pixel_size_nm,
+            edge_tolerance_um=self.edge_tolerance_um,
             return_metadata=True,
             source_name=os.path.basename(filepath),
         )
@@ -3205,11 +3242,11 @@ class LayoutClusteringPipeline:
             processed_infos.append(sample_info)
             weights.append(int(sample_info.get("duplicate_count", 1)))
         print(f" 生成 {len(sample_infos)} 个去重窗口样本")
-        return split_meta
+        return window_meta
 
-    def _record_split_metadata(self, split_meta: Dict[str, Any],
-                               dedup_meta_template: Dict[str, Any],
-                               dedup_stats: Dict[str, int]) -> None:
+    def _record_window_metadata(self, window_meta: Dict[str, Any],
+                                dedup_meta_template: Dict[str, Any],
+                                dedup_stats: Dict[str, int]) -> None:
         for key in (
                 'max_elements_per_window',
                 'window_size_um',
@@ -3217,9 +3254,14 @@ class LayoutClusteringPipeline:
                 'hash_precision_nm',
                 'clip_shifting_enabled',
                 'marker_layer',
+                'geometry_match_mode',
+                'geometry_pixel_size_nm',
+                'edge_tolerance_um',
+                'geometry_prefilter_invariant_dist_limit',
+                'geometry_prefilter_signature_threshold',
         ):
-            if key in split_meta and key not in dedup_meta_template:
-                dedup_meta_template[key] = split_meta[key]
+            if key in window_meta and key not in dedup_meta_template:
+                dedup_meta_template[key] = window_meta[key]
         for key in (
                 'raw_center_count',
                 'initial_seed_count',
@@ -3231,40 +3273,31 @@ class LayoutClusteringPipeline:
                 'marker_count',
                 'marker_candidate_count',
                 'marker_skipped_invalid_count',
+                'coarse_prefilter_group_count',
+                'coarse_prefilter_merged_count',
+                'coarse_prefilter_invalid_group_count',
+                'coarse_prefilter_invalid_candidate_count',
                 'dedup_bucket_count',
         ):
-            dedup_stats[key] += int(split_meta.get(key, 0))
+            dedup_stats[key] += int(window_meta.get(key, 0))
 
-    def _load_single_layout_file(self, filepath: str, temp_dir: Path, split_large_layout: bool,
+    def _load_single_layout_file(self, filepath: str, temp_dir: Path,
                                  dedup_meta_template: Dict[str, Any], dedup_stats: Dict[str, int],
                                  processed_files: List[str], processed_infos: List[Optional[Dict[str, Any]]],
                                  weights: List[int]) -> None:
-        if not split_large_layout:
+        if not self.marker_layer:
             self._append_direct_file(filepath, temp_dir, processed_files, processed_infos, weights)
             return
-        if not self.marker_layer:
-            raise ValueError("--split-layout requires --marker-layer <layer>/<datatype>")
 
-        try:
-            is_large, width, height = check_if_large_layout(filepath)
-            if is_large:
-                print(f"检测到大版图 ({width:.2f} x {height:.2f} um)，开始基于 marker 窗口采样...")
-                split_meta = self._append_window_files(
-                    filepath,
-                    temp_dir,
-                    processed_files,
-                    processed_infos,
-                    weights,
-                )
-                self._record_split_metadata(split_meta, dedup_meta_template, dedup_stats)
-                return
-
-            print(f"文件不是大版图 ({width:.2f} x {height:.2f} um)，按原始文件处理")
-        except Exception as e:
-            print(f"中心窗口采样失败: {e}")
-            raise
-
-        self._append_direct_file(filepath, temp_dir, processed_files, processed_infos, weights)
+        print(f"检测到 marker 层配置 {self.marker_layer}，开始基于 marker 窗口采样...")
+        window_meta = self._append_window_files(
+            filepath,
+            temp_dir,
+            processed_files,
+            processed_infos,
+            weights,
+        )
+        self._record_window_metadata(window_meta, dedup_meta_template, dedup_stats)
 
     def _build_pattern_dedup_info(self, dedup_meta_template: Dict[str, Any],
                                   dedup_stats: Dict[str, int]) -> Dict[str, Any]:
@@ -3283,9 +3316,28 @@ class LayoutClusteringPipeline:
             'clip_shifting_enabled': bool(dedup_meta_template.get('clip_shifting_enabled', self.enable_clip_shifting)),
             'shifted_seed_count': int(dedup_stats.get('shifted_seed_count', 0)),
             'marker_layer': dedup_meta_template.get('marker_layer', self.marker_layer),
+            'geometry_match_mode': dedup_meta_template.get('geometry_match_mode', self.geometry_match_mode),
+            'geometry_pixel_size_nm': float(dedup_meta_template.get('geometry_pixel_size_nm', self.geometry_pixel_size_nm)),
+            'edge_tolerance_um': float(dedup_meta_template.get('edge_tolerance_um', self.edge_tolerance_um)),
+            'geometry_prefilter_invariant_dist_limit': float(
+                dedup_meta_template.get(
+                    'geometry_prefilter_invariant_dist_limit',
+                    DEFAULT_SHIFT_PREFILTER_INVARIANT_LIMIT,
+                )
+            ),
+            'geometry_prefilter_signature_threshold': float(
+                dedup_meta_template.get(
+                    'geometry_prefilter_signature_threshold',
+                    self.sample_similarity_threshold,
+                )
+            ),
             'marker_count': int(dedup_stats.get('marker_count', 0)),
             'marker_candidate_count': int(dedup_stats.get('marker_candidate_count', 0)),
             'marker_skipped_invalid_count': int(dedup_stats.get('marker_skipped_invalid_count', 0)),
+            'coarse_prefilter_group_count': int(dedup_stats.get('coarse_prefilter_group_count', 0)),
+            'coarse_prefilter_merged_count': int(dedup_stats.get('coarse_prefilter_merged_count', 0)),
+            'coarse_prefilter_invalid_group_count': int(dedup_stats.get('coarse_prefilter_invalid_group_count', 0)),
+            'coarse_prefilter_invalid_candidate_count': int(dedup_stats.get('coarse_prefilter_invalid_candidate_count', 0)),
             'dedup_bucket_count': int(dedup_stats.get('dedup_bucket_count', 0)),
         }
 
@@ -3490,7 +3542,7 @@ class LayoutClusteringPipeline:
             summary["window_samples"] = window_summary
         return summary
 
-    def load_files(self, input_dir: str, pattern: str = "*.oas", split_large_layout: bool = True) -> List[str]:
+    def load_files(self, input_dir: str, pattern: str = "*.oas") -> List[str]:
         """加载 OASIS 文件"""
         input_path = Path(input_dir)
         temp_dir = self._create_run_temp_dir()
@@ -3510,6 +3562,10 @@ class LayoutClusteringPipeline:
             'marker_count': 0,
             'marker_candidate_count': 0,
             'marker_skipped_invalid_count': 0,
+            'coarse_prefilter_group_count': 0,
+            'coarse_prefilter_merged_count': 0,
+            'coarse_prefilter_invalid_group_count': 0,
+            'coarse_prefilter_invalid_candidate_count': 0,
             'dedup_bucket_count': 0,
         }
         dedup_meta_template = {}
@@ -3520,7 +3576,6 @@ class LayoutClusteringPipeline:
             self._load_single_layout_file(
                 filepath,
                 temp_dir,
-                split_large_layout,
                 dedup_meta_template,
                 dedup_stats,
                 self.filepaths,
@@ -3538,24 +3593,18 @@ class LayoutClusteringPipeline:
                 ]
                 all_files = sorted(set(all_files + pattern_files))
 
-            if split_large_layout:
-                print("检查目录中的文件是否为大版图...")
-                for i, file_path in enumerate(all_files):
-                    filepath = str(file_path)
-                    print(f"检查文件 {i + 1}/{len(all_files)}: {os.path.basename(filepath)}")
-                    self._load_single_layout_file(
-                        filepath,
-                        temp_dir,
-                        True,
-                        dedup_meta_template,
-                        dedup_stats,
-                        self.filepaths,
-                        self.sample_infos,
-                        self.pattern_weights,
-                    )
-            else:
-                for filepath in [str(f) for f in all_files]:
-                    self._append_direct_file(filepath, temp_dir, self.filepaths, self.sample_infos, self.pattern_weights)
+            for i, file_path in enumerate(all_files):
+                filepath = str(file_path)
+                print(f"处理文件 {i + 1}/{len(all_files)}: {os.path.basename(filepath)}")
+                self._load_single_layout_file(
+                    filepath,
+                    temp_dir,
+                    dedup_meta_template,
+                    dedup_stats,
+                    self.filepaths,
+                    self.sample_infos,
+                    self.pattern_weights,
+                )
             print(f"找到 {len(self.filepaths)} 个文件")
 
         if len(self.sample_infos) != len(self.filepaths):
@@ -3758,10 +3807,10 @@ class LayoutClusteringPipeline:
                 print(f" 聚类 {i}: 代表样本 {rep}")
         return self.representatives
 
-    def run_pipeline(self, input_path: str, split_large_layout: bool = False) -> Dict[str, Any]:
+    def run_pipeline(self, input_path: str) -> Dict[str, Any]:
         """运行完整的聚类分析管道"""
         # 1. 加载文件
-        self.load_files(input_path, split_large_layout=split_large_layout)
+        self.load_files(input_path)
         if not self.filepaths:
             return {"error": "没有找到可处理的文件"}
 
@@ -3975,13 +4024,13 @@ python layout_clustering_hdbscan.py ./input_data --output results.json
 python layout_clustering_hdbscan.py ./design.oas --output results.json
 
 3) 大版图中心窗口采样 + 聚类
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --clip-size 1.35 --context-width 0.675 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --clip-size 1.35 --context-width 0.675 --output results.json
 
 4) 调整聚类粒度
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --min-cluster-size 8 --min-samples 4 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --min-cluster-size 8 --min-samples 4 --output results.json
 
 5) 调整窗口去重
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --sample-similarity-threshold 0.97 --hash-precision-nm 5.0 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --sample-similarity-threshold 0.97 --hash-precision-nm 5.0 --output results.json
 
 6) 并行特征提取与窗口局部几何上限
 python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-elements-per-window 512 --output results.json
@@ -3989,7 +4038,7 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
 
 注意:
 - HDBSCAN版本直接对全样本特征做聚类，不构建完整NxN相似度矩阵
-- 对于大版图，--split-layout 必须配合 --marker-layer layer/datatype 使用，marker 层只用于窗口 seed
+- 指定 --marker-layer layer/datatype 时启用 marker-driven 窗口采样，marker 层只用于窗口 seed
 - 默认启用了高性能近似几何去重；如果想保留更多局部几何，可增大 --max-elements-per-window
 - 普通帮助仅展示常用参数；仍生效的高级参数隐藏解析，已断开的旧 seed/bin 参数不再保留
         """
@@ -4016,9 +4065,8 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
                         help=argparse.SUPPRESS)
 
     # 中心窗口采样选项
-    parser.add_argument("--split-layout", action="store_true", help="对大版图启用中心窗口采样")
     parser.add_argument("--marker-layer", "--hotspot-layer", dest="marker_layer", default=None,
-                        help="marker 层，格式 layer/datatype；--split-layout 时必填，--hotspot-layer 为兼容别名")
+                        help="marker 层，格式 layer/datatype；指定后启用 marker-driven 窗口采样，--hotspot-layer 为兼容别名")
     parser.add_argument("--clip-size", type=float, default=1.35, help="中心矩形的边长 (微米, 默认: 1.35)")
     parser.add_argument("--context-width", type=float, default=0.675,
                         help="中心矩形外围上下文宽度 (微米, 默认: 0.675)")
@@ -4032,7 +4080,13 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
                         help=argparse.SUPPRESS)
     parser.add_argument("--sample-similarity-threshold", type=float, default=0.96,
                         help="几何去重时判定高度相似窗口的签名相似度阈值 (默认: 0.96)")
+    parser.add_argument("--geometry-match-mode", default=DEFAULT_GEOMETRY_MATCH_MODE, choices=["acc", "ecc"],
+                        help="shift-cover 的最终几何匹配方式: acc 或 ecc (默认: acc)")
+    parser.add_argument("--edge-tolerance-um", type=float, default=DEFAULT_EDGE_TOLERANCE_UM,
+                        help="ECC 几何匹配的边缘容差，单位微米 (默认: 0.02)")
     parser.add_argument("--window-signature-bins", type=int, default=20,
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--geometry-pixel-size-nm", type=float, default=DEFAULT_GEOMETRY_PIXEL_SIZE_NM,
                         help=argparse.SUPPRESS)
     parser.add_argument("--disable-coarse-prefilter", action="store_true",
                         help=argparse.SUPPRESS)
@@ -4070,8 +4124,6 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
     parser.add_argument("--hash-precision-nm", type=float, default=5.0,
                         help="增强顶点哈希量化精度（纳米，仅影响精确哈希，默认: 5.0）")
     args = parser.parse_args()
-    if args.split_layout and not args.marker_layer:
-        parser.error("--split-layout requires --marker-layer <layer>/<datatype>")
     if args.marker_layer is not None:
         try:
             _parse_layer_spec(args.marker_layer)
@@ -4091,6 +4143,9 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
         "inner_block_weights": args.inner_block_weights,
         "outer_block_weights": args.outer_block_weights,
         "sample_similarity_threshold": args.sample_similarity_threshold,
+        "geometry_match_mode": args.geometry_match_mode,
+        "geometry_pixel_size_nm": args.geometry_pixel_size_nm,
+        "edge_tolerance_um": args.edge_tolerance_um,
         "window_signature_bins": args.window_signature_bins,
         "enable_coarse_prefilter": (not args.disable_coarse_prefilter),
         "coarse_prefilter_quant_um": args.coarse_prefilter_quant_um,
@@ -4136,7 +4191,7 @@ python layout_clustering_hdbscan.py ./input_data --feature-workers 4 --max-eleme
             print(f"已注册层操作: {source_layer} {operation} {target_layer} -> {result_layer}")
 
         # 运行完整管道
-        result = pipeline.run_pipeline(args.input, split_large_layout=args.split_layout)
+        result = pipeline.run_pipeline(args.input)
 
         if "error" in result:
             print(f"错误: {result['error']}")

@@ -7,13 +7,15 @@
 当前流程大致为：
 
 1. 读取 OASIS 文件或目录，默认匹配 `*.oas`。
-2. 对大版图启用 `--split-layout` 时，必须指定 `--marker-layer layer/datatype`；marker bbox center 作为初始窗口 seed。
+2. 指定 `--marker-layer layer/datatype` 时启用 marker-driven 窗口采样；marker bbox center 作为初始窗口 seed。
 3. marker 图形只作为 seed，不进入窗口 pattern 几何、特征提取或输出窗口。
-4. 对 marker seed 做 clip shifting 边界对齐微调，再构建中心矩形与外围上下文窗口。
-5. 通过几何去重和 shift-cover 压缩减少 clip 位置冗余。
+4. 初始窗口严格使用 marker bbox center，先构建中心矩形与外围上下文窗口。
+5. 通过 duplicate-preserving 几何去重和 marker-limited shift-cover 压缩减少 clip 位置冗余。
 6. 提取中心窗口内部与外围上下文的多块特征，包括 base、spatial、shape、layer、pattern、radon。
-7. 使用 HDBSCAN 对全样本特征聚类，并用 medoid 选择 representative。
+7. 使用 HDBSCAN 对压缩后的窗口样本聚类，并用 medoid 选择 representative。
 8. 可导出 cluster review 目录，便于人工检查结果。
+
+未指定 marker layer 时，脚本按输入 OAS 文件直接提取整体特征并聚类。
 
 ## 运行方式
 
@@ -25,9 +27,9 @@ python layout_clustering_hdbscan.py ./input_data --output results.json
 
 ```bash
 python layout_clustering_hdbscan.py ./design.oas --output results.json
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --clip-size 1.35 --context-width 0.675 --output results.json
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --min-cluster-size 8 --min-samples 4 --feature-workers 2 --output results.json
-python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-layer 999/0 --sample-similarity-threshold 0.97 --hash-precision-nm 5.0 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --clip-size 1.35 --context-width 0.675 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --min-cluster-size 8 --min-samples 4 --feature-workers 2 --output results.json
+python layout_clustering_hdbscan.py ./large_design.oas --marker-layer 999/0 --sample-similarity-threshold 0.97 --hash-precision-nm 5.0 --output results.json
 ```
 
 ## 关键参数
@@ -36,8 +38,7 @@ python layout_clustering_hdbscan.py ./large_design.oas --split-layout --marker-l
 - `--output`: 输出文件路径，默认 `clustering_results.json`。
 - `--format`: `json` 或 `txt`，默认 `json`。
 - `--export-cluster-review-dir`: 导出 review 目录。
-- `--split-layout`: 对大版图启用中心窗口采样。
-- `--marker-layer`: marker 层，格式 `layer/datatype`；`--split-layout` 时必填。
+- `--marker-layer`: marker 层，格式 `layer/datatype`；指定后启用 marker-driven 窗口采样。
 - `--hotspot-layer`: `--marker-layer` 的兼容别名。
 - `--clip-size`: 中心矩形边长，默认 `1.35um`。
 - `--context-width`: 外围上下文宽度，默认 `0.675um`。
