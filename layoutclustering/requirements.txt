@@ -10,7 +10,13 @@ gdstk>=0.9.52
 
 # Behavior verification image metrics
 scikit-image>=0.20.0
+scipy>=1.10.0
+Pillow>=9.0.0
+tifffile>=2022.8.12
+ncempy>=1.11.0
 
 # AE/FV training and ANN retrieval
 torch>=2.0.0
 hnswlib>=0.8.0
+
+chroma-hnswlib

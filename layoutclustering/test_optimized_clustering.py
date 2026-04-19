@@ -226,6 +226,9 @@ class OptimizedBehaviorTests(unittest.TestCase):
         self.assertEqual(result["exact_cluster_count"], 2)
         self.assertIn("behavior_stats", result)
         self.assertGreaterEqual(result["selected_representative_count"], 1)
+        self.assertNotIn("feature_source", result)
+        self.assertNotIn("feature_metadata", result)
+        self.assertNotIn("feature_metadata", result["config"])
         payload = json.dumps(result, default=optimized._json_default)
         for legacy_word in ("HDBSCAN", "hdbscan", "ILP", "closed_loop", "fft", "auto_marker"):
             self.assertNotIn(legacy_word, payload)

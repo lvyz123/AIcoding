@@ -1,83 +1,180 @@
 # Optimized Behavior Clustering 使用说明
 
-`layout_clustering_optimized.py` 是当前推荐的 marker-driven 光刻行为覆盖聚类入口。它不再把“几何相似”作为最终聚类语义，而是使用 AutoEncoder feature vector 做 coverage representative selection，并用 aerial image SSIM 做 final verification。
+本目录现在维护两条 marker-driven 光刻行为聚类主线：
 
-主目标顺序固定为：
+- `layout_clustering_optimized.py`：AE/FV 主线。用户先用 AutoEncoder 提取 `features.npz`，主脚本负责 ANN coverage clustering 和 behavior verification。
+- `layout_clustering_optimized_notrain.py`：无训练备用主线。主脚本自动调用 `feature_extractor_handcraft.py` 生成 handcrafted FV，不需要外部 `features.npz`。
 
-1. 尽可能增大光刻行为 coverage。
-2. 在 coverage 足够高的前提下减少 representative / cluster 数。
-3. 保证每个 cluster member 都能与 representative 通过 behavior verification。
+两条主线的共同目标都是：优先最大化光刻行为 coverage，其次减少 representative / cluster 数，并用 aerial image SSIM 等 behavior verification 保证 cluster member 与 representative 明确一致。
 
-## 主流程
+## 两个版本怎么选
+
+| 项目 | AE optimized 版本 | no-train 版本 |
+| --- | --- | --- |
+| 主脚本 | `layout_clustering_optimized.py` | `layout_clustering_optimized_notrain.py` |
+| 特征来源 | AutoEncoder latent FV | 手工特征 FV |
+| 是否需要训练 | 需要先训练/加载 AE 模型 | 不需要训练 |
+| 是否需要 `--feature-npz` | 需要，必须由 AE encode 生成 | 不需要，主脚本自动生成临时 handcrafted FV |
+| 必需 behavior 输入 | `behavior.jsonl` + `aerial_npz` | `behavior.jsonl` + `aerial_npz`，也可直接传 preprocess 输出目录 |
+| 推荐场景 | 已有足够 aerial/behavior 数据训练 AE，追求更贴近学习到的光刻行为 embedding | AE 暂不可用、需要 deterministic baseline、快速验证或备用流程 |
+| 输出 `pipeline_mode` | `optimized_behavior` | `optimized_notrain` |
+| 输出特征 metadata | 只记录外部 `feature_npz` 路径 | 额外记录 `feature_source: handcraft`、`feature_metadata`、`handcraft_feature_npz` |
+
+简单说：**AE 版 = 外部训练并提供 FV；no-train 版 = 不训练，自动提取手工 FV。** 两者后半段的 ANN / facility location / k-center / behavior verification 目标一致，但输入准备方式和特征来源不同。
+
+## 版本 A：AE Optimized 流程
 
 ```text
-marker layer
-  -> marker-centered clip
-  -> exact hash 去重和 duplicate weight 累计
-  -> 载入 AutoEncoder FV
-  -> hnswlib ANN top-K graph
+OAS + marker layer
+  -> behavior.jsonl + aerial_npz
+  -> AutoEncoder encode 生成 features.npz
+  -> layout_clustering_optimized.py
+  -> exact hash duplicate grouping
+  -> ANN top-K graph
   -> weighted facility location 选 reps
   -> weighted k-center 补 farthest / high-risk holes
   -> behavior final verification
   -> JSON/TXT/review export
 ```
 
-`exact hash` 只用于去重和权重累计，不再定义最终 cluster 语义。最终 cluster 是否成立由 behavior verification 决定。
+这个版本的决策边界很清楚：主脚本不负责训练，也不负责生成 FV；它只消费 `behavior.jsonl` 和外部 `features.npz`。
 
-## 必需输入
+## 版本 B：No-Train 流程
 
-### OAS + Marker Layer
+```text
+OAS + marker layer + aerial image directory
+  -> preprocess_notrain.py 生成 behavior.jsonl + aerial_npz
+  -> layout_clustering_optimized_notrain.py
+  -> 自动生成 handcrafted features.npz
+  -> 同样的 ANN / facility / k-center / behavior verification / export
+```
 
-输入必须包含 marker layer。每个 marker 会生成一个 centered clip sample。
+这个版本不需要 AE 模型，也不需要外部 `features.npz`。`behavior.jsonl` 仍然必须提供 aerial 数据；如果通过 `preprocess_notrain.py` 生成输入，缺失 aerial 的 marker 会被跳过。
 
-```bash
-python layout_clustering_optimized.py input.oas \
-  --marker-layer 999/0 \
-  --behavior-manifest behavior.jsonl \
-  --feature-npz features.npz \
-  --output results_optimized.json
+`exact hash` 只用于完全重复 marker window 的去重和 duplicate weight 累计，不作为最终聚类语义。最终 cluster 是否成立由 behavior verification 决定。
+
+## 输入契约
+
+### Layout 与 Marker
+
+输入 OAS/OASIS 必须包含 marker layer。marker id 由底层工具按 OAS 文件名和 marker 顺序生成：
+
+```text
+<oas_stem>__marker_000000
+<oas_stem>__marker_000001
+...
+```
+
+例如 `sample_layout_002.oas` 的第一个 marker 是：
+
+```text
+sample_layout_002__marker_000000
 ```
 
 ### Behavior Manifest
 
-Manifest 使用 JSONL。每行至少包含：
+`behavior.jsonl` 每行对应一个 marker sample，最少包含：
 
 ```json
 {
-  "sample_id": "sample_000001",
-  "source_path": "input.oas",
-  "marker_id": "input__marker_000001",
+  "sample_id": "sample_layout_002__marker_000000",
+  "source_path": "sample_layout_002.oas",
+  "marker_id": "sample_layout_002__marker_000000",
   "clip_bbox": [0.0, 0.0, 1.35, 1.35],
-  "aerial_npz": "aerial/sample_000001.npz"
+  "aerial_npz": "aerial_npz/sample_layout_002__marker_000000.npz",
+  "risk_score": 0.0
 }
-```
-
-可选字段：
-
-```text
-layout_npz
-resist_npz
-epe_npz
-pv_npz
-nils_npz
-risk_score
 ```
 
 约束：
 
 - `aerial_npz` 必填。
-- 每个 NPZ 必须包含 float32 数组键 `image`。
-- `epe/pv/nils` 是数据集级可选项：如果某个 channel 在任意样本中出现，则所有样本都必须提供。
-- `sample_id` 或 `marker_id` 必须能在 `features.npz` 中找到对应 FV。
+- 每个 NPZ 必须包含二维 float32 数组，key 固定为 `image`。
+- `sample_id` 或 `marker_id` 必须能在 FV 的 `sample_ids` 中找到对应行。
+- `epe_npz` / `pv_npz` / `nils_npz` 是数据集级可选项：只要某个 channel 出现，就要求所有样本都提供。
+- `resist_npz` 可用于手工特征统计和可选 diff 输出，但当前不参与 final verification weighted score。
 
-## 生成 AutoEncoder FV
+## 准备 No-Train 输入
 
-使用独立脚本 `layout_clustering_autoencoder.py`。
+如果你已经有每个 marker 对应的 aerial image，可以先用 `preprocess_notrain.py` 转成 no-train 可直接使用的目录。
+
+```bash
+python layoutclustering/preprocess_notrain.py input.oas \
+  --marker-layer 999/0 \
+  --aerial-dir aerial_images \
+  --output-dir notrain_inputs
+```
+
+输出目录：
+
+```text
+notrain_inputs/
+  behavior.jsonl
+  preprocess_summary.json
+  aerial_npz/
+    <marker_id>.npz
+```
+
+图片文件名匹配规则：
+
+1. 优先完整 marker id，例如 `sample_layout_002__marker_000123.png`
+2. 其次 `marker_000123`
+3. 最后裸编号 `000123`
+
+缺失 aerial 的 marker 会被跳过；重复匹配同一 marker 时按路径字符串升序取第一张，并在 `preprocess_summary.json` 中记录。
+
+支持格式：
+
+```text
+png, jpg, jpeg, tif, tiff, bmp, npy, npz, dm3, dm4
+```
+
+DM3/DM4 读取依赖 `ncempy`。`preprocess_notrain.py` 默认把图像 min-max normalize 到 `[0, 1]`，可用 `--no-normalize` 关闭。
+
+## 运行 No-Train 主线
+
+`layout_clustering_optimized_notrain.py` 不需要 `features.npz`，会自动生成 handcrafted FV。
+
+可以直接把 preprocess 输出目录传给 `--behavior-manifest`：
+
+```bash
+python layoutclustering/layout_clustering_optimized_notrain.py input.oas \
+  --marker-layer 999/0 \
+  --behavior-manifest notrain_inputs \
+  --output results_notrain.json
+```
+
+也可以传具体 JSONL 文件：
+
+```bash
+python layoutclustering/layout_clustering_optimized_notrain.py input.oas \
+  --marker-layer 999/0 \
+  --behavior-manifest notrain_inputs/behavior.jsonl \
+  --output results_notrain.json
+```
+
+no-train 输出会额外记录：
+
+```text
+pipeline_mode: optimized_notrain
+feature_source: handcraft
+feature_metadata
+handcraft_feature_npz
+handcraft_feature_metadata_json
+input_marker_count
+skipped_missing_behavior_count
+```
+
+如果 preprocess 跳过了缺图 marker，no-train 也会只聚类 manifest 中存在 aerial 的 marker 子集。
+
+## 运行 AE Optimized 主线
+
+AE 主线需要先训练/编码 FV。当前脚本名为 `feature_extractor_autoencoder.py`。
 
 训练：
 
 ```bash
-python layout_clustering_autoencoder.py train \
+python layoutclustering/feature_extractor_autoencoder.py train \
   --manifest train.jsonl \
   --model-out ae.pt \
   --latent-dim 128 \
@@ -88,48 +185,39 @@ python layout_clustering_autoencoder.py train \
 编码：
 
 ```bash
-python layout_clustering_autoencoder.py encode \
+python layoutclustering/feature_extractor_autoencoder.py encode \
   --manifest all.jsonl \
   --model ae.pt \
   --features-out features.npz \
   --fv-manifest-out fv_manifest.jsonl
 ```
 
-`features.npz` 包含：
+`features.npz` 必须包含：
 
 ```text
 sample_ids
 features
 ```
 
-其中 `sample_ids` 必须与主脚本中的 manifest sample 可一一匹配。
-
-## Layer Operations
-
-`--apply-layer-ops` 支持在 clustering 前对 OAS 中不同层做 boolean 操作，并把结果写到新层。常见用途是从多个设计层生成 marker 或 pattern 辅助层。
-
-支持操作：
-
-```text
-subtract
-union
-intersect
-```
-
-层格式固定为：
-
-```text
-layer/datatype
-```
-
-示例：
+然后运行主脚本：
 
 ```bash
-python layout_clustering_optimized.py input.oas \
+python layoutclustering/layout_clustering_optimized.py input.oas \
   --marker-layer 999/0 \
   --behavior-manifest behavior.jsonl \
   --feature-npz features.npz \
-  --apply-layer-ops \
+  --output results_optimized.json
+```
+
+## Layer Operations
+
+AE optimized 和 no-train 主脚本都支持 layer boolean operations：
+
+```bash
+python layoutclustering/layout_clustering_optimized.py input.oas \
+  --marker-layer 999/0 \
+  --behavior-manifest behavior.jsonl \
+  --feature-npz features.npz \
   --register-op 1/0 2/0 subtract 10/0 \
   --register-op 10/0 3/0 intersect 999/0 \
   --output results_layer_ops.json
@@ -141,9 +229,19 @@ python layout_clustering_optimized.py input.oas \
 source_layer operation target_layer -> result_layer
 ```
 
-只要提供 `--register-op`，脚本会自动启用 layer operations；显式写 `--apply-layer-ops` 只是让命令更清楚。
+支持操作：
+
+```text
+subtract
+union
+intersect
+```
+
+层格式固定为 `layer/datatype`。只要提供 `--register-op`，脚本会自动启用 layer operations；显式加 `--apply-layer-ops` 只是让命令更清楚。
 
 ## 关键参数
+
+两条主线共享这些 clustering 参数：
 
 ```text
 --ann-top-k 64
@@ -177,13 +275,13 @@ weighted k-center 补洞时，把 risk score top 10% 作为 high-risk 样本。
 
 ## Behavior Verification
 
-默认一定使用 aerial image SSIM distance：
+final verification 默认一定使用 aerial image SSIM distance：
 
 ```text
 distance = 1 - SSIM
 ```
 
-如果 `EPE/PV/NILS` 全局可用，会加入 weighted score：
+如果 `EPE/PV/NILS` 在 manifest 中全局可用，会加入 weighted score：
 
 ```text
 aerial: 0.60
@@ -192,19 +290,18 @@ PV:     0.15
 NILS:   0.10
 ```
 
-实际可用 channel 会自动重新归一化权重。verification 失败的 member 不做跨 cluster reassign，会直接成为 singleton/base representative，保证结果容易解释。
+实际可用 channel 会自动重新归一化权重。verification 失败的 member 不做跨 cluster reassign，会直接成为 singleton/base representative，保证结果容易解释和 review。
 
-## Review 输出
+## Review 与 Diff 输出
 
 导出 review 目录：
 
 ```bash
-python layout_clustering_optimized.py input.oas \
+python layoutclustering/layout_clustering_optimized_notrain.py input.oas \
   --marker-layer 999/0 \
-  --behavior-manifest behavior.jsonl \
-  --feature-npz features.npz \
-  --review-dir review_optimized \
-  --output results_optimized.json
+  --behavior-manifest notrain_inputs \
+  --review-dir review_notrain \
+  --output results_notrain.json
 ```
 
 兼容旧参数：
@@ -232,7 +329,7 @@ diff__*.npz
 
 ## 输出字段
 
-JSON 输出包含主要字段：
+主要 JSON 字段：
 
 ```text
 pipeline_mode
@@ -242,11 +339,13 @@ layer_operations
 marker_count
 exact_cluster_count
 selected_representative_count
+selected_candidate_count
 total_clusters
 total_samples
 cluster_sizes
 behavior_stats
 behavior_verification_stats
+final_verification_stats
 clusters
 file_list
 file_metadata
@@ -255,32 +354,22 @@ config
 cluster_review
 ```
 
-`--format txt` 会写出中文摘要，适合快速查看：
+no-train 额外字段：
 
-```bash
-python layout_clustering_optimized.py input.oas \
-  --marker-layer 999/0 \
-  --behavior-manifest behavior.jsonl \
-  --feature-npz features.npz \
-  --format txt \
-  --output summary.txt
+```text
+feature_source
+feature_metadata
+handcraft_feature_npz
+handcraft_feature_metadata_json
+input_marker_count
+skipped_missing_behavior_count
 ```
 
-## 过程显示
+`--format txt` 会写出中文摘要，适合快速查看 cluster 数、top cluster sizes、behavior stats 和 config。
 
-脚本默认输出中文阶段日志，包括：
+## 当前不包含的旧路线
 
-- 启动配置和 layer operation 规则。
-- 输入文件数和 marker layer。
-- 每个文件的 marker 数、pattern 元素数、窗口样本数。
-- exact hash 去重前后数量。
-- ANN / facility / k-center representative 选择结果。
-- behavior final verification pass/reject/singleton 统计。
-- review/export 路径和最终 cluster summary。
-
-## 不包含的旧路线
-
-当前 optimized 行为版不再保留：
+当前 optimized / no-train 行为版不再保留：
 
 ```text
 HDBSCAN
@@ -291,4 +380,4 @@ auto-marker
 几何 ACC/ECC 作为最终聚类 gate
 ```
 
-几何信息仍可通过 marker clip 和 exact hash 支持去重，但最终聚类质量由 behavior image verification 兜底。
+几何信息仍用于 marker clip、exact hash duplicate grouping 和 no-train handcrafted layout/WL 特征；最终 cluster 成员关系由 behavior image verification 兜底。
