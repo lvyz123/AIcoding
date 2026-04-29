@@ -1,0 +1,10 @@
+# Python 3.6 compatible dependency set for layout_clustering_optimized_v2_lsf.py
+#
+# 中文说明：
+# 1. v2_lsf 不依赖旧版训练/向量数据库组件，只保留 OAS、数值和形态学运行时。
+# 2. 这些版本上限用于避开 Python 3.7+ only 的 wheel。
+# 3. 实际 LSF 环境如果已有 EDA Python 镜像，可按同等 ABI 版本锁定。
+
+numpy>=1.19.5,<1.20
+scipy>=1.5.4,<1.6
+gdstk>=0.9.41,<0.10
