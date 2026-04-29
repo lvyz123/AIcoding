@@ -104,6 +104,8 @@ PACKED_EXPANDED_BITMAP_KEY = "optimized_expanded_bitmap_packed"
 PACKED_EXPANDED_SHAPE_KEY = "optimized_expanded_bitmap_shape"
 PACKED_CLIP_BITMAP_KEY = "optimized_clip_bitmap_packed"
 PACKED_CLIP_SHAPE_KEY = "optimized_clip_bitmap_shape"
+PACKED_CANDIDATE_CLIP_BITMAP_KEY = "optimized_candidate_clip_bitmap_packed"
+PACKED_CANDIDATE_CLIP_SHAPE_KEY = "optimized_candidate_clip_bitmap_shape"
 EXPORT_CHEAP_FEATURE_KEY = "optimized_export_cheap_feature"
 EXPORT_WORST_SCORE_KEY = "optimized_export_worst_score"
 EXPORT_DISTANCE_SCORE_KEY = "optimized_export_distance_score"
@@ -160,6 +162,22 @@ class RasterPayload:
     expanded_bitmap_shape: Tuple[int, int] | None = None
     graph_descriptor: GraphDescriptor | None = None
     cheap_descriptor: CheapDescriptor | None = None
+
+
+@dataclass(slots=True)
+class CoverageCandidateGroup:
+    """coverage 阶段的紧凑候选组，只保留一个长期常驻 candidate。"""
+
+    best_candidate: CandidateClip
+    packed_clip_bitmap: np.ndarray
+    clip_bitmap_shape: Tuple[int, int]
+    area_px: int
+    clip_hash: str
+    origin_ids: np.ndarray
+    logical_candidate_count: int
+    direction_counts: Dict[str, int]
+    coverage: Sequence[int]
+    materialized_candidates: Tuple[CandidateClip, ...] = ()
 
 
 def _empty_prefilter_stats() -> Dict[str, int]:
@@ -243,6 +261,8 @@ def _empty_coverage_debug_stats() -> Dict[str, int]:
         "shortlist_max_subgroup_size": 0,
         "shortlist_payload_peak_count": 0,
         "shortlist_payload_release_count": 0,
+        "lazy_signature_embedding_group_count": 0,
+        "signature_embedding_live_peak_count": 0,
         "pair_tracker_mode": "unset",
         "pair_tracker_disabled_bundle_count": 0,
         "pair_tracker_row_count": 0,
@@ -252,6 +272,7 @@ def _empty_coverage_debug_stats() -> Dict[str, int]:
         "max_bucket_window_group_count": 0,
         "bucketed_source_group_count": 0,
         "bucketed_target_group_count": 0,
+        "window_bitmap_live_peak_count": 0,
     }
 
 
@@ -294,6 +315,15 @@ def _empty_memory_debug() -> Dict[str, Any]:
         "strict_digest_collision_count": 0,
         "strict_key_bytes_avoided_estimate_mb": 0.0,
         "early_duplicate_shift_candidate_count": 0,
+        "candidate_object_avoided_count": 0,
+        "signature_embedding_bytes_avoided_estimate_mb": 0.0,
+        "online_exact_group_count": 0,
+        "light_member_record_count": 0,
+        "released_marker_clip_early_count": 0,
+        "released_marker_expanded_early_count": 0,
+        "packed_candidate_group_bitmap_count": 0,
+        "unpacked_candidate_group_bitmap_count": 0,
+        "candidate_group_bitmap_bytes_avoided_estimate_mb": 0.0,
     }
 
 
@@ -408,14 +438,14 @@ def _strict_bitmap_digest(packed: np.ndarray, shape: Tuple[int, int]) -> bytes:
     return digest.digest()
 
 
-def _strict_bitmap_digest_key(bitmap: np.ndarray) -> Tuple[Tuple[int, int, bytes], np.ndarray, int]:
-    """返回 optimized v1 的 strict digest key、规范 bitmap 和 packed 字节长度。"""
+def _strict_bitmap_digest_key(bitmap: np.ndarray) -> Tuple[Tuple[int, int, bytes], np.ndarray, np.ndarray, int]:
+    """返回 optimized v1 的 strict digest key、规范 bitmap、packed payload 和 packed 字节长度。"""
 
     mask = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
     shape = (int(mask.shape[0]), int(mask.shape[1]))
     packed = np.packbits(mask.reshape(-1))
     key = (shape[0], shape[1], _strict_bitmap_digest(packed, shape))
-    return key, mask, int(packed.size)
+    return key, mask, np.asarray(packed, dtype=np.uint8), int(packed.size)
 
 
 def _same_bitmap(left: np.ndarray, right: np.ndarray) -> bool:
@@ -467,6 +497,25 @@ def _pack_marker_clip_bitmap(record: MarkerRecord) -> bool:
     record.match_cache[PACKED_CLIP_BITMAP_KEY] = packed
     record.match_cache[PACKED_CLIP_SHAPE_KEY] = shape
     return True
+
+
+def _attach_packed_candidate_clip_bitmap(candidate: CandidateClip, packed: np.ndarray, shape: Tuple[int, int]) -> None:
+    """把候选 clip bitmap 的 packed 形态挂到 candidate cache。"""
+
+    candidate.match_cache[PACKED_CANDIDATE_CLIP_BITMAP_KEY] = np.asarray(packed, dtype=np.uint8)
+    candidate.match_cache[PACKED_CANDIDATE_CLIP_SHAPE_KEY] = (int(shape[0]), int(shape[1]))
+
+
+def _candidate_clip_bitmap(candidate: CandidateClip) -> np.ndarray:
+    """按需取回 candidate 的 clip bitmap，优先使用 at-rest packed payload。"""
+
+    bitmap = getattr(candidate, "clip_bitmap", None)
+    if bitmap is not None:
+        return np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
+    packed = candidate.match_cache.get(PACKED_CANDIDATE_CLIP_BITMAP_KEY)
+    shape = candidate.match_cache.get(PACKED_CANDIDATE_CLIP_SHAPE_KEY)
+    assert packed is not None and shape is not None, "candidate bitmap 恢复时 packed payload 不应为空"
+    return _unpack_bitmap_payload(np.asarray(packed, dtype=np.uint8), tuple(int(value) for value in shape))
 
 
 def _clip_bitmap_for_export(record: MarkerRecord) -> np.ndarray:
@@ -528,6 +577,14 @@ def _release_candidate_geometry_payload(candidate: CandidateClip, keep_clip_bitm
     if not keep_clip_bitmap and getattr(candidate, "clip_bitmap", None) is not None:
         candidate.clip_bitmap = None
         released = True
+    if not keep_clip_bitmap:
+        released = _clear_match_cache_keys(
+            candidate,
+            (
+                PACKED_CANDIDATE_CLIP_BITMAP_KEY,
+                PACKED_CANDIDATE_CLIP_SHAPE_KEY,
+            ),
+        ) or released
     return released
 
 
@@ -1520,6 +1577,8 @@ def _write_text_summary(result: Dict[str, Any], output_path: Path) -> None:
         )
         handle.write(f"  exact cluster 数: {result.get('exact_cluster_count')}\n")
         handle.write(f"  candidate 数: {result.get('candidate_count')}\n")
+        handle.write(f"  candidate group 数: {result.get('candidate_group_count', 0)}\n")
+        handle.write(f"  避免常驻 candidate 对象数: {result.get('candidate_object_avoided_count', 0)}\n")
         handle.write(f"  candidate 方向分布: {result.get('candidate_direction_counts', {})}\n")
         handle.write(f"  diagonal candidate 数: {result.get('diagonal_candidate_count', 0)}\n")
         handle.write(f"  selected candidate 数: {result.get('selected_candidate_count')}\n")
@@ -1799,7 +1858,12 @@ def _descriptor(owner: Any) -> GraphDescriptor:
 
     descriptor = owner.match_cache.get("optimized_graph_descriptor")
     if descriptor is None:
-        descriptor = _bitmap_descriptor(owner.clip_bitmap)
+        if isinstance(owner, CandidateClip):
+            bitmap = _candidate_clip_bitmap(owner)
+        else:
+            bitmap = getattr(owner, "clip_bitmap", None)
+            assert bitmap is not None, "构建图描述符时 clip bitmap 不应为空"
+        descriptor = _bitmap_descriptor(bitmap)
         owner.match_cache["optimized_graph_descriptor"] = descriptor
     return descriptor
 
@@ -1809,7 +1873,12 @@ def _cheap_descriptor(owner: Any) -> CheapDescriptor:
 
     descriptor = owner.match_cache.get("optimized_cheap_descriptor")
     if descriptor is None:
-        descriptor = _cheap_bitmap_descriptor(owner.clip_bitmap)
+        if isinstance(owner, CandidateClip):
+            bitmap = _candidate_clip_bitmap(owner)
+        else:
+            bitmap = getattr(owner, "clip_bitmap", None)
+            assert bitmap is not None, "构建 cheap 描述符时 clip bitmap 不应为空"
+        descriptor = _cheap_bitmap_descriptor(bitmap)
         owner.match_cache["optimized_cheap_descriptor"] = descriptor
     return descriptor
 
@@ -2213,6 +2282,33 @@ def _candidate_shift_summary(candidates: Sequence[CandidateClip]) -> Dict[str, A
     }
 
 
+def _candidate_shift_summary_from_counts(
+    direction_counts: Counter[str],
+    max_shift_distance_um: float,
+) -> Dict[str, Any]:
+    """把累计方向计数压成与旧版一致的 candidate 统计结构。"""
+
+    diagonal_count = sum(
+        int(count) for direction, count in direction_counts.items() if str(direction).startswith("diag_")
+    )
+    return {
+        "candidate_direction_counts": {str(direction): int(count) for direction, count in direction_counts.items()},
+        "diagonal_candidate_count": int(diagonal_count),
+        "max_shift_distance_um": float(max_shift_distance_um),
+    }
+
+
+def _candidate_greedy_tiebreak(candidate: CandidateClip) -> Tuple[int, float, int, str]:
+    """在 coverage 完全相同的前提下，复用 greedy set cover 的候选优先级。"""
+
+    return (
+        -1 if str(candidate.shift_direction) == "base" else 0,
+        abs(float(candidate.shift_distance_um)),
+        int(candidate.origin_exact_cluster_id),
+        str(candidate.candidate_id),
+    )
+
+
 def _invariant_distance(desc_a: GraphDescriptor, desc_b: GraphDescriptor) -> Tuple[float, bool]:
     """计算 invariant 相对误差距离，并标记是否命中关键维度大偏差。"""
 
@@ -2264,10 +2360,10 @@ def _coverage_structure(tol_px: int) -> np.ndarray:
     return cached
 
 
-def _init_coverage_geometry_cache(owner: Any) -> Dict[str, Any]:
+def _init_coverage_geometry_cache(bitmap: np.ndarray) -> Dict[str, Any]:
     """初始化 coverage 几何缓存，只生成 packed bitmap 和面积。"""
 
-    bitmap = np.ascontiguousarray(np.asarray(owner.clip_bitmap, dtype=bool))
+    bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
     return {
         "packed": np.packbits(bitmap.reshape(-1)),
         "area_px": int(np.count_nonzero(bitmap)),
@@ -2275,14 +2371,11 @@ def _init_coverage_geometry_cache(owner: Any) -> Dict[str, Any]:
     }
 
 
-def _extend_coverage_dilated_cache(cache: Dict[str, Any], tol_px: int) -> None:
+def _extend_coverage_dilated_cache(cache: Dict[str, Any], tol_px: int, bitmap: np.ndarray) -> None:
     """把 coverage 几何缓存扩展到膨胀层，不计算 donut。"""
 
     if int(tol_px) <= 0 or "packed_dilated" in cache:
         return
-    owner = cache.get("owner")
-    bitmap = getattr(owner, "clip_bitmap", None)
-    assert bitmap is not None, "coverage 膨胀缓存构建时 clip_bitmap 不应为空"
     bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
     structure = _coverage_structure(int(tol_px))
     dilated = np.ascontiguousarray(ndimage.binary_dilation(bitmap, structure=structure), dtype=bool)
@@ -2290,15 +2383,12 @@ def _extend_coverage_dilated_cache(cache: Dict[str, Any], tol_px: int) -> None:
     cache["dilated_area_px"] = int(np.count_nonzero(dilated))
 
 
-def _extend_coverage_donut_cache(cache: Dict[str, Any], tol_px: int) -> None:
+def _extend_coverage_donut_cache(cache: Dict[str, Any], tol_px: int, bitmap: np.ndarray) -> None:
     """把 coverage 几何缓存扩展到 donut 层，供最终 ECC overlap 使用。"""
 
     if int(tol_px) <= 0 or "packed_donut" in cache:
         return
-    _extend_coverage_dilated_cache(cache, int(tol_px))
-    owner = cache.get("owner")
-    bitmap = getattr(owner, "clip_bitmap", None)
-    assert bitmap is not None, "coverage 环带缓存构建时 clip_bitmap 不应为空"
+    _extend_coverage_dilated_cache(cache, int(tol_px), bitmap)
     bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
     structure = _coverage_structure(int(tol_px))
     dilated = np.ascontiguousarray(ndimage.binary_dilation(bitmap, structure=structure), dtype=bool)
@@ -2336,9 +2426,12 @@ def _ecc_cache(owner: Any, tol_px: int) -> Dict[str, Any]:
     if cache is not None:
         return cache
 
-    bitmap = getattr(owner, "clip_bitmap", None)
-    assert bitmap is not None, "ECC 缓存构建时 clip_bitmap 不应为空"
-    bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
+    if isinstance(owner, CandidateClip):
+        bitmap = _candidate_clip_bitmap(owner)
+    else:
+        bitmap = getattr(owner, "clip_bitmap", None)
+        assert bitmap is not None, "ECC 缓存构建时 clip_bitmap 不应为空"
+        bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
     cache = {
         "area": int(np.count_nonzero(bitmap)),
     }
@@ -2356,9 +2449,8 @@ def _ecc_cache(owner: Any, tol_px: int) -> Dict[str, Any]:
 def _ecc_match_cached(candidate: CandidateClip, target: MarkerRecord, edge_tolerance_um: float, pixel_size_um: float) -> bool:
     """使用缓存后的位图形态学结果执行 ECC 几何匹配。"""
 
-    candidate_bitmap = getattr(candidate, "clip_bitmap", None)
+    candidate_bitmap = _candidate_clip_bitmap(candidate)
     target_bitmap = getattr(target, "clip_bitmap", None)
-    assert candidate_bitmap is not None, "ECC 匹配时 candidate.clip_bitmap 不应为空"
     assert target_bitmap is not None, "ECC 匹配时 target.clip_bitmap 不应为空"
     candidate_bitmap = np.ascontiguousarray(np.asarray(candidate_bitmap, dtype=bool))
     target_bitmap = np.ascontiguousarray(np.asarray(target_bitmap, dtype=bool))
@@ -2461,6 +2553,57 @@ class OptimizedMainlineRunner(MainlineRunner):
                 self.memory_debug["released_marker_expanded_count"] += 1
         gc.collect()
 
+    def _lighten_online_exact_member_record(self, record: MarkerRecord) -> None:
+        """在 online exact grouping 时尽早释放非代表成员的大 bitmap。"""
+
+        if self.materialize_outputs:
+            if _release_marker_expanded_bitmap(record):
+                self.memory_debug["released_marker_expanded_early_count"] += 1
+            return
+
+        self.memory_debug["light_member_record_count"] += 1
+        _ensure_export_rerank_cache(record, include_distance=True)
+        had_expanded = bool(
+            getattr(record, "expanded_bitmap", None) is not None
+            or PACKED_EXPANDED_BITMAP_KEY in record.match_cache
+        )
+        had_clip = bool(getattr(record, "clip_bitmap", None) is not None)
+        _release_marker_clip_payload(record, keep_clip_bitmap=False)
+        if had_expanded:
+            self.memory_debug["released_marker_expanded_early_count"] += 1
+        if had_clip and getattr(record, "clip_bitmap", None) is None:
+            self.memory_debug["released_marker_clip_early_count"] += 1
+
+    def _register_online_exact_record(
+        self,
+        record: MarkerRecord,
+        marker_records: List[MarkerRecord],
+        exact_clusters: List[ExactCluster],
+        exact_index_by_key: Dict[Tuple[str, str], int],
+    ) -> None:
+        """把新生成的 marker 直接并入 online exact cluster 累加器。"""
+
+        marker_records.append(record)
+        exact_key = (str(record.clip_hash), str(record.expanded_hash))
+        existing_cluster_id = exact_index_by_key.get(exact_key)
+        if existing_cluster_id is None:
+            cluster_id = int(len(exact_clusters))
+            record.exact_cluster_id = cluster_id
+            exact_clusters.append(
+                ExactCluster(
+                    exact_cluster_id=cluster_id,
+                    representative=record,
+                    members=[record],
+                )
+            )
+            exact_index_by_key[exact_key] = cluster_id
+            return
+
+        cluster = exact_clusters[int(existing_cluster_id)]
+        record.exact_cluster_id = int(cluster.exact_cluster_id)
+        cluster.members.append(record)
+        self._lighten_online_exact_member_record(record)
+
     def _release_representative_expanded_bitmaps(self, exact_clusters: Sequence[ExactCluster]) -> None:
         """在 candidate 生成完成后释放 representative 的 expanded bitmap。"""
 
@@ -2473,6 +2616,22 @@ class OptimizedMainlineRunner(MainlineRunner):
         """在 set cover 后释放未入选 candidate 的 bitmap 和缓存。"""
 
         for candidate in candidates:
+            keep_clip = str(candidate.candidate_id) in selected_ids or str(candidate.shift_direction) == "base"
+            if _release_candidate_geometry_payload(candidate, keep_clip_bitmap=keep_clip):
+                self.memory_debug["released_cache_owner_count"] += 1
+            if not keep_clip and getattr(candidate, "clip_bitmap", None) is None:
+                self.memory_debug["released_candidate_clip_count"] += 1
+        gc.collect()
+
+    def _release_unselected_candidate_groups(
+        self,
+        candidate_groups: Sequence[CoverageCandidateGroup],
+        selected_ids: set[str],
+    ) -> None:
+        """在 set cover 后释放未入选 candidate group 的长期常驻 bitmap 与缓存。"""
+
+        for candidate_group in candidate_groups:
+            candidate = candidate_group.best_candidate
             keep_clip = str(candidate.candidate_id) in selected_ids or str(candidate.shift_direction) == "base"
             if _release_candidate_geometry_payload(candidate, keep_clip_bitmap=keep_clip):
                 self.memory_debug["released_cache_owner_count"] += 1
@@ -2494,7 +2653,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         """按逐像素 exact key 共享 candidate bitmap，减少重复 ndarray 常驻。"""
 
         del clip_hash
-        key, mask, packed_size = _strict_bitmap_digest_key(bitmap)
+        key, mask, _, packed_size = _strict_bitmap_digest_key(bitmap)
         cached_list = self._candidate_bitmap_pool.get(key)
         if cached_list is not None:
             for cached in cached_list:
@@ -2509,6 +2668,162 @@ class OptimizedMainlineRunner(MainlineRunner):
         self.memory_debug["candidate_bitmap_pool_unique_count"] += 1
         self.memory_debug["strict_key_bytes_avoided_estimate_mb"] += float(packed_size) / (1024.0 * 1024.0)
         return mask
+
+    def _park_candidate_group_bitmap(
+        self,
+        candidate: CandidateClip,
+        packed: np.ndarray,
+        shape: Tuple[int, int],
+    ) -> None:
+        """把 candidate clip bitmap 切到 packed-at-rest 形态，降低长期常驻内存。"""
+
+        if PACKED_CANDIDATE_CLIP_BITMAP_KEY not in candidate.match_cache:
+            _attach_packed_candidate_clip_bitmap(candidate, packed, shape)
+            self.memory_debug["packed_candidate_group_bitmap_count"] += 1
+            self.memory_debug["candidate_group_bitmap_bytes_avoided_estimate_mb"] += (
+                float(max(int(shape[0]) * int(shape[1]) - int(np.asarray(packed, dtype=np.uint8).size), 0))
+                / (1024.0 * 1024.0)
+            )
+        candidate.clip_bitmap = None
+
+    def _merge_coverage_candidate(
+        self,
+        group_buckets: Dict[Tuple[int, int, bytes], List[CoverageCandidateGroup]],
+        ordered_groups: List[CoverageCandidateGroup],
+        candidate: CandidateClip,
+        *,
+        retain_materialized_candidates: bool,
+    ) -> None:
+        """把一个 candidate 合并进全局 strict bitmap group，避免全量对象长期常驻。"""
+
+        bitmap = getattr(candidate, "clip_bitmap", None)
+        assert bitmap is not None, "coverage candidate group 合并时 candidate.clip_bitmap 不应为空"
+        key, mask, packed, packed_size = _strict_bitmap_digest_key(bitmap)
+        bucket_list = group_buckets.get(key)
+        if bucket_list is None:
+            bucket_list = []
+            group_buckets[key] = bucket_list
+        matched_group = None
+        for candidate_group in bucket_list:
+            if (
+                tuple(int(value) for value in candidate_group.clip_bitmap_shape) == tuple(int(value) for value in mask.shape)
+                and np.array_equal(
+                    np.asarray(candidate_group.packed_clip_bitmap, dtype=np.uint8),
+                    np.asarray(packed, dtype=np.uint8),
+                )
+            ):
+                matched_group = candidate_group
+                break
+        if matched_group is None:
+            if bucket_list:
+                self.memory_debug["strict_digest_collision_count"] += 1
+            packed_shape = (int(mask.shape[0]), int(mask.shape[1]))
+            candidate_group = CoverageCandidateGroup(
+                best_candidate=candidate,
+                packed_clip_bitmap=np.asarray(packed, dtype=np.uint8),
+                clip_bitmap_shape=packed_shape,
+                area_px=int(np.count_nonzero(mask)),
+                clip_hash=str(candidate.clip_hash),
+                origin_ids=_coverage_to_array([int(candidate.origin_exact_cluster_id)]),
+                logical_candidate_count=1,
+                direction_counts={str(candidate.shift_direction): 1},
+                coverage=_coverage_to_array(candidate.coverage),
+                materialized_candidates=(candidate,) if retain_materialized_candidates else (),
+            )
+            if not retain_materialized_candidates:
+                self._park_candidate_group_bitmap(candidate, candidate_group.packed_clip_bitmap, packed_shape)
+            bucket_list.append(candidate_group)
+            ordered_groups.append(candidate_group)
+            self.memory_debug["strict_digest_key_count"] = max(
+                int(self.memory_debug.get("strict_digest_key_count", 0)),
+                int(len(group_buckets)),
+            )
+            self.memory_debug["strict_key_bytes_avoided_estimate_mb"] = max(
+                float(self.memory_debug.get("strict_key_bytes_avoided_estimate_mb", 0.0)),
+                float(packed_size) / (1024.0 * 1024.0),
+            )
+            return
+
+        matched_group.logical_candidate_count += 1
+        matched_group.origin_ids = _coverage_union(
+            np.asarray(matched_group.origin_ids, dtype=np.int32),
+            _coverage_to_array([int(candidate.origin_exact_cluster_id)]),
+        )
+        matched_group.coverage = _coverage_union(
+            _coverage_to_array(matched_group.coverage),
+            _coverage_to_array(candidate.coverage),
+        )
+        direction = str(candidate.shift_direction)
+        matched_group.direction_counts[direction] = int(matched_group.direction_counts.get(direction, 0)) + 1
+        if retain_materialized_candidates:
+            matched_group.materialized_candidates = tuple(matched_group.materialized_candidates) + (candidate,)
+        if _candidate_greedy_tiebreak(candidate) < _candidate_greedy_tiebreak(matched_group.best_candidate):
+            previous_best = matched_group.best_candidate
+            matched_group.best_candidate = candidate
+            if not retain_materialized_candidates:
+                self._park_candidate_group_bitmap(candidate, matched_group.packed_clip_bitmap, matched_group.clip_bitmap_shape)
+            if (
+                not retain_materialized_candidates
+                and (
+                str(previous_best.shift_direction) != "base"
+                and previous_best is not self._base_candidate_by_exact_id.get(int(previous_best.origin_exact_cluster_id))
+                )
+            ):
+                if _release_candidate_geometry_payload(previous_best, keep_clip_bitmap=False):
+                    self.memory_debug["released_cache_owner_count"] += 1
+                if getattr(previous_best, "clip_bitmap", None) is None:
+                    self.memory_debug["released_candidate_clip_count"] += 1
+            elif not retain_materialized_candidates:
+                self._park_candidate_group_bitmap(
+                    previous_best,
+                    matched_group.packed_clip_bitmap,
+                    matched_group.clip_bitmap_shape,
+                )
+        elif (
+            not retain_materialized_candidates
+            and (
+            str(candidate.shift_direction) != "base"
+            and candidate is not self._base_candidate_by_exact_id.get(int(candidate.origin_exact_cluster_id))
+            )
+        ):
+            if _release_candidate_geometry_payload(candidate, keep_clip_bitmap=False):
+                self.memory_debug["released_cache_owner_count"] += 1
+            if getattr(candidate, "clip_bitmap", None) is None:
+                self.memory_debug["released_candidate_clip_count"] += 1
+        elif not retain_materialized_candidates:
+            self._park_candidate_group_bitmap(
+                candidate,
+                matched_group.packed_clip_bitmap,
+                matched_group.clip_bitmap_shape,
+            )
+
+    def _build_global_coverage_candidate_groups(
+        self,
+        exact_clusters: Sequence[ExactCluster],
+    ) -> Tuple[List[CoverageCandidateGroup], int, Dict[str, Any]]:
+        """逐个 exact cluster 生成 candidate，并立即压成全局紧凑 coverage group。"""
+
+        group_buckets: Dict[Tuple[int, int, bytes], List[CoverageCandidateGroup]] = {}
+        ordered_groups: List[CoverageCandidateGroup] = []
+        direction_counts: Counter[str] = Counter()
+        max_shift_distance_um = 0.0
+        candidate_count = 0
+        for exact_cluster in exact_clusters:
+            cluster_candidates = self._generate_candidates_for_cluster(exact_cluster)
+            candidate_count += int(len(cluster_candidates))
+            for candidate in cluster_candidates:
+                direction_counts[str(candidate.shift_direction)] += 1
+                max_shift_distance_um = max(max_shift_distance_um, abs(float(candidate.shift_distance_um)))
+                self._merge_coverage_candidate(
+                    group_buckets,
+                    ordered_groups,
+                    candidate,
+                    retain_materialized_candidates=False,
+                )
+            cluster_candidates.clear()
+        self.memory_debug["candidate_object_avoided_count"] = max(0, int(candidate_count - len(ordered_groups)))
+        candidate_shift_summary = _candidate_shift_summary_from_counts(direction_counts, max_shift_distance_um)
+        return ordered_groups, int(candidate_count), candidate_shift_summary
 
     def _release_candidate_bitmap_pool(self) -> None:
         """清空 candidate bitmap intern pool 的字典引用。"""
@@ -2599,8 +2914,12 @@ class OptimizedMainlineRunner(MainlineRunner):
             "seed_type": str(candidate.seed_type),
         }
 
-    def _collect_marker_records_for_file(self, filepath: Path) -> List[MarkerRecord]:
-        """对单个 OAS 文件执行 geometry-driven seed 生成并构建窗口记录。"""
+    def _collect_marker_records_for_file(
+        self,
+        filepath: Path,
+        online_exact_state: Dict[str, Any] | None = None,
+    ) -> List[MarkerRecord]:
+        """对单个 OAS 文件执行 geometry-driven seed 生成，并可选地直接接入 online exact grouping。"""
 
         layout_index = self._prepare_layout(filepath)
         if self.apply_layer_operations:
@@ -2619,6 +2938,10 @@ class OptimizedMainlineRunner(MainlineRunner):
         )
 
         records: List[MarkerRecord] = []
+        online_mode = online_exact_state is not None
+        online_marker_records = online_exact_state["marker_records"] if online_mode else []
+        online_exact_clusters = online_exact_state["exact_clusters"] if online_mode else []
+        online_exact_index = online_exact_state["exact_index_by_key"] if online_mode else {}
         pre_raster_cache: Dict[str, RasterPayload] = {}
         exact_bitmap_cache: Dict[Tuple[str, str], RasterPayload] = {}
         cache_stats = {
@@ -2629,6 +2952,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             "pre_raster_payload_cache_count": 0,
             "exact_bitmap_payload_cache_count": 0,
         }
+        generated_count = 0
         for marker_index, candidate in enumerate(bucketed_candidates):
             raster_spec = self._seed_raster_spec(candidate)
             pre_key = _pre_raster_fingerprint(
@@ -2643,7 +2967,11 @@ class OptimizedMainlineRunner(MainlineRunner):
                 self._apply_seed_metadata(record, filepath, marker_index, candidate)
                 if getattr(record, "expanded_bitmap", None) is not None and _pack_marker_expanded_bitmap(record):
                     self.memory_debug["packed_marker_expanded_count"] += 1
-                records.append(record)
+                generated_count += 1
+                if online_mode:
+                    self._register_online_exact_record(record, online_marker_records, online_exact_clusters, online_exact_index)
+                else:
+                    records.append(record)
                 continue
             cache_stats["pre_raster_cache_miss"] += 1
 
@@ -2678,20 +3006,26 @@ class OptimizedMainlineRunner(MainlineRunner):
                 if cached.cheap_descriptor is not None:
                     record.match_cache["optimized_cheap_descriptor"] = cached.cheap_descriptor
             pre_raster_cache[pre_key] = _raster_payload_from_record(record)
-            records.append(record)
+            generated_count += 1
+            if online_mode:
+                self._register_online_exact_record(record, online_marker_records, online_exact_clusters, online_exact_index)
+            else:
+                records.append(record)
 
         cache_stats["pre_raster_payload_cache_count"] = int(len(pre_raster_cache))
         cache_stats["exact_bitmap_payload_cache_count"] = int(len(exact_bitmap_cache))
         self.memory_debug["pre_raster_payload_cache_count"] += int(len(pre_raster_cache))
         self.memory_debug["exact_bitmap_payload_cache_count"] += int(len(exact_bitmap_cache))
         self._seed_stats_by_source[str(filepath)].update(cache_stats)
-        self._log(f"文件 {filepath.name}: 生成 geometry-driven seed 窗口 {len(records)} 个")
+        self._log(f"文件 {filepath.name}: 生成 geometry-driven seed 窗口 {generated_count} 个")
         self._log(
             f"文件 {filepath.name}: pre-raster cache hit/miss "
             f"{cache_stats['pre_raster_cache_hit']}/{cache_stats['pre_raster_cache_miss']}, "
             f"exact bitmap cache hit/miss "
             f"{cache_stats['exact_bitmap_cache_hit']}/{cache_stats['exact_bitmap_cache_miss']}"
         )
+        if online_mode:
+            return []
         return records
 
     def run(self, input_path: str) -> Dict[str, Any]:
@@ -2708,10 +3042,16 @@ class OptimizedMainlineRunner(MainlineRunner):
         self._log("开始收集 geometry-driven seed 窗口...")
         marker_started = time.perf_counter()
         marker_records: List[MarkerRecord] = []
+        exact_clusters: List[ExactCluster] = []
+        online_exact_state = {
+            "marker_records": marker_records,
+            "exact_clusters": exact_clusters,
+            "exact_index_by_key": {},
+        }
         for filepath in input_files:
             if self.apply_layer_operations:
                 self._log(f" 对文件 {filepath.name} 应用层操作...")
-            marker_records.extend(self._collect_marker_records_for_file(filepath))
+            self._collect_marker_records_for_file(filepath, online_exact_state=online_exact_state)
         marker_elapsed = time.perf_counter() - marker_started
 
         if not marker_records:
@@ -2726,23 +3066,21 @@ class OptimizedMainlineRunner(MainlineRunner):
 
         self._log("开始 exact hash 聚合...")
         dedup_started = time.perf_counter()
-        exact_clusters = self._group_exact_clusters(marker_records)
+        self.memory_debug["online_exact_group_count"] = int(len(exact_clusters))
         dedup_elapsed = time.perf_counter() - dedup_started
         self._log(f"exact hash 聚合完成: {len(marker_records)} -> {len(exact_clusters)}")
-        self._release_marker_records_after_exact_cluster(marker_records, exact_clusters)
         self._mark_memory("rss_exact_cluster_mb")
 
         self._log("开始生成 systematic shift candidates...")
         candidate_started = time.perf_counter()
-        all_candidates: List[CandidateClip] = []
-        for exact_cluster in exact_clusters:
-            all_candidates.extend(self._generate_candidates_for_cluster(exact_cluster))
+        candidate_groups, candidate_count, candidate_shift_summary = self._build_global_coverage_candidate_groups(
+            exact_clusters
+        )
         candidate_elapsed = time.perf_counter() - candidate_started
         self._release_representative_expanded_bitmaps(exact_clusters)
-        candidate_count = int(len(all_candidates))
-        candidate_shift_summary = _candidate_shift_summary(all_candidates)
         self._log(
             f"candidate 生成完成: {candidate_count} 个, "
+            f"group={len(candidate_groups)}, "
             f"方向分布={candidate_shift_summary['candidate_direction_counts']}, "
             f"diagonal={candidate_shift_summary['diagonal_candidate_count']}"
         )
@@ -2751,21 +3089,21 @@ class OptimizedMainlineRunner(MainlineRunner):
         self._log("开始构建 verified coverage edges...")
         coverage_started = time.perf_counter()
         self.prefilter_stats = _empty_prefilter_stats()
-        self._evaluate_candidate_coverage(all_candidates, exact_clusters)
+        self._evaluate_candidate_coverage(candidate_groups, exact_clusters)
         coverage_elapsed = time.perf_counter() - coverage_started
         self._log(f"coverage 构建完成: {self.prefilter_stats}")
         self._mark_memory("rss_coverage_eval_mb")
 
         self._log("开始 greedy set cover...")
         cover_started = time.perf_counter()
-        selected_candidates = self._greedy_cover(all_candidates, exact_clusters)
+        selected_candidates = self._greedy_cover(candidate_groups, exact_clusters)
         cover_elapsed = time.perf_counter() - cover_started
-        self._release_unselected_candidates(
-            all_candidates,
+        self._release_unselected_candidate_groups(
+            candidate_groups,
             {str(candidate.candidate_id) for candidate in selected_candidates},
         )
-        self.memory_debug["released_candidate_list_ref_count"] += int(len(all_candidates))
-        all_candidates.clear()
+        self.memory_debug["released_candidate_list_ref_count"] += int(len(candidate_groups))
+        candidate_groups.clear()
         gc.collect()
         selected_direction_counts = dict(Counter(str(candidate.shift_direction) for candidate in selected_candidates))
         self._log(
@@ -2793,6 +3131,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             "greedy",
             runtime_summary=runtime_summary,
             candidate_count=candidate_count,
+            candidate_group_count=int(self.coverage_debug_stats.get("candidate_group_count", 0)),
             candidate_shift_summary=candidate_shift_summary,
         )
         self._mark_memory("rss_result_build_mb")
@@ -2868,7 +3207,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         ) -> None:
             """在同一个 exact cluster 内先做 strict duplicate 去重，再创建 candidate。"""
 
-            key, mask, _ = _strict_bitmap_digest_key(bitmap)
+            key, mask, _, _ = _strict_bitmap_digest_key(bitmap)
             proposal_index = int(len(proposals))
             cost = _proposal_cost(str(shift_direction), float(shift_distance_um), proposal_index)
             slots = proposal_slots.get(key)
@@ -3048,77 +3387,64 @@ class OptimizedMainlineRunner(MainlineRunner):
         else:
             self.prefilter_stats["geometry_reject"] += 1
 
+    def _coerce_coverage_candidate_groups(
+        self,
+        candidates: Sequence[CandidateClip] | Sequence[CoverageCandidateGroup],
+    ) -> List[CoverageCandidateGroup]:
+        """把输入统一转成 coverage candidate group，兼容旧测试直接传 candidate 列表。"""
+
+        if len(candidates) == 0:
+            return []
+        first = candidates[0]
+        if isinstance(first, CoverageCandidateGroup):
+            return list(candidates)
+        group_buckets: Dict[Tuple[int, int, bytes], List[CoverageCandidateGroup]] = {}
+        ordered_groups: List[CoverageCandidateGroup] = []
+        for candidate in candidates:
+            self._merge_coverage_candidate(
+                group_buckets,
+                ordered_groups,
+                candidate,
+                retain_materialized_candidates=True,
+            )
+        return ordered_groups
+
     def _build_candidate_match_bundles(
         self,
-        candidates: Sequence[CandidateClip],
+        candidates: Sequence[CandidateClip] | Sequence[CoverageCandidateGroup],
         tol_px: int,
     ) -> Dict[Tuple[int, int], Dict[str, Any]]:
-        """按严格 bitmap key 构建轻量 coverage bundle，不预先生成 ECC cache。"""
+        """按 bitmap shape 构建轻量 coverage bundle，不预先生成 ECC cache。"""
 
         del tol_px
-        grouped: Dict[Tuple[int, int, bytes], List[Dict[str, Any]]] = {}
-        avoided_key_bytes = 0
-        for candidate in candidates:
-            bitmap = getattr(candidate, "clip_bitmap", None)
-            assert bitmap is not None, "coverage bundle 构建时 candidate.clip_bitmap 不应为空"
-            key, mask, packed_size = _strict_bitmap_digest_key(bitmap)
-            bucket_list = grouped.get(key)
-            if bucket_list is None:
-                bucket_list = []
-                grouped[key] = bucket_list
-            bucket = None
-            for existing in bucket_list:
-                representative_bitmap = getattr(existing["representative"], "clip_bitmap", None)
-                if representative_bitmap is not None and _same_bitmap(representative_bitmap, mask):
-                    bucket = existing
-                    break
-            if bucket is None:
-                if bucket_list:
-                    self.memory_debug["strict_digest_collision_count"] += 1
-                bucket = {"representative": candidate, "candidates": [], "origin_ids": []}
-                bucket_list.append(bucket)
-                avoided_key_bytes += int(packed_size)
-            bucket["candidates"].append(candidate)
-            bucket["origin_ids"].append(int(candidate.origin_exact_cluster_id))
-
+        candidate_groups = self._coerce_coverage_candidate_groups(candidates)
         bundles: Dict[Tuple[int, int], Dict[str, Any]] = {}
-        self.memory_debug["strict_digest_key_count"] = max(
-            int(self.memory_debug.get("strict_digest_key_count", 0)),
-            int(len(grouped)),
-        )
-        self.memory_debug["strict_key_bytes_avoided_estimate_mb"] = max(
-            float(self.memory_debug.get("strict_key_bytes_avoided_estimate_mb", 0.0)),
-            float(avoided_key_bytes) / (1024.0 * 1024.0),
-        )
-
-        for bucket_list in grouped.values():
-            for bucket in bucket_list:
-                representative_candidate = bucket["representative"]
-                representative_bitmap = getattr(representative_candidate, "clip_bitmap", None)
-                assert representative_bitmap is not None, "coverage bundle representative.clip_bitmap 不应为空"
-                shape = tuple(int(value) for value in representative_bitmap.shape)
-                bundle = bundles.setdefault(
-                    shape,
-                    {
-                        "areas": [],
-                        "hashes": [],
-                        "origin_ids": [],
-                        "candidate_groups": [],
-                        "representatives": [],
-                        "clip_pixels": int(shape[0]) * int(shape[1]),
-                        "geometry_cache_by_idx": {},
-                        "full_descriptor_cache_by_idx": {},
-                        "full_prefilter_disabled": False,
-                        "full_prefilter_probe_pairs": 0,
-                        "full_prefilter_probe_rejects": 0,
-                        "full_prefilter_probe_done": False,
-                    },
-                )
-                bundle["areas"].append(int(np.count_nonzero(representative_bitmap)))
-                bundle["hashes"].append(str(representative_candidate.clip_hash))
-                bundle["origin_ids"].append(_coverage_to_array(bucket["origin_ids"]))
-                bundle["candidate_groups"].append(tuple(bucket["candidates"]))
-                bundle["representatives"].append(representative_candidate)
+        for candidate_group in candidate_groups:
+            representative_candidate = candidate_group.best_candidate
+            shape = tuple(int(value) for value in candidate_group.clip_bitmap_shape)
+            bundle = bundles.setdefault(
+                shape,
+                {
+                    "areas": [],
+                    "hashes": [],
+                    "origin_ids": [],
+                    "candidate_groups": [],
+                    "representatives": [],
+                    "clip_pixels": int(shape[0]) * int(shape[1]),
+                    "bitmap_cache_by_idx": {},
+                    "geometry_cache_by_idx": {},
+                    "full_descriptor_cache_by_idx": {},
+                    "full_prefilter_disabled": False,
+                    "full_prefilter_probe_pairs": 0,
+                    "full_prefilter_probe_rejects": 0,
+                    "full_prefilter_probe_done": False,
+                },
+            )
+            bundle["areas"].append(int(candidate_group.area_px))
+            bundle["hashes"].append(str(candidate_group.clip_hash))
+            bundle["origin_ids"].append(_coverage_to_array(candidate_group.origin_ids))
+            bundle["candidate_groups"].append(candidate_group)
+            bundle["representatives"].append(representative_candidate)
 
         for bundle in bundles.values():
             bundle["areas"] = np.asarray(bundle["areas"], dtype=np.int64)
@@ -3133,11 +3459,8 @@ class OptimizedMainlineRunner(MainlineRunner):
         """构建 bundle group 的初始 coverage 数组。"""
 
         coverage_by_group: List[np.ndarray] = []
-        for grouped_candidates in bundle["candidate_groups"]:
-            group_coverage = np.asarray([], dtype=np.int32)
-            for candidate in grouped_candidates:
-                group_coverage = _coverage_union(group_coverage, _coverage_to_array(candidate.coverage))
-            coverage_by_group.append(group_coverage)
+        for candidate_group in bundle["candidate_groups"]:
+            coverage_by_group.append(_coverage_to_array(candidate_group.coverage))
         return coverage_by_group
 
     def _apply_same_hash_coverage(self, bundle: Dict[str, Any], coverage_by_group: List[np.ndarray]) -> None:
@@ -3199,6 +3522,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             "candidate_groups": [bundle["candidate_groups"][int(idx)] for idx in indices.tolist()],
             "representatives": [bundle["representatives"][int(idx)] for idx in indices.tolist()],
             "clip_pixels": int(bundle["clip_pixels"]),
+            "bitmap_cache_by_idx": {},
             "geometry_cache_by_idx": {},
             "full_descriptor_cache_by_idx": {},
             "full_prefilter_disabled": False,
@@ -3208,6 +3532,40 @@ class OptimizedMainlineRunner(MainlineRunner):
             "global_indices": indices,
         }
 
+    def _bundle_group_bitmap(self, bundle: Dict[str, Any], group_idx: int, *, persist: bool) -> np.ndarray:
+        """按需恢复 bundle group 的 bitmap；可选挂入当前 window 局部缓存。"""
+
+        idx = int(group_idx)
+        if persist:
+            cache_by_idx = bundle.setdefault("bitmap_cache_by_idx", {})
+            cached = cache_by_idx.get(idx)
+            if cached is not None:
+                return np.ascontiguousarray(np.asarray(cached, dtype=bool))
+        candidate_group = bundle["candidate_groups"][idx]
+        representative = bundle["representatives"][idx]
+        bitmap = getattr(representative, "clip_bitmap", None)
+        if bitmap is None:
+            bitmap = _unpack_bitmap_payload(
+                np.asarray(candidate_group.packed_clip_bitmap, dtype=np.uint8),
+                tuple(int(value) for value in candidate_group.clip_bitmap_shape),
+            )
+            self.memory_debug["unpacked_candidate_group_bitmap_count"] += 1
+        bitmap = np.ascontiguousarray(np.asarray(bitmap, dtype=bool))
+        if persist:
+            cache_by_idx[idx] = bitmap
+            self.coverage_debug_stats["window_bitmap_live_peak_count"] = max(
+                int(self.coverage_debug_stats.get("window_bitmap_live_peak_count", 0)),
+                int(len(cache_by_idx)),
+            )
+        return bitmap
+
+    def _release_bundle_bitmap_cache(self, bundle: Dict[str, Any]) -> None:
+        """释放当前 coverage window 的局部 unpack bitmap 缓存。"""
+
+        cache_by_idx = bundle.get("bitmap_cache_by_idx")
+        if isinstance(cache_by_idx, dict) and cache_by_idx:
+            cache_by_idx.clear()
+
     def _release_shortlist_payloads(self, shortlist_index: Dict[str, Any]) -> None:
         """释放 window 内仍未自动释放的 shortlist payload。"""
 
@@ -3216,7 +3574,14 @@ class OptimizedMainlineRunner(MainlineRunner):
             return
         started = time.perf_counter()
         released = int(len(payloads))
+        live_count = int(
+            sum(int(payload.get("embedding_group_count", 0)) for payload in payloads.values() if isinstance(payload, dict))
+        )
         payloads.clear()
+        shortlist_index["live_signature_embedding_groups"] = max(
+            0,
+            int(shortlist_index.get("live_signature_embedding_groups", 0)) - live_count,
+        )
         self.coverage_detail_seconds["shortlist_payload_release"] += time.perf_counter() - started
         self.coverage_debug_stats["shortlist_payload_release_count"] += released
 
@@ -3383,6 +3748,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             self._release_shortlist_payloads(shortlist_index)
             self._release_bundle_full_descriptor_cache(bundle)
             self._release_bundle_geometry_cache(bundle)
+            self._release_bundle_bitmap_cache(bundle)
             if str(compared_pairs.get("mode")) == "rows":
                 self.coverage_debug_stats["pair_tracker_row_count"] += int(len(compared_pairs.get("rows", {})))
             self.coverage_debug_stats["geometry_cache_live_after_bundle_count"] = max(
@@ -3449,8 +3815,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         cached = cache_by_idx.get(idx)
         if cached is None:
             started = time.perf_counter()
-            cached = _init_coverage_geometry_cache(bundle["representatives"][idx])
-            cached["owner"] = bundle["representatives"][idx]
+            cached = _init_coverage_geometry_cache(self._bundle_group_bitmap(bundle, idx, persist=True))
             cache_by_idx[idx] = cached
             self.coverage_detail_seconds["geometry_cache"] += time.perf_counter() - started
             self.coverage_debug_stats["geometry_cache_group_count"] += 1
@@ -3458,13 +3823,13 @@ class OptimizedMainlineRunner(MainlineRunner):
 
         if level in {"dilated", "donut"} and int(tol_px) > 0 and "packed_dilated" not in cached:
             started = time.perf_counter()
-            _extend_coverage_dilated_cache(cached, int(tol_px))
+            _extend_coverage_dilated_cache(cached, int(tol_px), self._bundle_group_bitmap(bundle, idx, persist=True))
             self.coverage_detail_seconds["geometry_cache"] += time.perf_counter() - started
             self.coverage_debug_stats["geometry_dilated_cache_group_count"] += 1
 
         if level == "donut" and int(tol_px) > 0 and "packed_donut" not in cached:
             started = time.perf_counter()
-            _extend_coverage_donut_cache(cached, int(tol_px))
+            _extend_coverage_donut_cache(cached, int(tol_px), self._bundle_group_bitmap(bundle, idx, persist=True))
             self.coverage_detail_seconds["geometry_cache"] += time.perf_counter() - started
             self.coverage_debug_stats["geometry_donut_cache_group_count"] += 1
         return cached
@@ -3550,8 +3915,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         cached = cache_by_idx.get(idx)
         if cached is None:
             started = time.perf_counter()
-            bitmap = getattr(bundle["representatives"][idx], "clip_bitmap", None)
-            assert bitmap is not None, "coverage full descriptor 构建时 candidate.clip_bitmap 不应为空"
+            bitmap = self._bundle_group_bitmap(bundle, idx, persist=True)
             cached = _bitmap_descriptor(bitmap)
             cache_by_idx[idx] = cached
             self.coverage_detail_seconds["full_descriptor_cache"] += time.perf_counter() - started
@@ -3570,7 +3934,6 @@ class OptimizedMainlineRunner(MainlineRunner):
 
         group_count = int(len(bundle["representatives"]))
         cheap_invariants = np.empty((group_count, 8), dtype=np.float32)
-        signature_embeddings = np.empty((group_count, 120), dtype=np.float32)
         subgroup_members: Dict[Tuple[int, int, int, int, int], np.ndarray] = {}
         subgroup_remaining: Dict[Tuple[int, int, int, int, int], int] = {}
         source_subgroup_ids = np.empty(group_count, dtype=np.int32)
@@ -3578,11 +3941,10 @@ class OptimizedMainlineRunner(MainlineRunner):
         subgroup_keys: List[Tuple[int, int, int, int, int]] = []
         temp_subgroups: Dict[Tuple[int, int, int, int, int], List[int]] = {}
         for idx, representative in enumerate(bundle["representatives"]):
-            bitmap = getattr(representative, "clip_bitmap", None)
-            assert bitmap is not None, "shortlist cheap descriptor 构建时 candidate.clip_bitmap 不应为空"
+            del representative
+            bitmap = self._bundle_group_bitmap(bundle, int(idx), persist=False)
             desc = _cheap_bitmap_descriptor(bitmap)
             cheap_invariants[int(idx)] = np.asarray(desc.invariants, dtype=np.float32)
-            signature_embeddings[int(idx)] = _signature_embedding(desc)
             subgroup_key = _coverage_cheap_subgroup_key(desc)
             subgroup_id = subgroup_key_to_id.get(subgroup_key)
             if subgroup_id is None:
@@ -3597,6 +3959,10 @@ class OptimizedMainlineRunner(MainlineRunner):
             int(self.coverage_debug_stats.get("shortlist_max_subgroup_size", 0)),
             max((len(indices) for indices in temp_subgroups.values()), default=0),
         )
+        self.memory_debug["signature_embedding_bytes_avoided_estimate_mb"] = max(
+            float(self.memory_debug.get("signature_embedding_bytes_avoided_estimate_mb", 0.0)),
+            float(group_count * 120 * np.dtype(np.float32).itemsize) / (1024.0 * 1024.0),
+        )
         for subgroup_key, indices in temp_subgroups.items():
             group_indices = np.asarray(indices, dtype=np.int32)
             subgroup_members[subgroup_key] = group_indices
@@ -3604,12 +3970,13 @@ class OptimizedMainlineRunner(MainlineRunner):
 
         return {
             "cheap_invariants": cheap_invariants,
-            "signature_embeddings": signature_embeddings,
+            "bundle": bundle,
             "source_subgroup_ids": source_subgroup_ids,
             "subgroup_keys": subgroup_keys,
             "subgroup_members": subgroup_members,
             "subgroup_remaining": subgroup_remaining,
             "subgroup_payloads": {},
+            "live_signature_embedding_groups": 0,
         }
 
     def _ensure_shortlist_payload(
@@ -3632,8 +3999,10 @@ class OptimizedMainlineRunner(MainlineRunner):
         elif group_indices.size <= k:
             mapped_labels = np.tile(group_indices[None, :], (int(group_indices.size), 1)).astype(np.int32, copy=False)
         else:
-            signature_embeddings = np.asarray(shortlist_index["signature_embeddings"], dtype=np.float32)
-            group_vectors = np.ascontiguousarray(signature_embeddings[group_indices], dtype=np.float32)
+            group_vectors = np.empty((int(group_indices.size), 120), dtype=np.float32)
+            for local_idx, group_idx in enumerate(group_indices.tolist()):
+                bitmap = self._bundle_group_bitmap(shortlist_index["bundle"], int(group_idx), persist=False)
+                group_vectors[int(local_idx)] = _signature_embedding(_cheap_bitmap_descriptor(bitmap))
             if int(group_indices.size) <= int(COVERAGE_EXACT_SHORTLIST_MAX_GROUPS):
                 self.coverage_debug_stats["shortlist_exact_subgroup_count"] += 1
                 local_labels = _exact_cosine_topk_labels(group_vectors, k).astype(np.int32, copy=False)
@@ -3650,12 +4019,21 @@ class OptimizedMainlineRunner(MainlineRunner):
         payload = {
             "group_indices": group_indices,
             "mapped_labels": mapped_labels,
+            "embedding_group_count": int(group_indices.size),
         }
         payloads[subgroup_key] = payload
+        shortlist_index["live_signature_embedding_groups"] = int(shortlist_index.get("live_signature_embedding_groups", 0)) + int(
+            group_indices.size
+        )
         self.coverage_detail_seconds["shortlist_payload_build"] += time.perf_counter() - started
         self.coverage_debug_stats["shortlist_payload_peak_count"] = max(
             int(self.coverage_debug_stats.get("shortlist_payload_peak_count", 0)),
             int(len(payloads)),
+        )
+        self.coverage_debug_stats["lazy_signature_embedding_group_count"] += int(group_indices.size)
+        self.coverage_debug_stats["signature_embedding_live_peak_count"] = max(
+            int(self.coverage_debug_stats.get("signature_embedding_live_peak_count", 0)),
+            int(shortlist_index.get("live_signature_embedding_groups", 0)),
         )
         return payload
 
@@ -3670,6 +4048,11 @@ class OptimizedMainlineRunner(MainlineRunner):
         if subgroup_key not in payloads:
             return
         started = time.perf_counter()
+        payload = payloads[subgroup_key]
+        shortlist_index["live_signature_embedding_groups"] = max(
+            0,
+            int(shortlist_index.get("live_signature_embedding_groups", 0)) - int(payload.get("embedding_group_count", 0)),
+        )
         del payloads[subgroup_key]
         self.coverage_detail_seconds["shortlist_payload_release"] += time.perf_counter() - started
         self.coverage_debug_stats["shortlist_payload_release_count"] += 1
@@ -3913,7 +4296,11 @@ class OptimizedMainlineRunner(MainlineRunner):
             return np.asarray([], dtype=np.int32)
         return np.concatenate(non_empty, axis=0).astype(np.int32, copy=False)
 
-    def _evaluate_candidate_coverage(self, candidates: Sequence[CandidateClip], exact_clusters: Sequence[ExactCluster]) -> None:
+    def _evaluate_candidate_coverage(
+        self,
+        candidates: Sequence[CandidateClip] | Sequence[CoverageCandidateGroup],
+        exact_clusters: Sequence[ExactCluster],
+    ) -> None:
         """用 grid-aware shortlist + ACC/ECC 构建 candidate 覆盖关系。"""
 
         del exact_clusters
@@ -3953,9 +4340,11 @@ class OptimizedMainlineRunner(MainlineRunner):
                     force_source_unique=False,
                     detail_key="shortlist_index",
                 )
-            for group_idx, grouped_candidates in enumerate(bundle["candidate_groups"]):
+            for group_idx, candidate_group in enumerate(bundle["candidate_groups"]):
                 group_coverage_tuple = tuple(int(value) for value in coverage_by_group[group_idx].tolist())
-                for candidate in grouped_candidates:
+                candidate_group.coverage = group_coverage_tuple
+                candidate_group.best_candidate.coverage = group_coverage_tuple
+                for candidate in candidate_group.materialized_candidates:
                     candidate.coverage = group_coverage_tuple
 
         self._log(
@@ -3975,18 +4364,24 @@ class OptimizedMainlineRunner(MainlineRunner):
             f"detail={{{', '.join(f'{k}: {round(v, 3)}' for k, v in self.coverage_detail_seconds.items())}}}"
         )
 
-    def _greedy_cover(self, candidates: Sequence[CandidateClip], exact_clusters: Sequence[ExactCluster]) -> List[CandidateClip]:
+    def _greedy_cover(
+        self,
+        candidates: Sequence[CandidateClip] | Sequence[CoverageCandidateGroup],
+        exact_clusters: Sequence[ExactCluster],
+    ) -> List[CandidateClip]:
         """按 coverage、cluster 数与 shift 代价执行 lazy-heap greedy set cover。"""
 
+        candidate_groups = self._coerce_coverage_candidate_groups(candidates)
         uncovered = {int(cluster.exact_cluster_id) for cluster in exact_clusters}
         weights = {int(cluster.exact_cluster_id): int(cluster.weight) for cluster in exact_clusters}
         selected: List[CandidateClip] = []
         selected_ids: set[str] = set()
-        candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+        group_by_id = {group.best_candidate.candidate_id: group for group in candidate_groups}
         heap: List[Tuple[Tuple[Any, ...], str]] = []
 
-        def _priority(candidate: CandidateClip) -> Tuple[Any, ...]:
-            covered_now = _coverage_overlap(candidate.coverage, uncovered)
+        def _priority(candidate_group: CoverageCandidateGroup) -> Tuple[Any, ...]:
+            candidate = candidate_group.best_candidate
+            covered_now = _coverage_overlap(candidate_group.coverage, uncovered)
             return (
                 -sum(weights[cid] for cid in covered_now),
                 -len(covered_now),
@@ -3996,8 +4391,9 @@ class OptimizedMainlineRunner(MainlineRunner):
                 candidate.candidate_id,
             )
 
-        for candidate in candidates:
-            heapq.heappush(heap, (_priority(candidate), candidate.candidate_id))
+        for candidate_group in candidate_groups:
+            candidate = candidate_group.best_candidate
+            heapq.heappush(heap, (_priority(candidate_group), candidate.candidate_id))
 
         while uncovered:
             best: CandidateClip | None = None
@@ -4006,12 +4402,13 @@ class OptimizedMainlineRunner(MainlineRunner):
                 saved_priority, candidate_id = heapq.heappop(heap)
                 if candidate_id in selected_ids:
                     continue
-                candidate = candidate_by_id[candidate_id]
-                current_priority = _priority(candidate)
+                candidate_group = group_by_id[candidate_id]
+                candidate = candidate_group.best_candidate
+                current_priority = _priority(candidate_group)
                 if current_priority != saved_priority:
                     heapq.heappush(heap, (current_priority, candidate_id))
                     continue
-                current_covered = _coverage_overlap(candidate.coverage, uncovered)
+                current_covered = _coverage_overlap(candidate_group.coverage, uncovered)
                 if current_covered:
                     best = candidate
                     covered_now = current_covered
@@ -4030,9 +4427,8 @@ class OptimizedMainlineRunner(MainlineRunner):
     def _geometry_passes(self, candidate: CandidateClip, target: MarkerRecord) -> bool:
         """根据当前模式执行 ACC 或 ECC 最终几何判定。"""
 
-        candidate_bitmap = getattr(candidate, "clip_bitmap", None)
+        candidate_bitmap = _candidate_clip_bitmap(candidate)
         target_bitmap = getattr(target, "clip_bitmap", None)
-        assert candidate_bitmap is not None, "最终几何匹配时 candidate.clip_bitmap 不应为空"
         assert target_bitmap is not None, "最终几何匹配时 target.clip_bitmap 不应为空"
         if candidate_bitmap.shape != target_bitmap.shape:
             return False
@@ -4258,6 +4654,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         solver_used: str,
         runtime_summary: Dict[str, float],
         candidate_count: int,
+        candidate_group_count: int,
         candidate_shift_summary: Dict[str, Any],
     ) -> Dict[str, Any]:
         """物化 sample/representative clip，并组装最终结果 JSON。"""
@@ -4334,8 +4731,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             representative_file = None
             if materialize_outputs:
                 rep_path = representative_dir / _make_sample_filename("rep", cluster_members[0].source_name, cluster_index)
-                candidate_bitmap = getattr(candidate, "clip_bitmap", None)
-                assert candidate_bitmap is not None, "物化 representative 时 candidate.clip_bitmap 不应为空"
+                candidate_bitmap = _candidate_clip_bitmap(candidate)
                 rep_materialize_started = time.perf_counter()
                 representative_file = _materialize_clip_bitmap(
                     candidate_bitmap,
@@ -4525,6 +4921,8 @@ class OptimizedMainlineRunner(MainlineRunner):
             "seed_audit": seed_audit,
             "exact_cluster_count": int(len(exact_clusters)),
             "candidate_count": int(candidate_count),
+            "candidate_group_count": int(candidate_group_count),
+            "candidate_object_avoided_count": int(self.memory_debug.get("candidate_object_avoided_count", 0)),
             "candidate_direction_counts": dict(candidate_shift_summary["candidate_direction_counts"]),
             "diagonal_candidate_count": int(candidate_shift_summary["diagonal_candidate_count"]),
             "selected_candidate_count": int(len(selected_candidates)),
@@ -4587,6 +4985,8 @@ class OptimizedMainlineRunner(MainlineRunner):
                 "seed_audit": seed_audit,
                 "exact_cluster_count": int(len(exact_clusters)),
                 "candidate_count": int(candidate_count),
+                "candidate_group_count": int(candidate_group_count),
+                "candidate_object_avoided_count": int(self.memory_debug.get("candidate_object_avoided_count", 0)),
                 "candidate_direction_counts": dict(candidate_shift_summary["candidate_direction_counts"]),
                 "diagonal_candidate_count": int(candidate_shift_summary["diagonal_candidate_count"]),
                 "selected_candidate_count": int(len(selected_candidates)),
@@ -4815,6 +5215,8 @@ def main() -> int:
             f"{result.get('bucketed_seed_count', 0)} / {result.get('seed_bucket_merged_count', 0)}"
         )
         print(f"seed type counts: {result.get('seed_type_counts', {})}")
+        print(f"candidate group 数: {result.get('candidate_group_count', 0)}")
+        print(f"避免常驻 candidate 对象数: {result.get('candidate_object_avoided_count', 0)}")
         print(f"candidate 方向分布: {result.get('candidate_direction_counts', {})}")
         print(f"diagonal candidate 数: {result.get('diagonal_candidate_count', 0)}")
         print(f"selected candidate 方向分布: {result.get('selected_candidate_direction_counts', {})}")

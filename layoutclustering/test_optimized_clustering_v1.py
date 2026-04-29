@@ -469,7 +469,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
         bundle = next(iter(runner._build_candidate_match_bundles([cand_a, cand_b], 0).values()))
 
         self.assertEqual(len(bundle["candidate_groups"]), 1)
-        self.assertEqual(len(bundle["candidate_groups"][0]), 2)
+        self.assertEqual(bundle["candidate_groups"][0].logical_candidate_count, 2)
         self.assertEqual(runner.memory_debug["strict_digest_key_count"], 1)
         self.assertGreater(float(runner.memory_debug["strict_key_bytes_avoided_estimate_mb"]), 0.0)
 
@@ -628,16 +628,89 @@ class OptimizedGridV1Tests(unittest.TestCase):
         bundle = next(iter(runner._build_candidate_match_bundles([cand_a, cand_b, cand_c], 2).values()))
         shortlist_index = runner._build_bundle_shortlist_index(bundle)
         self.assertNotIn("descriptors", shortlist_index)
+        self.assertNotIn("signature_embeddings", shortlist_index)
         self.assertEqual(shortlist_index["cheap_invariants"].shape[0], 3)
-        self.assertEqual(shortlist_index["signature_embeddings"].shape[0], 3)
         kept = runner._batch_prefilter(bundle, shortlist_index, 0, np.asarray([1, 2], dtype=np.int64))
 
         self.assertEqual(kept.tolist(), [1])
         self.assertEqual(runner.coverage_debug_stats["full_descriptor_cache_group_count"], 2)
+        self.assertGreaterEqual(runner.coverage_debug_stats["lazy_signature_embedding_group_count"], 0)
         self.assertEqual(set(bundle["full_descriptor_cache_by_idx"].keys()), {0, 1})
         self.assertNotIn("optimized_graph_descriptor", cand_a.match_cache)
         self.assertNotIn("optimized_graph_descriptor", cand_b.match_cache)
         self.assertNotIn("optimized_graph_descriptor", cand_c.match_cache)
+
+    def test_lazy_signature_embedding_shortlist_matches_reference(self) -> None:
+        bitmap_a = np.zeros((16, 16), dtype=bool)
+        bitmap_a[4:12, 4:12] = True
+        bitmap_b = bitmap_a.copy()
+        bitmap_b[6, 6] = False
+        bitmap_c = bitmap_a.copy()
+        bitmap_c[9, 9] = False
+        runner = self._make_runner(geometry_match_mode="ecc")
+        cand_a = _candidate("cand_a", bitmap_a, origin_exact_cluster_id=0, shift_direction="base")
+        cand_b = _candidate("cand_b", bitmap_b, origin_exact_cluster_id=1, shift_direction="base")
+        cand_c = _candidate("cand_c", bitmap_c, origin_exact_cluster_id=2, shift_direction="base")
+        bundle = next(iter(runner._build_candidate_match_bundles([cand_a, cand_b, cand_c], 2).values()))
+        shortlist_index = runner._build_bundle_shortlist_index(bundle)
+        subgroup_id = int(shortlist_index["source_subgroup_ids"][0])
+        subgroup_key = shortlist_index["subgroup_keys"][subgroup_id]
+        group_indices = np.asarray(shortlist_index["subgroup_members"][subgroup_key], dtype=np.int32)
+        self.assertGreaterEqual(int(group_indices.size), 2)
+
+        old_shortlist_max = optimized.COVERAGE_SHORTLIST_MAX_TARGETS
+        try:
+            optimized.COVERAGE_SHORTLIST_MAX_TARGETS = 1
+            payload = runner._ensure_shortlist_payload(shortlist_index, subgroup_key)
+            group_vectors = np.asarray(
+                [
+                    optimized._signature_embedding(
+                        optimized._cheap_bitmap_descriptor(bundle["representatives"][int(group_idx)].clip_bitmap)
+                    )
+                    for group_idx in group_indices.tolist()
+                ],
+                dtype=np.float32,
+            )
+            expected_labels = group_indices[
+                optimized._exact_cosine_topk_labels(group_vectors, min(int(optimized.COVERAGE_SHORTLIST_MAX_TARGETS) + 1, int(group_indices.size)))
+            ].astype(np.int32, copy=False)
+        finally:
+            optimized.COVERAGE_SHORTLIST_MAX_TARGETS = old_shortlist_max
+
+        np.testing.assert_array_equal(np.asarray(payload["mapped_labels"], dtype=np.int32), expected_labels)
+        self.assertGreater(runner.coverage_debug_stats["lazy_signature_embedding_group_count"], 0)
+        self.assertGreater(runner.coverage_debug_stats["signature_embedding_live_peak_count"], 0)
+
+    def test_compact_candidate_group_keeps_direction_and_origin_stats(self) -> None:
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[3:7, 3:7] = True
+        runner = self._make_runner()
+        cand_a = _candidate("cand_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        cand_b = _candidate("cand_b", bitmap.copy(), origin_exact_cluster_id=1, shift_direction="left")
+
+        groups = runner._coerce_coverage_candidate_groups([cand_a, cand_b])
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].logical_candidate_count, 2)
+        self.assertEqual(set(int(value) for value in groups[0].origin_ids.tolist()), {0, 1})
+        self.assertEqual(groups[0].direction_counts["base"], 1)
+        self.assertEqual(groups[0].direction_counts["left"], 1)
+
+    def test_base_candidates_survive_group_merge_for_singleton_fallback(self) -> None:
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[3:7, 3:7] = True
+        runner = self._make_runner()
+        exact_a = ExactCluster(0, _record("a0", bitmap, seed_weight=1), [_record("a0", bitmap, seed_weight=1)])
+        exact_b = ExactCluster(1, _record("b0", bitmap, seed_weight=1), [_record("b0", bitmap, seed_weight=1)])
+
+        groups, candidate_count, _ = runner._build_global_coverage_candidate_groups([exact_a, exact_b])
+
+        self.assertGreater(candidate_count, 0)
+        self.assertEqual(len(groups), 1)
+        self.assertIn(0, runner._base_candidate_by_exact_id)
+        self.assertIn(1, runner._base_candidate_by_exact_id)
+        self.assertEqual(runner._base_candidate_by_exact_id[0].shift_direction, "base")
+        self.assertEqual(runner._base_candidate_by_exact_id[1].shift_direction, "base")
 
     def test_full_prefilter_rejects_before_geometry_cache(self) -> None:
         bitmap_source = np.zeros((16, 16), dtype=bool)
@@ -838,6 +911,108 @@ class OptimizedGridV1Tests(unittest.TestCase):
         for key in ("score", "medoid_score", "worst_case_score", "distance_worst_case_score", "weight_score"):
             self.assertAlmostEqual(float(cached_scores[key]), float(original_scores[key]), places=6)
 
+    def test_online_exact_grouping_matches_reference(self) -> None:
+        bitmap_a = np.zeros((8, 8), dtype=bool)
+        bitmap_a[2:6, 2:6] = True
+        bitmap_b = np.zeros((8, 8), dtype=bool)
+        bitmap_b[1:5, 1:4] = True
+        runner = self._make_runner()
+
+        online_records = [
+            _record("a0", bitmap_a, seed_weight=1),
+            _record("a1", bitmap_a.copy(), seed_weight=2),
+            _record("b0", bitmap_b, seed_weight=1),
+        ]
+        reference_records = [
+            _record("a0_ref", bitmap_a, seed_weight=1),
+            _record("a1_ref", bitmap_a.copy(), seed_weight=2),
+            _record("b0_ref", bitmap_b, seed_weight=1),
+        ]
+
+        marker_records: list[MarkerRecord] = []
+        exact_clusters: list[ExactCluster] = []
+        exact_index_by_key: dict[tuple[str, str], int] = {}
+        for record in online_records:
+            runner._register_online_exact_record(record, marker_records, exact_clusters, exact_index_by_key)
+        reference_clusters = runner._group_exact_clusters(reference_records)
+
+        self.assertEqual(len(exact_clusters), len(reference_clusters))
+        self.assertEqual(
+            [sorted(int(member.seed_weight) for member in cluster.members) for cluster in exact_clusters],
+            [sorted(int(member.seed_weight) for member in cluster.members) for cluster in reference_clusters],
+        )
+        self.assertEqual(
+            [cluster.representative.clip_hash for cluster in exact_clusters],
+            [cluster.representative.clip_hash for cluster in reference_clusters],
+        )
+
+    def test_online_exact_lightens_nonrepresentative_without_review(self) -> None:
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        runner = self._make_runner()
+        rec_a = _record("a0", bitmap, seed_weight=1)
+        rec_b = _record("a1", bitmap.copy(), seed_weight=3)
+        marker_records: list[MarkerRecord] = []
+        exact_clusters: list[ExactCluster] = []
+        exact_index_by_key: dict[tuple[str, str], int] = {}
+
+        runner._register_online_exact_record(rec_a, marker_records, exact_clusters, exact_index_by_key)
+        runner._register_online_exact_record(rec_b, marker_records, exact_clusters, exact_index_by_key)
+
+        self.assertEqual(len(exact_clusters), 1)
+        self.assertIsNotNone(rec_a.clip_bitmap)
+        self.assertIsNone(rec_b.clip_bitmap)
+        self.assertIsNone(rec_b.expanded_bitmap)
+        self.assertIn(optimized.EXPORT_CHEAP_FEATURE_KEY, rec_b.match_cache)
+        self.assertIn(optimized.EXPORT_WORST_SCORE_KEY, rec_b.match_cache)
+        self.assertIn(optimized.EXPORT_DISTANCE_SCORE_KEY, rec_b.match_cache)
+        self.assertEqual(runner.memory_debug["light_member_record_count"], 1)
+        self.assertGreater(runner.memory_debug["released_marker_clip_early_count"], 0)
+        self.assertGreater(runner.memory_debug["released_marker_expanded_early_count"], 0)
+
+    def test_online_exact_keeps_member_clip_with_review_dir(self) -> None:
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        runner = self._make_runner(materialize_outputs=True)
+        rec_a = _record("a0", bitmap, seed_weight=1)
+        rec_b = _record("a1", bitmap.copy(), seed_weight=2)
+        marker_records: list[MarkerRecord] = []
+        exact_clusters: list[ExactCluster] = []
+        exact_index_by_key: dict[tuple[str, str], int] = {}
+
+        runner._register_online_exact_record(rec_a, marker_records, exact_clusters, exact_index_by_key)
+        runner._register_online_exact_record(rec_b, marker_records, exact_clusters, exact_index_by_key)
+
+        self.assertEqual(len(exact_clusters), 1)
+        self.assertIsNotNone(rec_b.clip_bitmap)
+        self.assertIsNone(rec_b.expanded_bitmap)
+        self.assertEqual(runner.memory_debug["light_member_record_count"], 0)
+
+    def test_packed_candidate_group_bitmap_roundtrip_and_window_release(self) -> None:
+        bitmap_a = np.zeros((12, 12), dtype=bool)
+        bitmap_a[3:9, 3:9] = True
+        bitmap_b = np.zeros((12, 12), dtype=bool)
+        bitmap_b[3:9, 4:10] = True
+        runner = self._make_runner()
+        exact_a = ExactCluster(0, _record("a0", bitmap_a, seed_weight=1), [_record("a0", bitmap_a, seed_weight=1)])
+        exact_b = ExactCluster(1, _record("b0", bitmap_b, seed_weight=1), [_record("b0", bitmap_b, seed_weight=1)])
+
+        candidate_groups, _, _ = runner._build_global_coverage_candidate_groups([exact_a, exact_b])
+        self.assertTrue(all(group.best_candidate.clip_bitmap is None for group in candidate_groups))
+        self.assertTrue(all(group.packed_clip_bitmap.size > 0 for group in candidate_groups))
+
+        bundle = next(iter(runner._build_candidate_match_bundles(candidate_groups, 2).values()))
+        shortlist_index = runner._build_bundle_shortlist_index(bundle)
+        self.assertEqual(shortlist_index["bundle"], bundle)
+        desc = runner._bundle_full_descriptor(bundle, 0)
+        geom = runner._bundle_geometry_cache(bundle, 0, 2, level="donut")
+
+        self.assertGreater(len(bundle["bitmap_cache_by_idx"]), 0)
+        self.assertIsInstance(desc, optimized.GraphDescriptor)
+        self.assertIn("packed_donut", geom)
+        runner._release_bundle_bitmap_cache(bundle)
+        self.assertEqual(bundle["bitmap_cache_by_idx"], {})
+
     def test_release_helpers_trim_bitmap_lifetimes(self) -> None:
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
@@ -909,6 +1084,8 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIn("seed_audit", result)
         self.assertIn("residual_local_grid", result["seed_type_counts"])
         self.assertIn("candidate_direction_counts", result)
+        self.assertIn("candidate_group_count", result)
+        self.assertIn("candidate_object_avoided_count", result)
         self.assertIn("diagonal_candidate_count", result)
         self.assertIn("selected_diagonal_candidate_count", result)
         self.assertIn("cheap_reject", result["prefilter_stats"])
@@ -935,6 +1112,8 @@ class OptimizedGridV1Tests(unittest.TestCase):
             "shortlist_max_subgroup_size",
             "shortlist_payload_peak_count",
             "shortlist_payload_release_count",
+            "lazy_signature_embedding_group_count",
+            "signature_embedding_live_peak_count",
             "pair_tracker_disabled_bundle_count",
             "pair_tracker_row_count",
             "bucketed_coverage_bundle_count",
@@ -943,6 +1122,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
             "max_bucket_window_group_count",
             "bucketed_source_group_count",
             "bucketed_target_group_count",
+            "window_bitmap_live_peak_count",
         ):
             self.assertIn(key, result["coverage_debug_stats"])
             self.assertGreaterEqual(int(result["coverage_debug_stats"][key]), 0)
@@ -986,6 +1166,15 @@ class OptimizedGridV1Tests(unittest.TestCase):
             "strict_digest_collision_count",
             "strict_key_bytes_avoided_estimate_mb",
             "early_duplicate_shift_candidate_count",
+            "candidate_object_avoided_count",
+            "signature_embedding_bytes_avoided_estimate_mb",
+            "online_exact_group_count",
+            "light_member_record_count",
+            "released_marker_clip_early_count",
+            "released_marker_expanded_early_count",
+            "packed_candidate_group_bitmap_count",
+            "unpacked_candidate_group_bitmap_count",
+            "candidate_group_bitmap_bytes_avoided_estimate_mb",
         ):
             self.assertIn(key, result["memory_debug"])
         for value in result["coverage_detail_seconds"].values():
