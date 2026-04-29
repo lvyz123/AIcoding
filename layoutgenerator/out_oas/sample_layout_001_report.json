@@ -1,0 +1,26 @@
+{
+  "file": "C:\\Users\\81932\\Documents\\AIcoding\\layoutgenerator\\out_oas\\sample_layout_001.oas",
+  "removed_layer": "3/0",
+  "verification": {
+    "top_bbox_um": {
+      "x0": 0.0,
+      "y0": 0.0,
+      "x1": 550.0,
+      "y1": 550.0,
+      "width": 550.0,
+      "height": 550.0
+    },
+    "per_layer_polygons": {
+      "1": 140000,
+      "2": 140000,
+      "3": 0,
+      "4": 468136
+    },
+    "remaining_layers": [
+      1,
+      2,
+      4
+    ],
+    "total_polygons": 748136
+  }
+}

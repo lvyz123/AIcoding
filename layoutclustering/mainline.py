@@ -46,7 +46,7 @@ COVERAGE_CHUNK_BYTE_BUDGET = 8 * 1024 * 1024
 BIT_COUNT_TABLE = np.array([bin(value).count("1") for value in range(256)], dtype=np.uint8)
 
 
-@dataclass
+@dataclass(slots=True)
 class MarkerRecord:
     """单个 marker 的主记录。
 
@@ -74,7 +74,7 @@ class MarkerRecord:
     match_cache: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class ExactCluster:
     """双重 exact hash 合并后的精确簇。"""
 
@@ -87,7 +87,7 @@ class ExactCluster:
         return int(sum(max(1, int(member.seed_weight)) for member in self.members))
 
 
-@dataclass
+@dataclass(slots=True)
 class CandidateClip:
     """由某个 exact cluster representative 派生出的候选 clip。"""
 
@@ -100,12 +100,12 @@ class CandidateClip:
     clip_hash: str
     shift_direction: str
     shift_distance_um: float
-    coverage: Set[int]
+    coverage: Sequence[int]
     source_marker_id: str
     match_cache: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class LayoutIndex:
     """布局查询缓存。
 
