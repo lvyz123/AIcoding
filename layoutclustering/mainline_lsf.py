@@ -47,6 +47,7 @@ from layout_utils_lsf import (
     _polygon_vertices_array,
     _read_oas_only_library,
     _safe_bbox_tuple,
+    _write_oas_library,
 )
 from layer_operations_lsf import LayerOperationProcessor
 
@@ -272,6 +273,29 @@ def spatial_index_stats(layout_index):
             "avg_bin_load": 0.0,
         }
     return layout_index.spatial_index.stats()
+
+
+def write_layout_index_oas(layout_index, filepath, cell_name="TILE"):
+    """把 LayoutIndex 中的 polygon 写成独立 OAS tile。"""
+
+    lib = gdstk.Library()
+    cell = gdstk.Cell(str(cell_name)[:64] or "TILE")
+    element_count = 0
+    for item in layout_index.indexed_elements:
+        element = item.get("element")
+        points = _polygon_vertices_array(element)
+        if points is None:
+            continue
+        layer = int(item.get("layer", getattr(element, "layer", 0)))
+        datatype = int(item.get("datatype", getattr(element, "datatype", 0)))
+        cell.add(gdstk.Polygon(np.asarray(points, dtype=np.float64).copy(), layer=layer, datatype=datatype))
+        element_count += 1
+    lib.add(cell)
+    _write_oas_library(lib, filepath)
+    return {
+        "tile_element_count": int(element_count),
+        "tile_oas_bytes": int(os.path.getsize(str(filepath))) if os.path.exists(str(filepath)) else 0,
+    }
 
 
 class GridSeedCandidate(object):
@@ -2053,6 +2077,51 @@ def _coverage_group_from_candidates(candidates):
     return list(grouped.values())
 
 
+def create_candidate_bundle_accumulator():
+    """创建 candidate bundle 增量累加器，避免 prepare-coverage 常驻全量 candidate 对象。"""
+
+    return {"shape_groups": {}, "candidate_count": 0}
+
+
+def add_candidates_to_candidate_bundle_accumulator(accumulator, candidates):
+    """把一批 candidates 增量合并进 bundle 累加器。"""
+
+    shape_groups = accumulator.setdefault("shape_groups", {})
+    for candidate in candidates:
+        shape = tuple(int(value) for value in candidate.clip_bitmap.shape)
+        strict_key = _bitmap_exact_key(candidate.clip_bitmap)
+        groups = shape_groups.get(shape)
+        if groups is None:
+            groups = {}
+            shape_groups[shape] = groups
+        bucket = groups.get(strict_key)
+        if bucket is None:
+            bucket = {
+                "representative": candidate,
+                "origin_ids": set(),
+                "strict_key": strict_key,
+                "candidate_ids": [],
+                "candidate_count": 0,
+            }
+            groups[strict_key] = bucket
+        bucket["origin_ids"].add(int(candidate.origin_exact_cluster_id))
+        bucket["candidate_ids"].append(str(candidate.candidate_id))
+        bucket["candidate_count"] = int(bucket.get("candidate_count", 0)) + 1
+        accumulator["candidate_count"] = int(accumulator.get("candidate_count", 0)) + 1
+    return accumulator
+
+
+def candidate_bundles_from_accumulator(accumulator):
+    """把增量累加器转成与原有 bundle writer 兼容的 bundle 结构。"""
+
+    bundles = {}
+    for shape in sorted(accumulator.get("shape_groups", {})):
+        groups = accumulator["shape_groups"][shape]
+        bundle = {"shape": tuple(int(value) for value in shape), "candidate_groups": list(groups.values())}
+        bundles[tuple(int(value) for value in shape)] = _finalize_candidate_bundle(bundle)
+    return bundles
+
+
 def _finalize_candidate_bundle(bundle):
     """补齐 bundle 的数组索引和缓存字段。"""
 
@@ -2118,8 +2187,14 @@ def _candidate_bundle_payload(bundle, shape_key, output_json, output_npz, extra_
         metadata = candidate_metadata(group["representative"], include_coverage=False)
         metadata["group_index"] = int(idx)
         metadata["origin_ids"] = [int(value) for value in sorted(group["origin_ids"])]
-        metadata["candidate_ids"] = [str(candidate.candidate_id) for candidate in group.get("candidates", [])]
-        metadata["candidate_count"] = int(len(group.get("candidates", [])))
+        candidate_ids = group.get("candidate_ids")
+        if candidate_ids is None:
+            candidate_ids = [str(candidate.candidate_id) for candidate in group.get("candidates", [])]
+        metadata["candidate_ids"] = list(candidate_ids)
+        candidate_count = group.get("candidate_count")
+        if candidate_count is None:
+            candidate_count = int(len(group.get("candidates", [])))
+        metadata["candidate_count"] = int(candidate_count)
         groups.append(metadata)
     payload["groups"] = groups
     return payload
@@ -2190,6 +2265,12 @@ def save_candidate_bundle_index(candidates, bundle_root, extra_payload=None):
     if not root.exists():
         root.mkdir(parents=True)
     bundles = build_candidate_match_bundles(candidates)
+    return _save_candidate_bundle_index_from_bundles(bundles, root, extra_payload, int(len(candidates)))
+
+
+def _save_candidate_bundle_index_from_bundles(bundles, root, extra_payload, candidate_count):
+    """把 bundle 字典写成 candidate bundle 索引。"""
+
     shape_buckets = {}
     total_groups = 0
     total_file_buckets = 0
@@ -2233,7 +2314,7 @@ def save_candidate_bundle_index(candidates, bundle_root, extra_payload=None):
     return {
         "bucket_count": int(total_file_buckets),
         "shape_bucket_count": int(len(shape_buckets)),
-        "candidate_count": int(len(candidates)),
+        "candidate_count": int(candidate_count),
         "candidate_group_count": int(total_groups),
         "max_bundle_group_count": int(max(group_sizes, default=0)),
         "max_file_bucket_group_count": int(max(file_bucket_group_sizes, default=0)),
@@ -2242,6 +2323,21 @@ def save_candidate_bundle_index(candidates, bundle_root, extra_payload=None):
         "fill_bin_neighbor_radius": int(math.ceil(float(CHEAP_FILL_ABS_LIMIT) / float(CANDIDATE_BUNDLE_FILL_BIN_WIDTH))) + 1,
         "shape_buckets": shape_buckets,
     }
+
+
+def save_candidate_bundle_index_from_accumulator(accumulator, bundle_root, extra_payload=None):
+    """把 chunked candidate 累加器写成 bundle 索引，避免全量 candidate 常驻内存。"""
+
+    root = Path(str(bundle_root))
+    if not root.exists():
+        root.mkdir(parents=True)
+    bundles = candidate_bundles_from_accumulator(accumulator)
+    return _save_candidate_bundle_index_from_bundles(
+        bundles,
+        root,
+        extra_payload,
+        int(accumulator.get("candidate_count", 0)),
+    )
 
 
 def load_candidate_bundle_bucket(json_path, npz_path):
@@ -2263,6 +2359,8 @@ def load_candidate_bundle_bucket(json_path, npz_path):
                 "candidates": [],
                 "origin_ids": origin_ids,
                 "strict_key": _bitmap_exact_key(candidate.clip_bitmap),
+                "candidate_ids": [str(value) for value in metadata.get("candidate_ids", [])],
+                "candidate_count": int(metadata.get("candidate_count", len(metadata.get("candidate_ids", [])))),
             }
         )
     if len(groups):

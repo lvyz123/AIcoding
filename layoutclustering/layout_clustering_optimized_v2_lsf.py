@@ -29,6 +29,10 @@ import hashlib
 import json
 import math
 import os
+try:
+    import resource
+except ImportError:
+    resource = None
 import sys
 import time
 import zipfile
@@ -45,6 +49,7 @@ from mainline_lsf import (
     build_compact_result,
     build_uniform_grid_seed_candidates,
     candidate_shift_summary,
+    create_candidate_bundle_accumulator,
     coverage_fill_bin_for_bitmap,
     evaluate_candidate_coverage,
     evaluate_candidate_coverage_against_bundles,
@@ -64,14 +69,21 @@ from mainline_lsf import (
     marker_query_candidate_stats,
     marker_record_from_seed,
     prepare_layout,
+    add_candidates_to_candidate_bundle_accumulator,
     save_coverage_shard,
-    save_candidate_bundle_index,
+    save_candidate_bundle_index_from_accumulator,
     save_exact_index,
     save_shard_records,
     selected_candidates_from_csr,
     spatial_index_stats,
+    write_layout_index_oas,
     GridSeedCandidate,
 )
+
+
+CENTRAL_MERGE_EXACT_CLUSTER_LIMIT = 20000
+PREPARE_COVERAGE_CANDIDATE_CHUNK_SIZE = 2000
+TARGET_LOAD_WARNING_RATIO = 0.60
 
 
 def _ensure_dir(path):
@@ -100,6 +112,17 @@ def _write_json(path, payload):
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
 
 
+def _write_text(path, text):
+    """写出 UTF-8 文本文件。"""
+
+    target = Path(str(path))
+    parent = target.parent
+    if not parent.exists():
+        parent.mkdir(parents=True)
+    with target.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(str(text))
+
+
 def _file_size_bytes(path):
     """返回文件大小；文件缺失时返回 0。"""
 
@@ -114,6 +137,132 @@ def _file_stat(path):
 
     target = Path(str(path))
     return {"path": str(target), "exists": bool(target.exists()), "bytes": _file_size_bytes(target)}
+
+
+def _max_rss_mb():
+    """杩斿洖褰撳墠杩涚▼宄板€间綇鐣欏唴瀛橈紝鏃犳硶鑾峰彇鏃惰繑鍥?None銆?"""
+
+    if resource is None:
+        return None
+    try:
+        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (AttributeError, ValueError):
+        return None
+    if value <= 0.0:
+        return None
+    if sys.platform == "darwin":
+        return round(value / (1024.0 * 1024.0), 3)
+    return round(value / 1024.0, 3)
+
+
+def _input_file_bytes(manifest):
+    """杩斿洖鍘熷杈撳叆 OAS 鏂囦欢澶у皬銆?"""
+
+    return int(_file_size_bytes(manifest.get("input_path", "")))
+
+
+def _merge_shift_summary(total_summary, chunk_summary):
+    """鍚堝苟涓€鎵筩andidate shift 璇婃柇缁熻銆?"""
+
+    direction_counts = dict(total_summary.get("candidate_direction_counts", {}))
+    for direction, count in chunk_summary.get("candidate_direction_counts", {}).items():
+        direction_key = str(direction)
+        direction_counts[direction_key] = int(direction_counts.get(direction_key, 0)) + int(count)
+    total_summary["candidate_direction_counts"] = direction_counts
+    total_summary["diagonal_candidate_count"] = int(total_summary.get("diagonal_candidate_count", 0)) + int(
+        chunk_summary.get("diagonal_candidate_count", 0)
+    )
+    total_summary["max_shift_distance_um"] = max(
+        float(total_summary.get("max_shift_distance_um", 0.0)),
+        float(chunk_summary.get("max_shift_distance_um", 0.0)),
+    )
+    return total_summary
+
+
+def _write_lsf_wrapper_files(work_root, name, commands, job_name):
+    """生成可手动提交的 LSF job-array 命令清单和模板。"""
+
+    lsf_root = _ensure_dir(Path(str(work_root)) / "lsf")
+    command_file = lsf_root / ("%s.commands" % str(name))
+    template_file = lsf_root / ("%s.bsub.template" % str(name))
+    command_lines = [str(command) for command in commands]
+    _write_text(command_file, "\n".join(command_lines) + ("\n" if command_lines else ""))
+    command_count = int(len(command_lines))
+    array_end = max(1, command_count)
+    template = [
+        "#!/bin/sh",
+        "#BSUB -J \"%s[1-%d]\"" % (str(job_name), int(array_end)),
+        "#BSUB -n 1",
+        "#BSUB -M ${MEM_MB:-8000}",
+        "#BSUB -R \"rusage[mem=${MEM_MB:-8000}]\"",
+        "#BSUB -oo %s.%%J.%%I.out" % str(name),
+        "#BSUB -eo %s.%%J.%%I.err" % str(name),
+        "COMMAND_FILE=\"%s\"" % str(command_file),
+        "CMD=$(sed -n \"${LSB_JOBINDEX}p\" \"$COMMAND_FILE\")",
+        "echo \"$CMD\"",
+        "eval \"$CMD\"",
+        "",
+    ]
+    _write_text(template_file, "\n".join(template))
+    return {
+        "mode": "manual_bsub_template_v1",
+        "command_file": str(command_file),
+        "bsub_template": str(template_file),
+        "command_count": int(command_count),
+    }
+
+
+def _write_single_lsf_command(work_root, name, command):
+    """生成单条 LSF 后处理命令文件。"""
+
+    lsf_root = _ensure_dir(Path(str(work_root)) / "lsf")
+    command_file = lsf_root / ("%s.command" % str(name))
+    _write_text(command_file, str(command) + "\n")
+    return {"command_file": str(command_file), "command_count": 1}
+
+
+def _source_fill_bins_for_clusters(clusters):
+    """返回 source exact clusters 的 fill-bin 集合。"""
+
+    return sorted(set(int(coverage_fill_bin_for_bitmap(cluster.representative.clip_bitmap)) for cluster in clusters))
+
+
+def _coverage_source_shard_specs(source_exact_clusters, coverage_shard_size):
+    """按 source fill-bin 优先规划 coverage source shards。"""
+
+    specs = []
+    total = int(len(source_exact_clusters))
+    if total <= 0:
+        return specs
+    safe_size = max(1, int(coverage_shard_size))
+    start = 0
+    while start < total:
+        fill_bin = int(coverage_fill_bin_for_bitmap(source_exact_clusters[start].representative.clip_bitmap))
+        group_end = start + 1
+        while group_end < total:
+            next_bin = int(coverage_fill_bin_for_bitmap(source_exact_clusters[group_end].representative.clip_bitmap))
+            if next_bin != fill_bin:
+                break
+            group_end += 1
+        chunk_start = start
+        while chunk_start < group_end:
+            chunk_end = min(group_end, int(chunk_start + safe_size))
+            clusters = source_exact_clusters[chunk_start:chunk_end]
+            fill_bins = _source_fill_bins_for_clusters(clusters)
+            specs.append(
+                {
+                    "start": int(chunk_start),
+                    "end": int(chunk_end),
+                    "clusters": clusters,
+                    "source_fill_bin_values": [int(value) for value in fill_bins],
+                    "source_fill_bin_min": int(min(fill_bins)) if fill_bins else 0,
+                    "source_fill_bin_max": int(max(fill_bins)) if fill_bins else 0,
+                    "source_fill_bin_count": int(len(fill_bins)),
+                }
+            )
+            chunk_start = chunk_end
+        start = group_end
+    return specs
 
 
 def _npz_zip_stat(path):
@@ -412,6 +561,7 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
     started = time.perf_counter()
     work_root = _ensure_dir(work_dir)
     shard_root = _ensure_dir(work_root / "shards")
+    tile_root = _ensure_dir(work_root / "tile_oas")
     register_ops = _normalized_register_ops(register_ops)
     apply_layer_ops = bool(config.get("apply_layer_operations", False) or register_ops)
     config = dict(config)
@@ -444,13 +594,21 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
     manifest_path = work_root / "manifest.json"
     shards = []
     script_path = Path(__file__).resolve()
+    tile_oas_total_bytes = 0
+    tile_oas_total_element_count = 0
     for shard_id in range(shard_count_actual):
         start = int(shard_id * shard_size)
         end = min(total, int(start + shard_size))
         shard_seeds = seeds[start:end]
         core_bbox = _seed_bbox_union(shard_seeds)
+        halo_bbox = _expand_bbox(core_bbox, halo_margin)
         shard_json = shard_root / ("shard_%04d.json" % shard_id)
         shard_npz = shard_root / ("shard_%04d.npz" % shard_id)
+        tile_oas = tile_root / ("shard_%04d.oas" % shard_id)
+        tile_index = filter_layout_index_by_bbox(layout_index, halo_bbox)
+        tile_stats = write_layout_index_oas(tile_index, tile_oas, "SHARD_%04d" % int(shard_id))
+        tile_oas_total_bytes += int(tile_stats.get("tile_oas_bytes", 0))
+        tile_oas_total_element_count += int(tile_stats.get("tile_element_count", 0))
         command = "%s %s run-shard --manifest %s --shard-id %d" % (
             sys.executable,
             str(script_path),
@@ -464,7 +622,11 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
                 "seed_end": int(end),
                 "seed_count": int(end - start),
                 "core_bbox": core_bbox,
-                "halo_bbox": _expand_bbox(core_bbox, halo_margin),
+                "halo_bbox": halo_bbox,
+                "tile_cache_mode": "per_shard_halo_oas_v1",
+                "tile_oas": str(tile_oas),
+                "tile_oas_bytes": int(tile_stats.get("tile_oas_bytes", 0)),
+                "tile_element_count": int(tile_stats.get("tile_element_count", 0)),
                 "output_json": str(shard_json),
                 "output_npz": str(shard_npz),
                 "command": command,
@@ -483,6 +645,9 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         "effective_pattern_layers": _layer_specs_to_json(layout_index.effective_pattern_layers),
         "excluded_helper_layers": _layer_specs_to_json(layout_index.excluded_helper_layers),
         "layout_element_count": int(len(layout_index.indexed_elements)),
+        "tile_cache_mode": "per_shard_halo_oas_v1",
+        "tile_oas_total_bytes": int(tile_oas_total_bytes),
+        "tile_oas_total_element_count": int(tile_oas_total_element_count),
         "spatial_index_stats": spatial_index_stats(layout_index),
         "seed_stats": dict(seed_stats),
         "seed_audit": {
@@ -496,7 +661,12 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         "shard_count": int(len(shards)),
         "shards": shards,
         "result_output": str((work_root / "final_result.json").resolve()),
+        "input_file_bytes": _file_size_bytes(input_path),
+        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": {"prepare": round(time.perf_counter() - started, 6)},
+    }
+    manifest["lsf_wrapper"] = {
+        "run_shards": _write_lsf_wrapper_files(work_root, "run_shards", [shard["command"] for shard in shards], "lc_run_shard")
     }
     _write_json(manifest_path, manifest)
     return manifest
@@ -514,9 +684,21 @@ def run_shard_stage(manifest_path, shard_id):
     register_ops = _normalized_register_ops(manifest.get("register_ops", []))
     apply_layer_ops = bool(config.get("apply_layer_operations", False) or register_ops)
     layer_processor = _make_layer_processor(register_ops)
-    layout_index = prepare_layout(input_path, layer_processor, apply_layer_ops)
+    tile_oas = shard.get("tile_oas", "")
+    if tile_oas and Path(str(tile_oas)).exists():
+        layout_load_path = str(tile_oas)
+        layout_load_mode = "tile_oas"
+        layout_apply_layer_ops = False
+        layout_layer_processor = None
+    else:
+        layout_load_path = str(input_path)
+        layout_load_mode = "full_oas"
+        layout_apply_layer_ops = bool(apply_layer_ops)
+        layout_layer_processor = layer_processor
+    layout_index = prepare_layout(layout_load_path, layout_layer_processor, layout_apply_layer_ops)
     layout_element_count = int(len(layout_index.indexed_elements))
-    layout_index = filter_layout_index_by_bbox(layout_index, shard.get("halo_bbox", shard.get("core_bbox", [0, 0, 0, 0])))
+    if layout_load_mode != "tile_oas":
+        layout_index = filter_layout_index_by_bbox(layout_index, shard.get("halo_bbox", shard.get("core_bbox", [0, 0, 0, 0])))
     halo_filtered_element_count = int(len(layout_index.indexed_elements))
     shard_spatial_index_stats = spatial_index_stats(layout_index)
     seeds = _read_seed_slice(manifest["seed_file"], int(shard["seed_start"]), int(shard["seed_end"]))
@@ -535,11 +717,21 @@ def run_shard_stage(manifest_path, shard_id):
         "seed_count": int(len(seeds)),
         "marker_count": int(len(records)),
         "apply_layer_operations": bool(apply_layer_ops),
+        "layout_load_mode": str(layout_load_mode),
+        "layout_load_path": str(layout_load_path),
+        "layout_apply_layer_operations": bool(layout_apply_layer_ops),
+        "source_input_file_bytes": _file_size_bytes(input_path),
+        "tile_cache_mode": str(shard.get("tile_cache_mode", manifest.get("tile_cache_mode", "none"))),
+        "tile_oas": str(tile_oas),
+        "tile_oas_bytes": int(shard.get("tile_oas_bytes", _file_size_bytes(tile_oas) if tile_oas else 0)),
+        "tile_element_count": int(shard.get("tile_element_count", layout_element_count if layout_load_mode == "tile_oas" else 0)),
         "registered_layer_operations": register_ops,
         "effective_pattern_layers": _layer_specs_to_json(layout_index.effective_pattern_layers),
         "excluded_helper_layers": _layer_specs_to_json(layout_index.excluded_helper_layers),
         "layout_element_count": int(layout_element_count),
         "halo_filtered_element_count": int(halo_filtered_element_count),
+        "input_file_bytes": _input_file_bytes(manifest),
+        "max_rss_mb": _max_rss_mb(),
         "spatial_index_stats": shard_spatial_index_stats,
         "query_candidate_count_stats": query_stats,
         "local_exact_cluster_count": 0,
@@ -564,6 +756,11 @@ def merge_stage(manifest_path, output_path=None):
     exact_started = time.perf_counter()
     exact_clusters = group_exact_clusters(marker_records)
     exact_seconds = time.perf_counter() - exact_started
+    if int(len(exact_clusters)) > int(CENTRAL_MERGE_EXACT_CLUSTER_LIMIT):
+        raise RuntimeError(
+            "exact_cluster_count=%d 超过集中式 merge 上限 %d，请改走 prepare-coverage -> run-coverage-shard -> merge-coverage 分布式 coverage 流程。"
+            % (int(len(exact_clusters)), int(CENTRAL_MERGE_EXACT_CLUSTER_LIMIT))
+        )
 
     candidate_started = time.perf_counter()
     candidates = []
@@ -593,7 +790,10 @@ def merge_stage(manifest_path, output_path=None):
         "seed_stats": dict(manifest.get("seed_stats", {})),
         "seed_audit": dict(manifest.get("seed_audit", {})),
         "spatial_index_stats": dict(manifest.get("spatial_index_stats", {})),
+        "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
     }
+    result["lsf_manifest"]["input_file_bytes"] = _input_file_bytes(manifest)
+    result["lsf_manifest"]["max_rss_mb"] = _max_rss_mb()
     result["result_summary"]["timing_seconds"]["merge_total"] = round(time.perf_counter() - started, 6)
     output = output_path or manifest.get("result_output")
     _write_json(output, result)
@@ -629,7 +829,9 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
         safe_shards = max(1, int(coverage_shard_count))
         coverage_shard_size = int(math.ceil(float(max(total, 1)) / float(safe_shards)))
     coverage_shard_size = max(1, int(coverage_shard_size))
-    shard_count_actual = int(math.ceil(float(max(total, 1)) / float(coverage_shard_size))) if total else 0
+    source_shard_specs = _coverage_source_shard_specs(source_exact_clusters, coverage_shard_size)
+    source_fill_bin_group_count = int(len(_source_fill_bins_for_clusters(source_exact_clusters)))
+    max_source_fill_bin_count = max((int(spec["source_fill_bin_count"]) for spec in source_shard_specs), default=0)
     work_root = _ensure_dir(manifest["work_dir"])
     coverage_root = _ensure_dir(work_root / "coverage_shards")
     source_root = _ensure_dir(work_root / "exact_source_shards")
@@ -681,15 +883,21 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
     target_seconds = time.perf_counter() - target_started
     detail_seconds["prepare_coverage_target_bucket_write"] = target_seconds
     candidate_started = time.perf_counter()
-    all_candidates = []
-    for cluster in exact_clusters:
-        all_candidates.extend(generate_candidates_for_cluster(cluster, config))
-    shift_summary = candidate_shift_summary(all_candidates)
+    candidate_bundle_accumulator = create_candidate_bundle_accumulator()
+    shift_summary = {"candidate_direction_counts": {}, "diagonal_candidate_count": 0, "max_shift_distance_um": 0.0}
+    cluster_chunk_size = max(1, int(PREPARE_COVERAGE_CANDIDATE_CHUNK_SIZE))
+    for chunk_start in range(0, len(exact_clusters), cluster_chunk_size):
+        chunk_end = min(len(exact_clusters), int(chunk_start + cluster_chunk_size))
+        chunk_candidates = []
+        for cluster in exact_clusters[chunk_start:chunk_end]:
+            chunk_candidates.extend(generate_candidates_for_cluster(cluster, config))
+        _merge_shift_summary(shift_summary, candidate_shift_summary(chunk_candidates))
+        add_candidates_to_candidate_bundle_accumulator(candidate_bundle_accumulator, chunk_candidates)
     candidate_seconds = time.perf_counter() - candidate_started
     detail_seconds["prepare_coverage_candidate_generation"] = candidate_seconds
     bundle_started = time.perf_counter()
-    candidate_bundle_index = save_candidate_bundle_index(
-        all_candidates,
+    candidate_bundle_index = save_candidate_bundle_index_from_accumulator(
+        candidate_bundle_accumulator,
         bundle_root,
         {
             "pipeline_mode": PIPELINE_MODE,
@@ -701,15 +909,15 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
     script_path = Path(__file__).resolve()
     coverage_shards = []
     source_started = time.perf_counter()
-    for shard_id in range(shard_count_actual):
-        start = int(shard_id * coverage_shard_size)
-        end = min(total, int(start + coverage_shard_size))
+    for shard_id, spec in enumerate(source_shard_specs):
+        start = int(spec["start"])
+        end = int(spec["end"])
         output_json = coverage_root / ("coverage_%04d.json" % shard_id)
         output_npz = coverage_root / ("coverage_%04d.npz" % shard_id)
         source_json = source_root / ("source_%04d.json" % shard_id)
         source_npz = source_root / ("source_%04d.npz" % shard_id)
         save_exact_index(
-            source_exact_clusters[start:end],
+            spec["clusters"],
             source_json,
             source_npz,
             {
@@ -720,6 +928,10 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
                 "exact_end": int(end),
                 "exact_cluster_count": int(end - start),
                 "source_order": "fill_bin",
+                "source_fill_bin_min": int(spec["source_fill_bin_min"]),
+                "source_fill_bin_max": int(spec["source_fill_bin_max"]),
+                "source_fill_bin_count": int(spec["source_fill_bin_count"]),
+                "source_fill_bin_values": [int(value) for value in spec["source_fill_bin_values"]],
             },
         )
         command = "%s %s run-coverage-shard --manifest %s --coverage-shard-id %d" % (
@@ -735,6 +947,10 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
                 "exact_end": int(end),
                 "exact_count": int(end - start),
                 "source_order": "fill_bin",
+                "source_fill_bin_min": int(spec["source_fill_bin_min"]),
+                "source_fill_bin_max": int(spec["source_fill_bin_max"]),
+                "source_fill_bin_count": int(spec["source_fill_bin_count"]),
+                "source_fill_bin_values": [int(value) for value in spec["source_fill_bin_values"]],
                 "source_index_json": str(source_json),
                 "source_index_npz": str(source_npz),
                 "output_json": str(output_json),
@@ -761,7 +977,7 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
     manifest["candidate_bundle_index"] = candidate_bundle_index
     manifest["coverage_plan"] = {
         "exact_cluster_count": int(total),
-        "candidate_count": int(len(all_candidates)),
+        "candidate_count": int(candidate_bundle_index.get("candidate_count", 0)),
         "candidate_direction_counts": dict(shift_summary["candidate_direction_counts"]),
         "diagonal_candidate_count": int(shift_summary["diagonal_candidate_count"]),
         "max_shift_distance_um": float(shift_summary["max_shift_distance_um"]),
@@ -770,10 +986,34 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
         "max_candidate_file_bucket_group_count": int(candidate_bundle_index.get("max_file_bucket_group_count", 0)),
         "candidate_bundle_bucket_count": int(candidate_bundle_index.get("bucket_count", 0)),
         "candidate_bundle_split_mode": str(candidate_bundle_index.get("bucket_split_mode", "shape")),
+        "candidate_chunk_size": int(cluster_chunk_size),
         "coverage_shard_size": int(coverage_shard_size),
+        "coverage_source_partition_mode": "fill_bin_grouped",
+        "coverage_source_fill_bin_group_count": int(source_fill_bin_group_count),
+        "max_source_fill_bin_count_per_shard": int(max_source_fill_bin_count),
         "source_shard_order": "fill_bin",
+        "input_file_bytes": _input_file_bytes(manifest),
+        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": dict((key, round(float(value), 6)) for key, value in detail_seconds.items()),
     }
+    lsf_wrapper = dict(manifest.get("lsf_wrapper", {}))
+    lsf_wrapper["run_coverage_shards"] = _write_lsf_wrapper_files(
+        work_root,
+        "run_coverage_shards",
+        [shard["command"] for shard in coverage_shards],
+        "lc_run_coverage",
+    )
+    merge_output = manifest.get("result_output", str(work_root / "final_result.json"))
+    merge_command = "%s %s merge-coverage --manifest %s --output %s" % (
+        sys.executable,
+        str(script_path),
+        str(Path(str(manifest_path)).resolve()),
+        str(merge_output),
+    )
+    merge_wrapper = _write_single_lsf_command(work_root, "merge_coverage", merge_command)
+    merge_wrapper["command"] = str(merge_command)
+    lsf_wrapper["merge_coverage"] = merge_wrapper
+    manifest["lsf_wrapper"] = lsf_wrapper
     _write_json(manifest_path, manifest)
     return manifest
 
@@ -801,12 +1041,24 @@ def run_coverage_shard_stage(manifest_path, coverage_shard_id):
         len(source_clusters),
     )
     shift_summary = candidate_shift_summary(candidates)
+    candidate_fill_bins = sorted(set(int(coverage_fill_bin_for_bitmap(candidate.clip_bitmap)) for candidate in candidates))
+    source_fill_bins = [int(value) for value in coverage_shard.get("source_fill_bin_values", source_payload.get("source_fill_bin_values", []))]
+    if not source_fill_bins:
+        source_fill_bins = _source_fill_bins_for_clusters(source_clusters)
     candidate_seconds = time.perf_counter() - candidate_started
 
     target_started = time.perf_counter()
     candidate_shape_keys = set(bitmap_shape_key(candidate.clip_bitmap.shape) for candidate in candidates)
     target_bundles, target_load_stats = load_candidate_bundle_buckets_for_candidates(manifest.get("candidate_bundle_index", {}), candidates)
     loaded_shapes = sorted(target_bundles.keys())
+    total_candidate_group_count = int(manifest.get("candidate_bundle_index", {}).get("candidate_group_count", 0))
+    target_candidate_group_count_loaded = int(
+        target_load_stats.get("candidate_group_count_loaded", sum(len(bundle["candidate_groups"]) for bundle in target_bundles.values()))
+    )
+    if int(total_candidate_group_count) > 0:
+        target_load_ratio = float(target_candidate_group_count_loaded) / float(total_candidate_group_count)
+    else:
+        target_load_ratio = 0.0
     target_seconds = time.perf_counter() - target_started
 
     coverage_started = time.perf_counter()
@@ -827,13 +1079,26 @@ def run_coverage_shard_stage(manifest_path, coverage_shard_id):
         "target_bucket_count_loaded": int(target_load_stats.get("bucket_count_loaded", len(loaded_shapes))),
         "target_bucket_shape_keys": loaded_shapes,
         "target_bundle_bucket_keys_loaded_sample": list(target_load_stats.get("bucket_keys_loaded", [])),
-        "target_candidate_group_count_loaded": int(target_load_stats.get("candidate_group_count_loaded", sum(len(bundle["candidate_groups"]) for bundle in target_bundles.values()))),
+        "target_candidate_group_count_loaded": int(target_candidate_group_count_loaded),
+        "target_candidate_group_count_total": int(total_candidate_group_count),
+        "target_candidate_group_load_ratio": round(float(target_load_ratio), 6),
+        "target_load_warning": bool(target_load_ratio > float(TARGET_LOAD_WARNING_RATIO)),
         "candidate_shape_count": int(len(candidate_shape_keys)),
         "candidate_count": int(len(candidates)),
         "candidate_direction_counts": dict(shift_summary["candidate_direction_counts"]),
         "diagonal_candidate_count": int(shift_summary["diagonal_candidate_count"]),
         "max_shift_distance_um": float(shift_summary["max_shift_distance_um"]),
+        "source_fill_bin_min": int(min(source_fill_bins)) if source_fill_bins else 0,
+        "source_fill_bin_max": int(max(source_fill_bins)) if source_fill_bins else 0,
+        "source_fill_bin_count": int(len(source_fill_bins)),
+        "source_fill_bin_values": [int(value) for value in source_fill_bins],
+        "candidate_fill_bin_min": int(min(candidate_fill_bins)) if candidate_fill_bins else 0,
+        "candidate_fill_bin_max": int(max(candidate_fill_bins)) if candidate_fill_bins else 0,
+        "candidate_fill_bin_count": int(len(candidate_fill_bins)),
+        "candidate_fill_bin_values_sample": [int(value) for value in candidate_fill_bins[:64]],
         "coverage_debug_stats": dict(coverage_stats),
+        "input_file_bytes": _input_file_bytes(manifest),
+        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": {
             "coverage_source_index_load": round(source_seconds, 6),
             "coverage_candidate_generation": round(candidate_seconds, 6),
@@ -908,6 +1173,10 @@ def merge_coverage_stage(manifest_path, output_path=None):
                 "coverage_storage": str(payload.get("coverage_storage", "json_inline")),
                 "coverage_value_count": int(payload.get("coverage_value_count", 0)),
                 "target_bucket_count_loaded": int(payload.get("target_bucket_count_loaded", 0)),
+                "target_candidate_group_load_ratio": float(payload.get("target_candidate_group_load_ratio", 0.0)),
+                "target_load_warning": bool(payload.get("target_load_warning", False)),
+                "source_fill_bin_count": int(payload.get("source_fill_bin_count", coverage_shard.get("source_fill_bin_count", 0))),
+                "candidate_fill_bin_count": int(payload.get("candidate_fill_bin_count", 0)),
                 "geometry_pair_count": int(stats.get("geometry_pair_count", 0)),
                 "geometry_pass": int(stats.get("geometry_pass", 0)),
                 "exact_hash_pairs": int(stats.get("exact_hash_pairs", 0)),
@@ -968,6 +1237,9 @@ def merge_coverage_stage(manifest_path, output_path=None):
         "exact_index": dict(manifest.get("exact_index", {})),
         "exact_target_buckets": dict(manifest.get("exact_target_buckets", {})),
         "candidate_bundle_index": dict(manifest.get("candidate_bundle_index", {})),
+        "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
+        "input_file_bytes": _input_file_bytes(manifest),
+        "max_rss_mb": _max_rss_mb(),
     }
     result["marker_count"] = int(exact_payload.get("marker_count", result["marker_count"]))
     result["total_samples"] = int(exact_payload.get("marker_count", result["total_samples"]))
@@ -1009,8 +1281,11 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "count": int(len(manifest.get("shards", []))),
         "missing_json": 0,
         "missing_npz": 0,
+        "missing_tile_oas": 0,
         "json_bytes": 0,
         "npz_bytes": 0,
+        "tile_oas_bytes": 0,
+        "tile_element_count": 0,
         "npz_zip_uncompressed_bytes": 0,
         "marker_count": 0,
         "local_candidate_count": 0,
@@ -1019,17 +1294,25 @@ def inspect_workdir_stage(manifest_path, output_path=None):
     for shard in manifest.get("shards", []):
         json_path = shard.get("output_json", "")
         npz_path = shard.get("output_npz", "")
+        tile_path = shard.get("tile_oas", "")
         json_stat = _file_stat(json_path)
         npz_stat = _npz_zip_stat(npz_path)
+        tile_stat = _file_stat(tile_path) if tile_path else {"exists": False, "bytes": 0}
         _add_largest_file(largest_files, "shard_json_%s" % shard.get("shard_id", ""), json_path)
         _add_largest_file(largest_files, "shard_npz_%s" % shard.get("shard_id", ""), npz_path)
+        if tile_path:
+            _add_largest_file(largest_files, "tile_oas_%s" % shard.get("shard_id", ""), tile_path)
         shard_summary["json_bytes"] += int(json_stat["bytes"])
         shard_summary["npz_bytes"] += int(npz_stat["bytes"])
+        shard_summary["tile_oas_bytes"] += int(tile_stat.get("bytes", 0))
+        shard_summary["tile_element_count"] += int(shard.get("tile_element_count", 0))
         shard_summary["npz_zip_uncompressed_bytes"] += int(npz_stat.get("zip_uncompressed_bytes", 0))
         if not json_stat["exists"]:
             shard_summary["missing_json"] += 1
         if not npz_stat["exists"]:
             shard_summary["missing_npz"] += 1
+        if tile_path and not tile_stat["exists"]:
+            shard_summary["missing_tile_oas"] += 1
         payload, _ = _safe_read_json(json_path)
         if payload:
             shard_summary["marker_count"] += int(payload.get("marker_count", 0))
@@ -1104,6 +1387,12 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "cheap_reject": 0,
         "xor_reject": 0,
         "target_bucket_count_loaded": 0,
+        "target_candidate_group_count_loaded": 0,
+        "target_candidate_group_load_ratio_sum": 0.0,
+        "target_candidate_group_load_ratio_max": 0.0,
+        "target_load_warning_count": 0,
+        "source_fill_bin_count_max": 0,
+        "candidate_fill_bin_count_max": 0,
         "coverage_storage_counts": {},
     }
     source_summary = {
@@ -1151,6 +1440,37 @@ def inspect_workdir_stage(manifest_path, output_path=None):
             coverage_summary["cheap_reject"] += int(stats.get("cheap_reject", 0))
             coverage_summary["xor_reject"] += int(stats.get("xor_reject", 0))
             coverage_summary["target_bucket_count_loaded"] += int(payload.get("target_bucket_count_loaded", 0))
+            coverage_summary["target_candidate_group_count_loaded"] += int(payload.get("target_candidate_group_count_loaded", 0))
+            coverage_summary["target_candidate_group_load_ratio_sum"] += float(payload.get("target_candidate_group_load_ratio", 0.0))
+            coverage_summary["target_candidate_group_load_ratio_max"] = max(
+                float(coverage_summary["target_candidate_group_load_ratio_max"]),
+                float(payload.get("target_candidate_group_load_ratio", 0.0)),
+            )
+            coverage_summary["target_load_warning_count"] += 1 if payload.get("target_load_warning", False) else 0
+            coverage_summary["source_fill_bin_count_max"] = max(
+                int(coverage_summary["source_fill_bin_count_max"]),
+                int(payload.get("source_fill_bin_count", 0)),
+            )
+            coverage_summary["candidate_fill_bin_count_max"] = max(
+                int(coverage_summary["candidate_fill_bin_count_max"]),
+                int(payload.get("candidate_fill_bin_count", 0)),
+            )
+
+    if int(coverage_summary["count"]) > 0:
+        coverage_summary["target_candidate_group_load_ratio_avg"] = round(
+            float(coverage_summary["target_candidate_group_load_ratio_sum"]) / float(coverage_summary["count"]),
+            6,
+        )
+    else:
+        coverage_summary["target_candidate_group_load_ratio_avg"] = 0.0
+    coverage_summary["target_candidate_group_load_ratio_sum"] = round(
+        float(coverage_summary["target_candidate_group_load_ratio_sum"]),
+        6,
+    )
+    coverage_summary["target_candidate_group_load_ratio_max"] = round(
+        float(coverage_summary["target_candidate_group_load_ratio_max"]),
+        6,
+    )
 
     largest_files.sort(key=lambda item: int(item["bytes"]), reverse=True)
     result = {
@@ -1158,6 +1478,8 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "stage": "inspect-workdir",
         "manifest_path": str(Path(str(manifest_path)).resolve()),
         "work_dir": str(manifest.get("work_dir", "")),
+        "input_file_bytes": _input_file_bytes(manifest),
+        "max_rss_mb": _max_rss_mb(),
         "manifest": manifest_stat,
         "seed_file": seed_stat,
         "seed_stats": dict(manifest.get("seed_stats", {})),
@@ -1169,6 +1491,7 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "exact_target_buckets": target_bucket_summary,
         "candidate_bundle_buckets": candidate_bundle_summary,
         "coverage_shards": coverage_summary,
+        "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
         "largest_files": largest_files[:20],
         "inspect_notes": [
             "npz_zip_uncompressed_bytes 来自 zip metadata，不会加载数组。",

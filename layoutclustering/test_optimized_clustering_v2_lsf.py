@@ -7,6 +7,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gdstk
 import numpy as np
@@ -24,8 +25,10 @@ from mainline_lsf import GridSeedCandidate
 from mainline_lsf import MarkerRecord
 from mainline_lsf import _canonical_bitmap_hash
 from mainline_lsf import _dedupe_geometry_seeds
+from mainline_lsf import add_candidates_to_candidate_bundle_accumulator
 from mainline_lsf import build_uniform_grid_seed_candidates
 from mainline_lsf import candidate_shift_summary
+from mainline_lsf import create_candidate_bundle_accumulator
 from mainline_lsf import evaluate_candidate_coverage
 from mainline_lsf import generate_candidates_for_cluster
 from mainline_lsf import prepare_layout
@@ -33,6 +36,7 @@ from mainline_lsf import load_candidate_bundle_buckets_for_candidates
 from mainline_lsf import load_coverage_shard_metadata
 from mainline_lsf import load_shard_records
 from mainline_lsf import save_candidate_bundle_index
+from mainline_lsf import save_candidate_bundle_index_from_accumulator
 
 
 LSF_FILES = [
@@ -107,6 +111,19 @@ def _make_shiftable_exact_cluster():
         metadata={},
     )
     return ExactCluster(0, "exact_shiftable", record, [record])
+
+
+def _make_dummy_exact_cluster(cluster_id, area_px):
+    """构造 source shard 规划测试使用的最小 exact cluster。"""
+
+    bitmap = np.zeros((10, 10), dtype=bool)
+    bitmap.reshape(-1)[: int(area_px)] = True
+    representative = type("Representative", (object,), {})()
+    representative.clip_bitmap = bitmap
+    cluster = type("Cluster", (object,), {})()
+    cluster.exact_cluster_id = int(cluster_id)
+    cluster.representative = representative
+    return cluster
 
 
 class OptimizedV2LsfTests(unittest.TestCase):
@@ -225,6 +242,39 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertIn("precomputed_cheap_invariants", loaded_bundle)
         self.assertIn("precomputed_packed_bitmaps", loaded_bundle)
 
+    def test_chunked_candidate_bundle_matches_eager_bundle_counts(self):
+        """chunked bundle 写出应与 eager bundle 保持核心计数一致。"""
+
+        candidates = []
+        for idx in range(12):
+            bitmap = np.zeros((8, 8), dtype=bool)
+            bitmap[1:4, 1:4] = True
+            if idx % 3 == 0:
+                bitmap[4:6, 4:6] = True
+            if idx % 4 == 0:
+                bitmap = np.rot90(bitmap)
+            candidates.append(_make_candidate(idx, idx % 5, bitmap, "base" if idx % 2 == 0 else "left"))
+
+        eager_index = save_candidate_bundle_index(
+            candidates,
+            self.temp_root / "candidate_bundle_eager",
+            {"pipeline_mode": v2_lsf.PIPELINE_MODE, "stage": "unit-test-eager"},
+        )
+        accumulator = create_candidate_bundle_accumulator()
+        add_candidates_to_candidate_bundle_accumulator(accumulator, candidates[:5])
+        add_candidates_to_candidate_bundle_accumulator(accumulator, candidates[5:9])
+        add_candidates_to_candidate_bundle_accumulator(accumulator, candidates[9:])
+        chunked_index = save_candidate_bundle_index_from_accumulator(
+            accumulator,
+            self.temp_root / "candidate_bundle_chunked",
+            {"pipeline_mode": v2_lsf.PIPELINE_MODE, "stage": "unit-test-chunked"},
+        )
+
+        self.assertEqual(chunked_index["candidate_count"], eager_index["candidate_count"])
+        self.assertEqual(chunked_index["candidate_group_count"], eager_index["candidate_group_count"])
+        self.assertEqual(chunked_index["bucket_count"], eager_index["bucket_count"])
+        self.assertEqual(chunked_index["shape_bucket_count"], eager_index["shape_bucket_count"])
+
     def test_prepare_generates_manifest_and_shards(self):
         """prepare 阶段应生成 manifest、seed 文件和 shard 命令。"""
 
@@ -258,6 +308,76 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertGreater(manifest["shard_count"], 0)
         self.assertTrue(all("run-shard" in shard["command"] for shard in manifest["shards"]))
         self.assertTrue(all("halo_bbox" in shard for shard in manifest["shards"]))
+        self.assertIn("input_file_bytes", manifest)
+        self.assertGreater(manifest["input_file_bytes"], 0)
+        self.assertEqual(manifest["tile_cache_mode"], "per_shard_halo_oas_v1")
+        self.assertIn("tile_oas_total_bytes", manifest)
+        self.assertGreater(manifest["tile_oas_total_bytes"], 0)
+        self.assertIn("tile_oas_total_element_count", manifest)
+        self.assertGreaterEqual(manifest["tile_oas_total_element_count"], 0)
+        for shard in manifest["shards"]:
+            self.assertEqual(shard["tile_cache_mode"], "per_shard_halo_oas_v1")
+            self.assertTrue(Path(shard["tile_oas"]).exists())
+            self.assertGreater(shard["tile_oas_bytes"], 0)
+            self.assertGreaterEqual(shard["tile_element_count"], 0)
+        self.assertIn("lsf_wrapper", manifest)
+        self.assertIn("run_shards", manifest["lsf_wrapper"])
+        run_shards = manifest["lsf_wrapper"]["run_shards"]
+        self.assertEqual(run_shards["command_count"], manifest["shard_count"])
+        self.assertTrue(Path(run_shards["command_file"]).exists())
+        self.assertTrue(Path(run_shards["bsub_template"]).exists())
+
+    def test_merge_stage_rejects_large_central_exact_cluster_count(self):
+        """大样本不应误走集中式 merge。"""
+
+        input_oas = self.temp_root / "merge_limit.oas"
+        _write_oas(
+            input_oas,
+            [
+                gdstk.rectangle((0.05, 0.05), (0.24, 0.24), layer=1, datatype=0),
+                gdstk.rectangle((1.05, 0.05), (1.24, 0.24), layer=1, datatype=0),
+                gdstk.rectangle((2.05, 0.05), (2.24, 0.24), layer=1, datatype=0),
+            ],
+        )
+        work_dir = self.temp_root / "work_merge_limit"
+        config = {
+            "clip_size_um": 1.0,
+            "geometry_match_mode": "ecc",
+            "area_match_ratio": 0.96,
+            "edge_tolerance_um": 0.02,
+            "pixel_size_nm": 20,
+        }
+        manifest = v2_lsf.prepare_stage(str(input_oas), str(work_dir), config, [], shard_count=1, shard_size=4)
+        manifest_path = work_dir / "manifest.json"
+        for shard in manifest["shards"]:
+            v2_lsf.run_shard_stage(str(manifest_path), int(shard["shard_id"]))
+        with mock.patch.object(v2_lsf, "CENTRAL_MERGE_EXACT_CLUSTER_LIMIT", 0):
+            with self.assertRaises(RuntimeError) as ctx:
+                v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_limit.json"))
+        self.assertIn("prepare-coverage", str(ctx.exception))
+
+    def test_coverage_source_shards_are_grouped_by_fill_bin(self):
+        """coverage source shards 应优先按 fill-bin 分组。"""
+
+        clusters = [
+            _make_dummy_exact_cluster(0, 4),
+            _make_dummy_exact_cluster(1, 4),
+            _make_dummy_exact_cluster(2, 4),
+            _make_dummy_exact_cluster(3, 20),
+            _make_dummy_exact_cluster(4, 20),
+            _make_dummy_exact_cluster(5, 60),
+        ]
+        clusters = sorted(
+            clusters,
+            key=lambda cluster: (
+                int(v2_lsf.coverage_fill_bin_for_bitmap(cluster.representative.clip_bitmap)),
+                int(cluster.exact_cluster_id),
+            ),
+        )
+        specs = v2_lsf._coverage_source_shard_specs(clusters, 2)
+        self.assertEqual([spec["end"] - spec["start"] for spec in specs], [2, 1, 2, 1])
+        self.assertTrue(all(spec["source_fill_bin_count"] == 1 for spec in specs))
+        self.assertEqual(len(set(spec["source_fill_bin_values"][0] for spec in specs)), 3)
 
     def test_grid_step_ratio_is_fixed_to_v1_default(self):
         """grid_step_ratio 应固定保持 v1 主线默认值 0.5。"""
@@ -450,6 +570,39 @@ class OptimizedV2LsfTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             v2_lsf.run_shard_stage(str(manifest_path), int(manifest["shards"][0]["shard_id"]))
 
+    def test_run_shard_uses_tile_oas_without_source_oas(self):
+        """run-shard 应优先读取 prepare 生成的 tile OAS。"""
+
+        input_oas = self.temp_root / "tile_source.oas"
+        _write_oas(
+            input_oas,
+            [
+                gdstk.rectangle((0.05, 0.05), (0.24, 0.24), layer=1, datatype=0),
+                gdstk.rectangle((1.05, 0.05), (1.24, 0.24), layer=1, datatype=0),
+            ],
+        )
+        work_dir = self.temp_root / "work_tile_source"
+        config = {
+            "clip_size_um": 1.0,
+            "geometry_match_mode": "ecc",
+            "area_match_ratio": 0.96,
+            "edge_tolerance_um": 0.02,
+            "pixel_size_nm": 20,
+        }
+        manifest = v2_lsf.prepare_stage(str(input_oas), str(work_dir), config, [], shard_count=1, shard_size=10)
+        manifest_path = work_dir / "manifest.json"
+        backup_path = input_oas.with_suffix(".bak")
+        input_oas.rename(backup_path)
+
+        summary = v2_lsf.run_shard_stage(str(manifest_path), int(manifest["shards"][0]["shard_id"]))
+
+        self.assertEqual(summary["layout_load_mode"], "tile_oas")
+        self.assertFalse(summary["layout_apply_layer_operations"])
+        self.assertTrue(Path(summary["tile_oas"]).exists())
+        self.assertGreater(summary["tile_oas_bytes"], 0)
+        self.assertGreaterEqual(summary["marker_count"], 0)
+        self.assertTrue(Path(manifest["shards"][0]["output_json"]).exists())
+
     def test_run_shard_and_merge_outputs_result(self):
         """run-shard 产物应可被 merge 汇总成 compact result。"""
 
@@ -485,6 +638,8 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertIn("spatial_index_stats", summary)
             self.assertIn("query_candidate_count_stats", summary)
             self.assertGreaterEqual(summary["query_candidate_count_stats"]["query_candidate_count_max"], 0)
+            self.assertEqual(summary["layout_load_mode"], "tile_oas")
+            self.assertFalse(summary["layout_apply_layer_operations"])
         result = v2_lsf.merge_stage(str(manifest_path), str(output))
         self.assertTrue(output.exists())
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
@@ -550,13 +705,31 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertGreaterEqual(coverage_timing[timing_key], 0.0)
         self.assertIn("candidate_bundle_bucket_count", coverage_plan)
         self.assertIn("candidate_bundle_split_mode", coverage_plan)
+        self.assertIn("candidate_chunk_size", coverage_plan)
+        self.assertEqual(coverage_plan["coverage_source_partition_mode"], "fill_bin_grouped")
+        self.assertIn("coverage_source_fill_bin_group_count", coverage_plan)
+        self.assertGreaterEqual(coverage_plan["coverage_source_fill_bin_group_count"], 0)
+        self.assertIn("max_source_fill_bin_count_per_shard", coverage_plan)
+        self.assertGreaterEqual(coverage_plan["max_source_fill_bin_count_per_shard"], 0)
         self.assertIn("candidate_direction_counts", coverage_plan)
         self.assertIn("diagonal_candidate_count", coverage_plan)
         self.assertGreaterEqual(coverage_plan["diagonal_candidate_count"], 0)
         self.assertIn("max_shift_distance_um", coverage_plan)
         self.assertGreaterEqual(coverage_plan["max_shift_distance_um"], 0.0)
+        self.assertIn("input_file_bytes", coverage_plan)
+        self.assertGreater(coverage_plan["input_file_bytes"], 0)
+        self.assertIn("lsf_wrapper", manifest)
+        self.assertIn("run_coverage_shards", manifest["lsf_wrapper"])
+        self.assertIn("merge_coverage", manifest["lsf_wrapper"])
+        run_coverage_wrapper = manifest["lsf_wrapper"]["run_coverage_shards"]
+        self.assertEqual(run_coverage_wrapper["command_count"], manifest["coverage_shard_count"])
+        self.assertTrue(Path(run_coverage_wrapper["command_file"]).exists())
+        self.assertTrue(Path(run_coverage_wrapper["bsub_template"]).exists())
+        self.assertTrue(Path(manifest["lsf_wrapper"]["merge_coverage"]["command_file"]).exists())
         self.assertTrue(all("run-coverage-shard" in shard["command"] for shard in manifest["coverage_shards"]))
         self.assertTrue(all("source_index_json" in shard for shard in manifest["coverage_shards"]))
+        self.assertTrue(all("source_fill_bin_count" in shard for shard in manifest["coverage_shards"]))
+        self.assertTrue(all(shard["source_fill_bin_count"] <= 1 for shard in manifest["coverage_shards"]))
         for shard in manifest["shards"]:
             Path(shard["output_npz"]).unlink()
         Path(manifest["exact_index"]["output_json"]).unlink()
@@ -570,8 +743,18 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertIn("diagonal_candidate_count", summary)
             self.assertGreaterEqual(summary["diagonal_candidate_count"], 0)
             self.assertGreater(summary["target_bucket_count_loaded"], 0)
+            self.assertIn("target_candidate_group_load_ratio", summary)
+            self.assertGreaterEqual(summary["target_candidate_group_load_ratio"], 0.0)
+            self.assertLessEqual(summary["target_candidate_group_load_ratio"], 1.0)
+            self.assertIn("target_load_warning", summary)
+            self.assertIn("source_fill_bin_count", summary)
+            self.assertGreaterEqual(summary["source_fill_bin_count"], 0)
+            self.assertEqual(summary["source_fill_bin_count"], coverage_shard["source_fill_bin_count"])
+            self.assertIn("candidate_fill_bin_count", summary)
+            self.assertGreaterEqual(summary["candidate_fill_bin_count"], summary["source_fill_bin_count"])
             raw_payload = json.loads(Path(coverage_shard["output_json"]).read_text(encoding="utf-8"))
             self.assertEqual(raw_payload["coverage_storage"], "npz_offsets_v1")
+            self.assertEqual(raw_payload["source_fill_bin_count"], coverage_shard["source_fill_bin_count"])
             self.assertTrue(all("coverage" not in candidate for candidate in raw_payload["candidates"]))
             metadata_candidates, _ = load_coverage_shard_metadata(
                 coverage_shard["output_json"],
@@ -619,6 +802,16 @@ class OptimizedV2LsfTests(unittest.TestCase):
             inspection["coverage_shards"]["coverage_value_count"],
             distributed["coverage_debug_stats"]["coverage_csr_edge_count"],
         )
+        self.assertIn("target_candidate_group_load_ratio_avg", inspection["coverage_shards"])
+        self.assertGreaterEqual(inspection["coverage_shards"]["target_candidate_group_load_ratio_avg"], 0.0)
+        self.assertIn("target_candidate_group_load_ratio_max", inspection["coverage_shards"])
+        self.assertGreaterEqual(inspection["coverage_shards"]["target_candidate_group_load_ratio_max"], 0.0)
+        self.assertIn("candidate_fill_bin_count_max", inspection["coverage_shards"])
+        self.assertGreaterEqual(inspection["coverage_shards"]["candidate_fill_bin_count_max"], 0)
+        self.assertIn("tile_oas_bytes", inspection["shards"])
+        self.assertGreater(inspection["shards"]["tile_oas_bytes"], 0)
+        self.assertIn("lsf_wrapper", inspection)
+        self.assertIn("run_coverage_shards", inspection["lsf_wrapper"])
         self.assertGreater(inspection["coverage_shards"]["npz_zip_uncompressed_bytes"], 0)
         self.assertGreater(len(inspection["largest_files"]), 0)
 
