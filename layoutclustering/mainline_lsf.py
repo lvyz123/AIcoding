@@ -20,6 +20,7 @@
    内置泛型类型标注或 scipy.optimize.milp。
 """
 
+import csv
 import hashlib
 import heapq
 import json
@@ -1616,7 +1617,7 @@ def _empty_seed_stats(ratio, grid_step_um):
     }
 
 
-def build_uniform_grid_seed_candidates(layout_index, clip_size_um):
+def build_geometry_driven_seed_candidates(layout_index, clip_size_um):
     """按图形/重复阵列直接生成代表 seed，不再扫描全域 eligible grid。"""
 
     ratio = float(GRID_STEP_RATIO)
@@ -1932,6 +1933,276 @@ def candidate_shift_summary(candidates):
         "diagonal_candidate_count": int(diagonal_count),
         "max_shift_distance_um": float(max_shift_distance_um),
     }
+
+
+CSV_OUTPUT_COLUMNS = [
+    "groupID",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "marker_id",
+    "exact_cluster_id",
+    "source_name",
+    "source_path",
+    "marker_bbox_x1",
+    "marker_bbox_y1",
+    "marker_bbox_x2",
+    "marker_bbox_y2",
+    "marker_center_x",
+    "marker_center_y",
+    "clip_bbox_x1",
+    "clip_bbox_y1",
+    "clip_bbox_x2",
+    "clip_bbox_y2",
+    "seed_bbox_x1",
+    "seed_bbox_y1",
+    "seed_bbox_x2",
+    "seed_bbox_y2",
+    "grid_ix",
+    "grid_iy",
+    "grid_cell_bbox_x1",
+    "grid_cell_bbox_y1",
+    "grid_cell_bbox_x2",
+    "grid_cell_bbox_y2",
+    "seed_type",
+    "seed_weight",
+    "selected_candidate_id",
+    "selected_shift_direction",
+    "selected_shift_distance_um",
+    "pipeline_mode",
+    "geometry_match_mode",
+    "internal_cluster_id",
+    "cluster_size",
+    "cluster_exact_cluster_ids",
+    "representative_marker_id",
+    "representative_exact_cluster_id",
+    "representative_shift_direction",
+    "representative_shift_distance_um",
+]
+
+
+def _csv_scalar(value):
+    """把 CSV 单元格中的空值和 numpy 标量归一成 csv 可写值。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    return value
+
+
+def _bbox_item(values, index):
+    """从 bbox / center 列表中安全取值。"""
+
+    if values is None:
+        return ""
+    try:
+        return _csv_scalar(list(values)[int(index)])
+    except (IndexError, TypeError, ValueError):
+        return ""
+
+
+def _csv_join_ints(values):
+    """把 exact cluster id 列表写成分号分隔文本。"""
+
+    return ";".join(str(int(value)) for value in values)
+
+
+def _record_csv_metadata(record_or_metadata):
+    """把 MarkerRecord 或 record_metadata dict 转成 CSV 行所需的扁平 metadata。"""
+
+    if isinstance(record_or_metadata, dict):
+        payload = dict(record_or_metadata)
+        nested = dict(payload.get("metadata", {}) or {})
+        return {
+            "marker_id": payload.get("marker_id"),
+            "exact_cluster_id": payload.get("exact_cluster_id"),
+            "source_name": payload.get("source_name"),
+            "source_path": payload.get("source_path"),
+            "marker_bbox": payload.get("marker_bbox"),
+            "marker_center": payload.get("marker_center"),
+            "clip_bbox": payload.get("clip_bbox"),
+            "seed_bbox": nested.get("seed_bbox"),
+            "grid_ix": nested.get("grid_ix"),
+            "grid_iy": nested.get("grid_iy"),
+            "grid_cell_bbox": nested.get("grid_cell_bbox", nested.get("seed_bbox")),
+            "seed_type": nested.get("seed_type"),
+            "seed_weight": payload.get("seed_weight", nested.get("bucket_weight", 1)),
+        }
+
+    nested = dict(getattr(record_or_metadata, "metadata", {}) or {})
+    return {
+        "marker_id": getattr(record_or_metadata, "marker_id", ""),
+        "exact_cluster_id": getattr(record_or_metadata, "exact_cluster_id", ""),
+        "source_name": getattr(record_or_metadata, "source_name", ""),
+        "source_path": getattr(record_or_metadata, "source_path", ""),
+        "marker_bbox": getattr(record_or_metadata, "marker_bbox", []),
+        "marker_center": getattr(record_or_metadata, "marker_center", []),
+        "clip_bbox": getattr(record_or_metadata, "clip_bbox", []),
+        "seed_bbox": nested.get("seed_bbox"),
+        "grid_ix": nested.get("grid_ix"),
+        "grid_iy": nested.get("grid_iy"),
+        "grid_cell_bbox": nested.get("grid_cell_bbox", nested.get("seed_bbox")),
+        "seed_type": nested.get("seed_type"),
+        "seed_weight": getattr(record_or_metadata, "seed_weight", nested.get("bucket_weight", 1)),
+    }
+
+
+def _csv_sample_row(
+    group_id,
+    internal_cluster_id,
+    cluster_size,
+    cluster_exact_cluster_ids,
+    selected_candidate_id,
+    selected_shift_direction,
+    selected_shift_distance_um,
+    representative_marker_id,
+    representative_exact_cluster_id,
+    representative_shift_direction,
+    representative_shift_distance_um,
+    geometry_match_mode,
+    member_metadata,
+):
+    """把一个最终归属 sample 扁平化成 v1 兼容 CSV 行。"""
+
+    metadata = _record_csv_metadata(member_metadata)
+    clip_bbox = list(metadata.get("clip_bbox") or [])
+    marker_bbox = list(metadata.get("marker_bbox") or [])
+    marker_center = list(metadata.get("marker_center") or [])
+    seed_bbox = list(metadata.get("seed_bbox") or [])
+    grid_cell_bbox = list(metadata.get("grid_cell_bbox") or [])
+    row = {
+        "groupID": int(group_id),
+        "x1": _bbox_item(clip_bbox, 0),
+        "y1": _bbox_item(clip_bbox, 1),
+        "x2": _bbox_item(clip_bbox, 2),
+        "y2": _bbox_item(clip_bbox, 3),
+        "marker_id": _csv_scalar(metadata.get("marker_id")),
+        "exact_cluster_id": _csv_scalar(metadata.get("exact_cluster_id")),
+        "source_name": _csv_scalar(metadata.get("source_name")),
+        "source_path": _csv_scalar(metadata.get("source_path")),
+        "marker_bbox_x1": _bbox_item(marker_bbox, 0),
+        "marker_bbox_y1": _bbox_item(marker_bbox, 1),
+        "marker_bbox_x2": _bbox_item(marker_bbox, 2),
+        "marker_bbox_y2": _bbox_item(marker_bbox, 3),
+        "marker_center_x": _bbox_item(marker_center, 0),
+        "marker_center_y": _bbox_item(marker_center, 1),
+        "clip_bbox_x1": _bbox_item(clip_bbox, 0),
+        "clip_bbox_y1": _bbox_item(clip_bbox, 1),
+        "clip_bbox_x2": _bbox_item(clip_bbox, 2),
+        "clip_bbox_y2": _bbox_item(clip_bbox, 3),
+        "seed_bbox_x1": _bbox_item(seed_bbox, 0),
+        "seed_bbox_y1": _bbox_item(seed_bbox, 1),
+        "seed_bbox_x2": _bbox_item(seed_bbox, 2),
+        "seed_bbox_y2": _bbox_item(seed_bbox, 3),
+        "grid_ix": _csv_scalar(metadata.get("grid_ix")),
+        "grid_iy": _csv_scalar(metadata.get("grid_iy")),
+        "grid_cell_bbox_x1": _bbox_item(grid_cell_bbox, 0),
+        "grid_cell_bbox_y1": _bbox_item(grid_cell_bbox, 1),
+        "grid_cell_bbox_x2": _bbox_item(grid_cell_bbox, 2),
+        "grid_cell_bbox_y2": _bbox_item(grid_cell_bbox, 3),
+        "seed_type": _csv_scalar(metadata.get("seed_type")),
+        "seed_weight": _csv_scalar(metadata.get("seed_weight")),
+        "selected_candidate_id": _csv_scalar(selected_candidate_id),
+        "selected_shift_direction": _csv_scalar(selected_shift_direction),
+        "selected_shift_distance_um": _csv_scalar(selected_shift_distance_um),
+        "pipeline_mode": PIPELINE_MODE,
+        "geometry_match_mode": _csv_scalar(geometry_match_mode),
+        "internal_cluster_id": int(internal_cluster_id),
+        "cluster_size": int(cluster_size),
+        "cluster_exact_cluster_ids": _csv_join_ints(cluster_exact_cluster_ids),
+        "representative_marker_id": _csv_scalar(representative_marker_id),
+        "representative_exact_cluster_id": _csv_scalar(representative_exact_cluster_id),
+        "representative_shift_direction": _csv_scalar(representative_shift_direction),
+        "representative_shift_distance_um": _csv_scalar(representative_shift_distance_um),
+    }
+    return dict((column, _csv_scalar(row.get(column))) for column in CSV_OUTPUT_COLUMNS)
+
+
+def _cluster_members_for_csv(exact_cluster, marker_metadata_by_exact_id):
+    """返回一个 exact cluster 下需要写入 CSV 的成员 metadata。"""
+
+    members = list(getattr(exact_cluster, "members", []) or [])
+    if members:
+        return members
+    if marker_metadata_by_exact_id is not None:
+        found = list(marker_metadata_by_exact_id.get(int(exact_cluster.exact_cluster_id), []))
+        if found:
+            return found
+    raise RuntimeError("CSV 输出缺少 exact cluster %s 的成员 metadata" % str(exact_cluster.exact_cluster_id))
+
+
+def write_result_csv(output_path, result, exact_clusters, selected_candidates, config, marker_metadata_by_exact_id=None):
+    """把最终聚类结果写成 v1 兼容 CSV，并把 CSV 诊断字段回填到 result。"""
+
+    output = Path(str(output_path))
+    if output.suffix.lower() != ".csv":
+        raise ValueError("optimized_v2_lsf 主结果只支持 .csv 文件，请将 --output 改为 .csv 后缀: %s" % str(output_path))
+    if not output.parent.exists():
+        output.parent.mkdir(parents=True)
+
+    exact_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in exact_clusters)
+    candidate_by_id = {}
+    for candidate in selected_candidates:
+        candidate_by_id[str(getattr(candidate, "candidate_id", ""))] = candidate
+
+    row_count = 0
+    geometry_match_mode = str(config.get("geometry_match_mode", result.get("geometry_match_mode", "ecc")))
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_OUTPUT_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        for cluster in result.get("clusters", []):
+            cluster_exact_ids = [int(value) for value in cluster.get("exact_cluster_ids", [])]
+            selected_candidate_id = str(cluster.get("selected_candidate_id", ""))
+            candidate = candidate_by_id.get(selected_candidate_id)
+            if candidate is not None:
+                representative_exact_cluster_id = int(getattr(candidate, "origin_exact_cluster_id", cluster_exact_ids[0] if cluster_exact_ids else -1))
+                representative_marker_id = str(getattr(candidate, "source_marker_id", cluster.get("representative_marker_id", "")))
+                representative_shift_direction = str(getattr(candidate, "shift_direction", cluster.get("selected_shift_direction", "")))
+                representative_shift_distance_um = float(getattr(candidate, "shift_distance_um", cluster.get("selected_shift_distance_um", 0.0)))
+            else:
+                representative_exact_cluster_id = int(cluster_exact_ids[0]) if cluster_exact_ids else -1
+                representative_marker_id = str(cluster.get("representative_marker_id", ""))
+                representative_shift_direction = str(cluster.get("selected_shift_direction", "base"))
+                representative_shift_distance_um = float(cluster.get("selected_shift_distance_um", 0.0))
+
+            for exact_id in cluster_exact_ids:
+                exact_cluster = exact_by_id[int(exact_id)]
+                for member in _cluster_members_for_csv(exact_cluster, marker_metadata_by_exact_id):
+                    writer.writerow(
+                        _csv_sample_row(
+                            int(cluster.get("cluster_id", 0)) + 1,
+                            int(cluster.get("cluster_id", 0)),
+                            int(cluster.get("size", 0)),
+                            cluster_exact_ids,
+                            selected_candidate_id,
+                            str(cluster.get("selected_shift_direction", "")),
+                            float(cluster.get("selected_shift_distance_um", 0.0)),
+                            representative_marker_id,
+                            representative_exact_cluster_id,
+                            representative_shift_direction,
+                            representative_shift_distance_um,
+                            geometry_match_mode,
+                            member,
+                        )
+                    )
+                    row_count += 1
+
+    expected = int(result.get("total_samples", result.get("marker_count", row_count)))
+    if int(row_count) != int(expected):
+        raise RuntimeError("CSV row count mismatch: wrote %d, expected %d deduped seeds" % (int(row_count), int(expected)))
+
+    result["output_format"] = "csv"
+    result["result_csv_path"] = str(output)
+    result["result_csv_row_count"] = int(row_count)
+    result["result_csv_columns"] = list(CSV_OUTPUT_COLUMNS)
+    summary = result.setdefault("result_summary", {})
+    summary["output_format"] = "csv"
+    summary["result_csv_path"] = str(output)
+    summary["result_csv_row_count"] = int(row_count)
+    summary["result_csv_columns"] = list(CSV_OUTPUT_COLUMNS)
+    return {"path": str(output), "row_count": int(row_count), "columns": list(CSV_OUTPUT_COLUMNS)}
 
 
 def _bitmap_ecc_match(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
@@ -3374,7 +3645,7 @@ def greedy_cover(candidates, exact_clusters):
 
 
 def build_compact_result(marker_records, exact_clusters, candidates, selected_candidates, coverage_stats, config, runtime_summary):
-    """构建 compact JSON 结果。"""
+    """构建最终 compact 结果字典。"""
 
     marker_count = len(marker_records) if marker_records is not None else sum(int(cluster.member_count) for cluster in exact_clusters)
     cluster_sizes = []
@@ -3383,7 +3654,9 @@ def build_compact_result(marker_records, exact_clusters, candidates, selected_ca
     assigned = set()
     verification_stats = {"verified_pass": 0, "verified_reject": 0, "singleton_created": 0}
     for cluster_index, candidate in enumerate(selected_candidates):
-        exact_ids = sorted(int(cid) for cid in candidate.coverage if int(cid) in exact_by_id)
+        exact_ids = sorted(
+            int(cid) for cid in candidate.coverage if int(cid) in exact_by_id and int(cid) not in assigned
+        )
         accepted_ids = []
         for exact_id in exact_ids:
             if candidate_matches_marker(candidate, exact_by_id[exact_id].representative, config):

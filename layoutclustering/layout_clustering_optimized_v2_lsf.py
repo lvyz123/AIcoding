@@ -11,13 +11,13 @@
    - run-shard：每个 LSF job 只处理一段 seed，输出 marker records 的 JSON/NPZ。
    - prepare-coverage：汇总 marker，生成 exact clusters、全局 candidate bundle buckets 和 coverage source shards。
    - run-coverage-shard：每个 LSF job 读取本 source shard 与需要的 candidate bundle bucket，计算 coverage CSR。
-   - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap 后输出 compact JSON。
+   - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap 后输出最终 CSV。
 3. run-local 用于开发和小 crop 验证；默认走集中式小样本流程，带 --distributed-coverage 时顺序模拟完整 LSF 流程。
 4. 代码保持 Python 3.6 兼容：不使用 dataclasses、现代 union type、内置泛型类型标注或 scipy.optimize.milp。
 
 注意点：
 - grid_step_ratio 固定保持 v1 主线默认值 0.5，当前版本不开放采样密度实验入口。
-- 默认不物化 sample/representative 文件，主输出是 compact JSON。
+- 默认不物化 sample/representative 文件，最终用户主输出是 CSV。
 - prepare-coverage 不 eager 构建 full descriptor 或 ECC geometry cache；这些缓存只在 coverage shard 内按需生成。
 - candidate coverage set 使用 NPZ offsets/values 存储，JSON 只保留轻量索引和诊断字段。
 - merge-coverage 的 greedy set cover 基于 CSR 数组运行，只把 selected candidates 还原成对象。
@@ -45,9 +45,10 @@ from mainline_lsf import (
     DEFAULT_PIXEL_SIZE_NM,
     GRID_STEP_RATIO,
     PIPELINE_MODE,
+    CSV_OUTPUT_COLUMNS,
     bitmap_shape_key,
     build_compact_result,
-    build_uniform_grid_seed_candidates,
+    build_geometry_driven_seed_candidates,
     candidate_shift_summary,
     create_candidate_bundle_accumulator,
     coverage_fill_bin_for_bitmap,
@@ -69,6 +70,7 @@ from mainline_lsf import (
     marker_query_candidate_stats,
     marker_record_from_seed,
     prepare_layout,
+    record_metadata,
     add_candidates_to_candidate_bundle_accumulator,
     save_coverage_shard,
     save_candidate_bundle_index_from_accumulator,
@@ -76,6 +78,7 @@ from mainline_lsf import (
     save_shard_records,
     selected_candidates_from_csr,
     spatial_index_stats,
+    write_result_csv,
     write_layout_index_oas,
     GridSeedCandidate,
 )
@@ -110,6 +113,25 @@ def _write_json(path, payload):
         parent.mkdir(parents=True)
     with Path(str(path)).open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2, default=json_default)
+
+
+def _validate_csv_output_path(output_path):
+    """校验最终用户主输出必须是 .csv 文件。"""
+
+    output = Path(str(output_path))
+    if output.suffix.lower() != ".csv":
+        raise ValueError("optimized_v2_lsf 主结果只支持 .csv 文件，请将 --output 改为 .csv 后缀: %s" % str(output_path))
+    return output
+
+
+def _csv_output_path_arg(value):
+    """供 argparse 使用的 .csv 输出路径校验器。"""
+
+    try:
+        _validate_csv_output_path(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+    return value
 
 
 def _write_text(path, text):
@@ -457,6 +479,45 @@ def _load_all_marker_records(manifest):
     return marker_records, shard_summaries
 
 
+def _load_marker_metadata_by_exact_id(manifest):
+    """读取 prepare-coverage 写出的 exact cluster 成员 metadata，供最终 CSV 写出使用。"""
+
+    by_exact_id = {}
+    total = 0
+    member_index = dict(manifest.get("exact_member_index", {}) or {})
+    member_index_json = member_index.get("output_json", "")
+    if not member_index_json or not Path(str(member_index_json)).exists():
+        raise RuntimeError("merge-coverage 输出 CSV 需要先运行 prepare-coverage 生成 exact_members.json")
+    payload = _read_json(member_index_json)
+    for metadata in payload.get("members", []):
+        exact_id = int(metadata.get("exact_cluster_id", -1))
+        by_exact_id.setdefault(exact_id, []).append(metadata)
+        total += 1
+    return by_exact_id, int(total)
+
+
+def _save_exact_member_index(exact_clusters, output_json):
+    """保存 exact cluster 成员的轻量 metadata，不写 bitmap。"""
+
+    members = []
+    for cluster in exact_clusters:
+        for member in cluster.members:
+            members.append(record_metadata(member))
+    payload = {
+        "pipeline_mode": PIPELINE_MODE,
+        "stage": "prepare-coverage-exact-member-index",
+        "member_count": int(len(members)),
+        "exact_cluster_count": int(len(exact_clusters)),
+        "members": members,
+    }
+    _write_json(output_json, payload)
+    return {
+        "output_json": str(output_json),
+        "member_count": int(len(members)),
+        "exact_cluster_count": int(len(exact_clusters)),
+    }
+
+
 def _load_shard_summaries_only(manifest):
     """只读取 shard JSON 摘要，不加载 shard bitmap。"""
 
@@ -570,7 +631,7 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
     layout_index = prepare_layout(input_path, layer_processor, apply_layer_ops)
     grid_step_ratio = float(GRID_STEP_RATIO)
     config["grid_step_ratio"] = grid_step_ratio
-    seeds, seed_stats = build_uniform_grid_seed_candidates(
+    seeds, seed_stats = build_geometry_driven_seed_candidates(
         layout_index,
         float(config.get("clip_size_um", 1.35)),
     )
@@ -660,7 +721,7 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         },
         "shard_count": int(len(shards)),
         "shards": shards,
-        "result_output": str((work_root / "final_result.json").resolve()),
+        "result_output": str((work_root / "final_result.csv").resolve()),
         "input_file_bytes": _file_size_bytes(input_path),
         "max_rss_mb": _max_rss_mb(),
         "timing_seconds": {"prepare": round(time.perf_counter() - started, 6)},
@@ -795,8 +856,11 @@ def merge_stage(manifest_path, output_path=None):
     result["lsf_manifest"]["input_file_bytes"] = _input_file_bytes(manifest)
     result["lsf_manifest"]["max_rss_mb"] = _max_rss_mb()
     result["result_summary"]["timing_seconds"]["merge_total"] = round(time.perf_counter() - started, 6)
-    output = output_path or manifest.get("result_output")
-    _write_json(output, result)
+    output = _validate_csv_output_path(output_path or manifest.get("result_output"))
+    csv_info = write_result_csv(output, result, exact_clusters, selected, config)
+    result["lsf_manifest"]["result_csv"] = dict(csv_info)
+    manifest["result_output"] = str(output)
+    _write_json(manifest_path, manifest)
     return result
 
 
@@ -839,6 +903,7 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
     bundle_root = _ensure_dir(work_root / "candidate_bundle_buckets")
     exact_json = work_root / "exact_index.json"
     exact_npz = work_root / "exact_index.npz"
+    exact_member_json = work_root / "exact_members.json"
     write_started = time.perf_counter()
     save_exact_index(
         exact_clusters,
@@ -853,6 +918,9 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
     )
     write_seconds = time.perf_counter() - write_started
     detail_seconds["prepare_coverage_exact_index_write"] = write_seconds
+    member_started = time.perf_counter()
+    exact_member_index = _save_exact_member_index(exact_clusters, exact_member_json)
+    detail_seconds["prepare_coverage_exact_member_index_write"] = time.perf_counter() - member_started
     target_started = time.perf_counter()
     target_groups = {}
     for cluster in exact_clusters:
@@ -970,6 +1038,7 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
         "marker_count": int(len(marker_records)),
         "exact_cluster_count": int(total),
     }
+    manifest["exact_member_index"] = exact_member_index
     manifest["exact_target_buckets"] = {
         "bucket_count": int(len(shape_buckets)),
         "shape_buckets": shape_buckets,
@@ -1003,7 +1072,7 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
         [shard["command"] for shard in coverage_shards],
         "lc_run_coverage",
     )
-    merge_output = manifest.get("result_output", str(work_root / "final_result.json"))
+    merge_output = manifest.get("result_output", str(work_root / "final_result.csv"))
     merge_command = "%s %s merge-coverage --manifest %s --output %s" % (
         sys.executable,
         str(script_path),
@@ -1235,6 +1304,7 @@ def merge_coverage_stage(manifest_path, output_path=None):
         "spatial_index_stats": dict(manifest.get("spatial_index_stats", {})),
         "coverage_plan": dict(manifest.get("coverage_plan", {})),
         "exact_index": dict(manifest.get("exact_index", {})),
+        "exact_member_index": dict(manifest.get("exact_member_index", {})),
         "exact_target_buckets": dict(manifest.get("exact_target_buckets", {})),
         "candidate_bundle_index": dict(manifest.get("candidate_bundle_index", {})),
         "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
@@ -1244,8 +1314,20 @@ def merge_coverage_stage(manifest_path, output_path=None):
     result["marker_count"] = int(exact_payload.get("marker_count", result["marker_count"]))
     result["total_samples"] = int(exact_payload.get("marker_count", result["total_samples"]))
     result["result_summary"]["timing_seconds"]["merge_coverage_total"] = round(time.perf_counter() - started, 6)
-    output = output_path or manifest.get("result_output")
-    _write_json(output, result)
+    output = _validate_csv_output_path(output_path or manifest.get("result_output"))
+    marker_metadata_by_exact_id, marker_metadata_count = _load_marker_metadata_by_exact_id(manifest)
+    csv_info = write_result_csv(
+        output,
+        result,
+        exact_clusters,
+        selected,
+        config,
+        marker_metadata_by_exact_id=marker_metadata_by_exact_id,
+    )
+    result["lsf_manifest"]["result_csv"] = dict(csv_info)
+    result["lsf_manifest"]["marker_metadata_csv_source_count"] = int(marker_metadata_count)
+    manifest["result_output"] = str(output)
+    _write_json(manifest_path, manifest)
     return result
 
 
@@ -1276,6 +1358,10 @@ def inspect_workdir_stage(manifest_path, output_path=None):
     seed_stat = _file_stat(seed_file) if seed_file else {"path": "", "exists": False, "bytes": 0}
     if seed_file:
         _add_largest_file(largest_files, "seeds", seed_file)
+    result_output = manifest.get("result_output", "")
+    result_csv_stat = _file_stat(result_output) if result_output and Path(str(result_output)).suffix.lower() == ".csv" else {"path": str(result_output), "exists": False, "bytes": 0}
+    if result_output and Path(str(result_output)).suffix.lower() == ".csv":
+        _add_largest_file(largest_files, "result_csv", result_output)
 
     shard_summary = {
         "count": int(len(manifest.get("shards", []))),
@@ -1329,6 +1415,14 @@ def inspect_workdir_stage(manifest_path, output_path=None):
     if exact_index:
         _add_largest_file(largest_files, "exact_index_json", exact_index.get("output_json", ""))
         _add_largest_file(largest_files, "exact_index_npz", exact_index.get("output_npz", ""))
+
+    exact_member_index = manifest.get("exact_member_index", {})
+    exact_member_summary = {
+        "json": _file_stat(exact_member_index.get("output_json", "")) if exact_member_index else {},
+        "member_count": int(exact_member_index.get("member_count", 0)) if exact_member_index else 0,
+    }
+    if exact_member_index:
+        _add_largest_file(largest_files, "exact_member_index_json", exact_member_index.get("output_json", ""))
 
     target_bucket_summary = {
         "bucket_count": 0,
@@ -1482,11 +1576,13 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "max_rss_mb": _max_rss_mb(),
         "manifest": manifest_stat,
         "seed_file": seed_stat,
+        "result_csv": result_csv_stat,
         "seed_stats": dict(manifest.get("seed_stats", {})),
         "seed_audit": dict(manifest.get("seed_audit", {})),
         "spatial_index_stats": dict(manifest.get("spatial_index_stats", {})),
         "shards": shard_summary,
         "exact_index": exact_index_summary,
+        "exact_member_index": exact_member_summary,
         "exact_source_shards": source_summary,
         "exact_target_buckets": target_bucket_summary,
         "candidate_bundle_buckets": candidate_bundle_summary,
@@ -1568,7 +1664,7 @@ def build_parser():
 
     merge_parser = subparsers.add_parser("merge", help="集中式合并所有 seed shard 输出")
     merge_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
-    merge_parser.add_argument("--output", "-o", default=None, help="最终结果 JSON 路径")
+    merge_parser.add_argument("--output", "-o", type=_csv_output_path_arg, default=None, help="最终结果 CSV 路径")
 
     coverage_prepare_parser = subparsers.add_parser("prepare-coverage", help="生成 coverage shard 计划")
     coverage_prepare_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
@@ -1581,7 +1677,7 @@ def build_parser():
 
     coverage_merge_parser = subparsers.add_parser("merge-coverage", help="合并 coverage shard 输出")
     coverage_merge_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
-    coverage_merge_parser.add_argument("--output", "-o", default=None, help="最终结果 JSON 路径")
+    coverage_merge_parser.add_argument("--output", "-o", type=_csv_output_path_arg, default=None, help="最终结果 CSV 路径")
 
     inspect_parser = subparsers.add_parser("inspect-workdir", help="检查 LSF 工作目录产物规模")
     inspect_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
@@ -1589,7 +1685,7 @@ def build_parser():
 
     local_parser = subparsers.add_parser("run-local", help="本地顺序模拟 LSF 流程")
     _add_common_runtime_args(local_parser)
-    local_parser.add_argument("--output", "-o", required=True, help="最终结果 JSON 路径")
+    local_parser.add_argument("--output", "-o", type=_csv_output_path_arg, required=True, help="最终结果 CSV 路径")
     local_parser.add_argument("--distributed-coverage", action="store_true", help="本地顺序模拟 prepare-coverage/coverage-shard/merge-coverage")
     local_parser.add_argument("--coverage-shard-count", type=int, default=1, help="目标 coverage shard 数")
     local_parser.add_argument("--coverage-shard-size", type=int, default=0, help="每个 coverage shard 的 exact cluster 数")
@@ -1597,7 +1693,33 @@ def build_parser():
 
 
 def main():
-    """命令行主函数。"""
+    """
+    命令行主入口：解析 stage 参数，并调度 prepare/run-shard/coverage/merge 等 LSF 分阶段流程。
+
+    使用说明：
+    1. 本地小样本或 crop 验证可直接顺序运行：
+       python layout_clustering_optimized_v2_lsf.py run-local input.oas ^
+         --work-dir work_v2_lsf ^
+         --output result.csv ^
+         --distributed-coverage
+    2. LSF/服务器推荐拆成分阶段运行：
+       python layout_clustering_optimized_v2_lsf.py prepare input.oas --work-dir work_v2_lsf
+       python layout_clustering_optimized_v2_lsf.py run-shard --manifest work_v2_lsf/manifest.json --shard-id 0
+       python layout_clustering_optimized_v2_lsf.py prepare-coverage --manifest work_v2_lsf/manifest.json
+       python layout_clustering_optimized_v2_lsf.py run-coverage-shard --manifest work_v2_lsf/manifest.json --coverage-shard-id 0
+       python layout_clustering_optimized_v2_lsf.py merge-coverage --manifest work_v2_lsf/manifest.json --output result.csv
+    3. prepare 会在 work_dir/lsf 下生成 run_shards 和 run_coverage_shards 的命令清单与 bsub 模板；
+       不强制自动提交 LSF 作业，便于按不同集群队列和资源策略手动接入。
+    4. inspect-workdir 可用于查看 shard/tile/candidate/coverage 文件规模：
+       python layout_clustering_optimized_v2_lsf.py inspect-workdir --manifest work_v2_lsf/manifest.json
+
+    注意点：
+    - v2_lsf 是 v1 optimized 主算法的 LSF/Python 3.6 独立适配版，不 import v1 或旧版 mainline/layout_utils/layer_operations。
+    - grid_step_ratio 固定保持 0.5；当前版本不开放 0.6/0.7 采样密度实验入口。
+    - prepare 会为每个 seed shard 写出 halo tile OAS；run-shard 优先读取 tile，避免每个 LSF job 重读全版图。
+    - 大样本不要走集中式 merge；应使用 prepare-coverage、run-coverage-shard、merge-coverage 的分布式 coverage 流程。
+    - 最终用户主输出只支持 CSV；LSF 中间产物仍使用 JSON/NPZ，_temp_runs 和 work_dir 产物不应提交进仓库。
+    """
 
     parser = build_parser()
     args = parser.parse_args()

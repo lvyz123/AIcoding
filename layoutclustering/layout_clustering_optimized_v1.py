@@ -19,6 +19,12 @@ Optimized geometry-driven layout clustering v1.
 6. final verification 仍然坚持“失败就拆回 singleton”的解释性策略，不做跨 cluster
    自动修补。换句话说，v1 的思路是：前半段用更结构化的 seed 尽量抓住真实弱点，
    后半段再严格验证，保证最终 cluster 的 representative-member 关系仍然容易人工理解和 review。
+7. 本轮在不改变阈值语义的前提下，只优化 coverage 和输出组织方式：mega bundle 默认恢复为
+   4月29日已验证可完成的 fill-bin window，主结果改为按 seed 流式写出 CSV，
+   避免为了输出再构造完整结果大对象。
+8. 这次校准后的实现把关注点重新拉回项目目标：输出里新增 coverage / verified repeat
+   目标指标、final verification 归因统计，以及 generated -> selected -> final verified
+   的方向转化率，帮助我们在真实版图上区分“coverage 没抓到”和“抓到了但验证不稳定”。
 
 设计原则：
 - 主线唯一：layer-op 过滤 -> geometry-driven seed -> shift-cover -> verified clustering。
@@ -29,12 +35,12 @@ Optimized geometry-driven layout clustering v1.
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter
 import ctypes
 import gc
 import hashlib
 import heapq
-import json
 import math
 import shutil
 import time
@@ -74,9 +80,9 @@ from mainline import (
 GRAPH_INVARIANT_LIMIT = 0.22
 GRAPH_TOPOLOGY_THRESHOLD = 6.5
 GRAPH_SIGNATURE_THRESHOLD = 0.74
-STRICT_INVARIANT_LIMIT = 0.20
-STRICT_TOPOLOGY_THRESHOLD = 3.0
-STRICT_SIGNATURE_THRESHOLD = 0.84
+STRICT_INVARIANT_LIMIT = 0.26
+STRICT_TOPOLOGY_THRESHOLD = 6.5
+STRICT_SIGNATURE_THRESHOLD = 0.74
 CHEAP_FILL_ABS_LIMIT = 0.12
 CHEAP_AREA_DENSITY_ABS_LIMIT = 0.18
 COVERAGE_FULL_PREFILTER_MIN_PROBE_PAIRS = 512
@@ -113,6 +119,27 @@ SEED_TYPE_ARRAY = "array_representative"
 SEED_TYPE_ARRAY_SPACE = "array_spacing"
 SEED_TYPE_LONG = "long_shape_path"
 SEED_TYPE_RESIDUAL = "residual_local_grid"
+
+
+@dataclass(frozen=True, slots=True)
+class GraphThresholds:
+    """保存图特征预筛选的一组三段阈值。"""
+
+    invariant_limit: float
+    topology_threshold: float
+    signature_threshold: float
+
+
+DEFAULT_GRAPH_THRESHOLDS = GraphThresholds(
+    invariant_limit=GRAPH_INVARIANT_LIMIT,
+    topology_threshold=GRAPH_TOPOLOGY_THRESHOLD,
+    signature_threshold=GRAPH_SIGNATURE_THRESHOLD,
+)
+DEFAULT_STRICT_GRAPH_THRESHOLDS = GraphThresholds(
+    invariant_limit=STRICT_INVARIANT_LIMIT,
+    topology_threshold=STRICT_TOPOLOGY_THRESHOLD,
+    signature_threshold=STRICT_SIGNATURE_THRESHOLD,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +231,70 @@ def _empty_verification_stats() -> Dict[str, int]:
         "verified_pass": 0,
         "verified_reject": 0,
         "singleton_created": 0,
+    }
+
+
+def _empty_final_verification_breakdown() -> Dict[str, Dict[str, int]]:
+    """返回 final verification 归因统计。"""
+
+    return {
+        "pass_shift_direction_counts": {},
+        "reject_shift_direction_counts": {},
+        "pass_origin_seed_type_counts": {},
+        "reject_origin_seed_type_counts": {},
+        "pass_target_seed_type_counts": {},
+        "reject_target_seed_type_counts": {},
+        "reject_reason_counts": {},
+    }
+
+
+def _threshold_payload(thresholds: GraphThresholds) -> Dict[str, float]:
+    """把图阈值结构转换成可输出的字典。"""
+
+    return {
+        "invariant_limit": float(thresholds.invariant_limit),
+        "topology_threshold": float(thresholds.topology_threshold),
+        "signature_threshold": float(thresholds.signature_threshold),
+    }
+
+
+def _config_float(config: Dict[str, Any], key: str, default: float) -> float:
+    """读取可选 float 配置，None 表示沿用默认值。"""
+
+    value = config.get(key)
+    if value is None:
+        return float(default)
+    return float(value)
+
+
+def _config_int(config: Dict[str, Any], key: str, default: int) -> int:
+    """读取可选 int 配置，None 表示沿用默认值。"""
+
+    value = config.get(key)
+    if value is None:
+        return int(default)
+    return int(value)
+
+
+def _empty_tuning_diagnostics(
+    *,
+    enabled: bool,
+    graph_thresholds: GraphThresholds,
+    strict_graph_thresholds: GraphThresholds,
+    coverage_shortlist_max_targets: int,
+) -> Dict[str, Any]:
+    """返回参数微调诊断统计。"""
+
+    return {
+        "enabled": bool(enabled),
+        "active_graph_thresholds": _threshold_payload(graph_thresholds),
+        "active_strict_graph_thresholds": _threshold_payload(strict_graph_thresholds),
+        "baseline_graph_thresholds": _threshold_payload(DEFAULT_GRAPH_THRESHOLDS),
+        "baseline_strict_graph_thresholds": _threshold_payload(DEFAULT_STRICT_GRAPH_THRESHOLDS),
+        "coverage_shortlist_max_targets": int(coverage_shortlist_max_targets),
+        "baseline_coverage_shortlist_max_targets": int(COVERAGE_SHORTLIST_MAX_TARGETS),
+        "relaxed_only_pass_count": 0,
+        "relaxed_only_reject_reason_counts": {},
     }
 
 
@@ -391,7 +482,7 @@ def _coverage_union(left: np.ndarray, right: np.ndarray) -> np.ndarray:
 def _coverage_overlap(values: Sequence[int], uncovered: set[int]) -> Tuple[int, ...]:
     """计算某个 candidate 当前仍能覆盖的 exact cluster。"""
 
-    if not values or not uncovered:
+    if len(values) == 0 or not uncovered:
         return ()
     return tuple(int(value) for value in values if int(value) in uncovered)
 
@@ -606,14 +697,6 @@ def _raster_payload_from_record(record: MarkerRecord) -> RasterPayload:
     )
 
 
-def _should_stream_result(sample_count: int, cluster_count: int, materialize_outputs: bool) -> bool:
-    """判断当前结果是否应走流式 JSON 写出路径。"""
-
-    if materialize_outputs:
-        return False
-    return int(sample_count) >= 1000 or int(cluster_count) >= 1000
-
-
 def _pair_tracker(group_count: int, *, force_source_unique: bool = False) -> Dict[str, Any]:
     """创建 bundle 内部 pair 去重跟踪器。"""
 
@@ -691,7 +774,7 @@ def _layer_spec_text(layer_spec: Any) -> str:
 
 
 def _layer_operation_payload(layer_processor: Any) -> List[Dict[str, str]]:
-    """从 layer processor 提取可写入结果 JSON 的规则列表。"""
+    """从 layer processor 提取可写入结果统计的规则列表。"""
 
     rules = list(getattr(layer_processor, "operation_rules", []) or [])
     payload = []
@@ -1526,175 +1609,40 @@ def _print_start_banner(title: str, args: argparse.Namespace, *, apply_layer_ope
     print("=" * 60)
 
 
-def _write_text_summary(result: Dict[str, Any], output_path: Path) -> None:
-    """把 JSON 结果压缩成适合快速查看的 TXT 摘要。"""
+def _validate_csv_output_path(output_path: str) -> Path:
+    """校验主结果输出路径必须是 .csv 文件。"""
 
-    summary = result.get("result_summary", {})
-    config = result.get("config", {})
-    layer_ops = result.get("layer_operations", [])
-    cluster_sizes = list(result.get("cluster_sizes", []))
-    top_sizes = sorted((int(v) for v in cluster_sizes), reverse=True)[:10]
+    output = Path(output_path)
+    if output.suffix.lower() != ".csv":
+        raise ValueError(f"optimized_v1 主结果只支持 .csv 文件，请将 --output 改为 .csv 后缀: {output_path}")
+    return output
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        handle.write("Optimized v1 Layout 聚类结果摘要\n")
-        handle.write("=" * 40 + "\n")
-        handle.write(f"pipeline mode: {result.get('pipeline_mode')}\n")
-        handle.write(f"seed strategy: {result.get('seed_strategy')}\n")
-        handle.write(f"grid step ratio: {result.get('grid_step_ratio')}\n")
-        handle.write(f"grid step um: {result.get('grid_step_um')}\n")
-        handle.write(f"geometry match mode: {result.get('geometry_match_mode')}\n")
-        handle.write(f"pixel size nm: {result.get('pixel_size_nm')}\n")
-        handle.write(f"area match ratio: {result.get('area_match_ratio')}\n")
-        handle.write(f"edge tolerance um: {result.get('edge_tolerance_um')}\n")
-        handle.write("\n统计:\n")
-        handle.write(f"  seed/sample 数: {result.get('marker_count')} / {result.get('total_samples')}\n")
-        handle.write(
-            f"  raw/dedup/merged geometry seed 数: {result.get('grid_seed_count')} / "
-            f"{result.get('bucketed_seed_count')} / {result.get('seed_bucket_merged_count')}\n"
-        )
-        handle.write(
-            f"  array/spacing/long/residual seed 数: {result.get('array_seed_count', 0)} / "
-            f"{result.get('array_spacing_seed_count', 0)} / {result.get('long_shape_seed_count', 0)} / "
-            f"{result.get('residual_seed_count', 0)}\n"
-        )
-        handle.write(
-            f"  array group / spacing group / long shape / residual element 数: "
-            f"{result.get('array_group_count', 0)} / {result.get('array_spacing_group_count', 0)} / "
-            f"{result.get('long_shape_count', 0)} / {result.get('residual_element_count', 0)}\n"
-        )
-        handle.write(f"  seed type counts: {result.get('seed_type_counts', {})}\n")
-        handle.write(
-            f"  pre-raster cache hit/miss: {result.get('pre_raster_cache_hit', 0)} / "
-            f"{result.get('pre_raster_cache_miss', 0)}\n"
-        )
-        handle.write(
-            f"  exact bitmap cache hit/miss: {result.get('exact_bitmap_cache_hit', 0)} / "
-            f"{result.get('exact_bitmap_cache_miss', 0)}\n"
-        )
-        handle.write(
-            f"  raster payload cache 数: {result.get('pre_raster_payload_cache_count', 0)} / "
-            f"{result.get('exact_bitmap_payload_cache_count', 0)}\n"
-        )
-        handle.write(f"  exact cluster 数: {result.get('exact_cluster_count')}\n")
-        handle.write(f"  candidate 数: {result.get('candidate_count')}\n")
-        handle.write(f"  candidate group 数: {result.get('candidate_group_count', 0)}\n")
-        handle.write(f"  避免常驻 candidate 对象数: {result.get('candidate_object_avoided_count', 0)}\n")
-        handle.write(f"  candidate 方向分布: {result.get('candidate_direction_counts', {})}\n")
-        handle.write(f"  diagonal candidate 数: {result.get('diagonal_candidate_count', 0)}\n")
-        handle.write(f"  selected candidate 数: {result.get('selected_candidate_count')}\n")
-        handle.write(f"  final cluster 数: {result.get('total_clusters')}\n")
-        handle.write(f"  selected candidate 方向分布: {result.get('selected_candidate_direction_counts')}\n")
-        handle.write(f"  selected diagonal candidate 数: {result.get('selected_diagonal_candidate_count', 0)}\n")
-        handle.write(f"  final cluster 方向分布: {result.get('final_cluster_direction_counts')}\n")
-        handle.write(f"  最大 shift 距离(um): {result.get('max_shift_distance_um')}\n")
-        handle.write(f"  top cluster sizes: {top_sizes}\n")
-        handle.write("\n层操作:\n")
-        handle.write(f"  apply_layer_operations: {result.get('apply_layer_operations')}\n")
-        handle.write(f"  layer_operation_count: {result.get('layer_operation_count')}\n")
-        handle.write(f"  effective clustering layers: {result.get('effective_clustering_layers', [])}\n")
-        handle.write(f"  excluded helper layers: {result.get('excluded_helper_layers', [])}\n")
-        if layer_ops:
-            for idx, rule in enumerate(layer_ops, start=1):
-                handle.write(
-                    f"  {idx}. {rule['source_layer']} {rule['operation']} "
-                    f"{rule['target_layer']} -> {rule['result_layer']}\n"
-                )
-        handle.write("\nprefilter stats:\n")
-        handle.write(json.dumps(result.get("prefilter_stats", {}), ensure_ascii=False, indent=2))
-        handle.write("\ncoverage detail seconds:\n")
-        handle.write(json.dumps(result.get("coverage_detail_seconds", {}), ensure_ascii=False, indent=2))
-        handle.write("\ncoverage debug stats:\n")
-        handle.write(json.dumps(result.get("coverage_debug_stats", {}), ensure_ascii=False, indent=2))
-        handle.write("\nseed audit:\n")
-        handle.write(json.dumps(result.get("seed_audit", {}), ensure_ascii=False, indent=2, default=_json_default))
-        handle.write("\nresult detail seconds:\n")
-        handle.write(json.dumps(result.get("result_detail_seconds", {}), ensure_ascii=False, indent=2))
-        handle.write("\nfinal verification stats:\n")
-        handle.write(json.dumps(result.get("final_verification_stats", {}), ensure_ascii=False, indent=2))
-        handle.write("\nfinal verification detail seconds:\n")
-        handle.write(json.dumps(result.get("final_verification_detail_seconds", {}), ensure_ascii=False, indent=2))
-        handle.write("\nmemory debug:\n")
-        handle.write(json.dumps(result.get("memory_debug", {}), ensure_ascii=False, indent=2, default=_json_default))
-        handle.write("\nconfig:\n")
-        handle.write(json.dumps(config or summary.get("config", {}), ensure_ascii=False, indent=2, default=_json_default))
-        handle.write("\n")
+
+def _csv_output_path_arg(value: str) -> str:
+    """供 argparse 使用的 .csv 输出路径校验器。"""
+
+    try:
+        _validate_csv_output_path(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
 
 
 def _save_results(result: Dict[str, Any], output_path: str, output_format: str) -> None:
-    """根据输出格式把结果保存为 JSON 或 TXT 文件。"""
+    """把结果 CSV spool 保存到用户指定路径。"""
 
-    output = Path(output_path)
+    if str(output_format).lower() != "csv":
+        raise ValueError("optimized_v1 当前只支持 CSV 主结果输出")
+    output = _validate_csv_output_path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if str(output_format).lower() == "txt":
-        _write_text_summary(result, output)
-    else:
-        with output.open("w", encoding="utf-8") as handle:
-            sample_count = int(result.get("total_samples") or result.get("marker_count") or 0)
-            cluster_count = int(result.get("total_clusters") or 0)
-            if "__stream_state" in result:
-                _stream_save_results(result, handle)
-            elif sample_count >= 1000 or cluster_count >= 1000:
-                json.dump(result, handle, ensure_ascii=False, separators=(",", ":"), default=_json_default)
-            else:
-                json.dump(result, handle, indent=2, ensure_ascii=False, default=_json_default)
+    csv_state = dict(result.get("__csv_state", {}) or {})
+    csv_spool_path = csv_state.get("csv_spool_path")
+    if not csv_spool_path:
+        raise RuntimeError("结果中缺少 CSV spool 路径，无法保存主结果")
+    source = Path(csv_spool_path)
+    if source.resolve() != output.resolve():
+        shutil.copyfile(source, output)
     print(f"结果已保存到: {output}")
-
-
-def _stream_save_results(result: Dict[str, Any], handle: Any) -> None:
-    """把大样本结果按流式数组方式写出，避免构造巨大的中间 JSON 对象。"""
-
-    stream_state = dict(result.get("__stream_state", {}) or {})
-    ordered_records = list(stream_state.get("ordered_records", []) or [])
-    cluster_units = list(stream_state.get("cluster_units", []) or [])
-    sample_index_map = dict(stream_state.get("sample_index_map", {}) or {})
-    metadata_builder = stream_state.get("metadata_builder")
-    cluster_builder = stream_state.get("cluster_builder")
-    if metadata_builder is None or cluster_builder is None:
-        compact_result = {key: value for key, value in result.items() if key != "__stream_state"}
-        json.dump(compact_result, handle, ensure_ascii=False, separators=(",", ":"), default=_json_default)
-        return
-
-    def _dump_value(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=_json_default)
-
-    def _write_field(name: str, value: Any, first_field: bool) -> bool:
-        if not first_field:
-            handle.write(",")
-        handle.write(_dump_value(str(name)))
-        handle.write(":")
-        handle.write(_dump_value(value))
-        return False
-
-    handle.write("{")
-    first = True
-    for key, value in result.items():
-        if key in {"__stream_state", "clusters", "file_metadata"}:
-            continue
-        first = _write_field(str(key), value, first)
-
-    if not first:
-        handle.write(",")
-    handle.write(_dump_value("file_metadata"))
-    handle.write(":[")
-    for idx, record in enumerate(ordered_records):
-        if idx:
-            handle.write(",")
-        handle.write(_dump_value(metadata_builder(record)))
-    handle.write("]")
-
-    handle.write(",")
-    handle.write(_dump_value("clusters"))
-    handle.write(":[")
-    written_cluster = 0
-    for cluster_index, (candidate, assigned_exact_clusters) in enumerate(cluster_units):
-        if written_cluster:
-            handle.write(",")
-        handle.write(_dump_value(cluster_builder(cluster_index, candidate, assigned_exact_clusters, sample_index_map)))
-        written_cluster += 1
-    handle.write("]}")
-    for record in ordered_records:
-        _release_marker_clip_payload(record, keep_clip_bitmap=False)
-    gc.collect()
 
 
 def _pool_bitmap(bitmap: np.ndarray, bins: int = 10) -> np.ndarray:
@@ -2268,7 +2216,7 @@ def _rank_diagonal_shift_pairs(
 
 
 def _candidate_shift_summary(candidates: Sequence[CandidateClip]) -> Dict[str, Any]:
-    """汇总 candidate shift 方向统计，供结果 JSON 和日志诊断使用。"""
+    """汇总 candidate shift 方向统计，供结果和日志诊断使用。"""
 
     direction_counts = Counter(str(candidate.shift_direction) for candidate in candidates)
     max_shift_distance_um = max((abs(float(candidate.shift_distance_um)) for candidate in candidates), default=0.0)
@@ -2298,8 +2246,52 @@ def _candidate_shift_summary_from_counts(
     }
 
 
+def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
+    """在分母可能为零时安全计算比例。"""
+
+    denominator_value = float(denominator)
+    if abs(denominator_value) <= 1e-12:
+        return 0.0
+    return float(numerator) / denominator_value
+
+
+def _increment_named_counter(counter: Dict[str, int], name: Any, amount: int = 1) -> None:
+    """对字符串键的计数器做自增，统一处理空值和类型转换。"""
+
+    key = str(name) if name not in (None, "") else "unknown"
+    counter[key] = int(counter.get(key, 0)) + int(amount)
+
+
+def _marker_seed_type(record: MarkerRecord) -> str:
+    """读取 marker record 上游 seed type，缺失时回退为 unknown。"""
+
+    auto_seed = dict(record.match_cache.get("auto_seed", {}) or {})
+    seed_type = auto_seed.get("seed_type")
+    if seed_type in (None, ""):
+        return "unknown"
+    return str(seed_type)
+
+
+def _exact_cluster_seed_type(exact_cluster: ExactCluster) -> str:
+    """返回 exact cluster representative 的 seed type。"""
+
+    return _marker_seed_type(exact_cluster.representative)
+
+
+def _candidate_origin_seed_type(
+    candidate: CandidateClip,
+    exact_by_id: Dict[int, ExactCluster],
+) -> str:
+    """返回 candidate 来源 representative 的 seed type。"""
+
+    source_cluster = exact_by_id.get(int(candidate.origin_exact_cluster_id))
+    if source_cluster is None:
+        return "unknown"
+    return _exact_cluster_seed_type(source_cluster)
+
+
 def _candidate_greedy_tiebreak(candidate: CandidateClip) -> Tuple[int, float, int, str]:
-    """在 coverage 完全相同的前提下，复用 greedy set cover 的候选优先级。"""
+    """复用 4.29 版 greedy set cover 的候选优先级。"""
 
     return (
         -1 if str(candidate.shift_direction) == "base" else 0,
@@ -2307,6 +2299,211 @@ def _candidate_greedy_tiebreak(candidate: CandidateClip) -> Tuple[int, float, in
         int(candidate.origin_exact_cluster_id),
         str(candidate.candidate_id),
     )
+
+
+def _build_target_metrics(
+    selected_candidates: Sequence[CandidateClip],
+    exact_clusters: Sequence[ExactCluster],
+    final_verification_stats: Dict[str, int],
+    cluster_sizes: Sequence[int],
+    total_samples: int,
+    total_clusters: int,
+) -> Dict[str, Any]:
+    """构建与项目目标对齐的轻量指标集合。"""
+
+    exact_by_id = {int(cluster.exact_cluster_id): cluster for cluster in exact_clusters}
+    covered_exact_ids: set[int] = set()
+    for candidate in selected_candidates:
+        covered_exact_ids.update(int(cluster_id) for cluster_id in candidate.coverage)
+    coverage_sample_count = int(
+        sum(len(exact_by_id[int(cluster_id)].members) for cluster_id in covered_exact_ids if int(cluster_id) in exact_by_id)
+    )
+    non_singleton_cluster_count = int(sum(1 for size in cluster_sizes if int(size) > 1))
+    verified_repeat_member_count = int(sum(int(size) for size in cluster_sizes if int(size) > 1))
+    exact_cluster_count = int(len(exact_clusters))
+    return {
+        "coverage_sample_count": int(coverage_sample_count),
+        "exact_cluster_count": exact_cluster_count,
+        "covered_exact_cluster_count": int(len(covered_exact_ids)),
+        "verified_pass_ratio": float(
+            _safe_ratio(int(final_verification_stats.get("verified_pass", 0)), exact_cluster_count)
+        ),
+        "verified_repeat_member_count": int(verified_repeat_member_count),
+        "verified_repeat_member_ratio": float(_safe_ratio(verified_repeat_member_count, int(total_samples))),
+        "non_singleton_cluster_count": int(non_singleton_cluster_count),
+        "mean_verified_cluster_size": float(_safe_ratio(int(total_samples), int(total_clusters))),
+    }
+
+
+def _build_candidate_direction_conversion(
+    candidate_direction_counts: Dict[str, int],
+    selected_candidate_direction_counts: Dict[str, int],
+    final_cluster_direction_counts: Dict[str, int],
+) -> Dict[str, Dict[str, float | int]]:
+    """构建 generated -> selected -> final verified 的方向转化率。"""
+
+    directions = sorted(
+        {
+            str(direction)
+            for direction in (
+                list(candidate_direction_counts.keys())
+                + list(selected_candidate_direction_counts.keys())
+                + list(final_cluster_direction_counts.keys())
+            )
+        }
+    )
+    conversion: Dict[str, Dict[str, float | int]] = {}
+    for direction in directions:
+        generated_count = int(candidate_direction_counts.get(direction, 0))
+        selected_count = int(selected_candidate_direction_counts.get(direction, 0))
+        final_verified_count = int(final_cluster_direction_counts.get(direction, 0))
+        conversion[direction] = {
+            "generated_count": generated_count,
+            "selected_count": selected_count,
+            "selected_rate": float(_safe_ratio(selected_count, generated_count)),
+            "final_verified_count": final_verified_count,
+            "final_verified_rate_from_generated": float(_safe_ratio(final_verified_count, generated_count)),
+            "final_verified_rate_from_selected": float(_safe_ratio(final_verified_count, selected_count)),
+        }
+    return conversion
+
+
+CSV_OUTPUT_COLUMNS = [
+    "groupID",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "marker_id",
+    "exact_cluster_id",
+    "source_name",
+    "source_path",
+    "marker_bbox_x1",
+    "marker_bbox_y1",
+    "marker_bbox_x2",
+    "marker_bbox_y2",
+    "marker_center_x",
+    "marker_center_y",
+    "clip_bbox_x1",
+    "clip_bbox_y1",
+    "clip_bbox_x2",
+    "clip_bbox_y2",
+    "seed_bbox_x1",
+    "seed_bbox_y1",
+    "seed_bbox_x2",
+    "seed_bbox_y2",
+    "grid_ix",
+    "grid_iy",
+    "grid_cell_bbox_x1",
+    "grid_cell_bbox_y1",
+    "grid_cell_bbox_x2",
+    "grid_cell_bbox_y2",
+    "seed_type",
+    "seed_weight",
+    "selected_candidate_id",
+    "selected_shift_direction",
+    "selected_shift_distance_um",
+    "pipeline_mode",
+    "geometry_match_mode",
+    "internal_cluster_id",
+    "cluster_size",
+    "cluster_exact_cluster_ids",
+    "representative_marker_id",
+    "representative_exact_cluster_id",
+    "representative_shift_direction",
+    "representative_shift_distance_um",
+]
+
+
+def _csv_scalar(value: Any) -> Any:
+    """把 CSV 单元格中的空值归一为空字符串。"""
+
+    if value is None:
+        return ""
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    return value
+
+
+def _bbox_item(values: Any, index: int) -> Any:
+    """从 bbox / center 列表中安全提取指定位置。"""
+
+    if values is None:
+        return ""
+    try:
+        return _csv_scalar(list(values)[int(index)])
+    except (IndexError, TypeError, ValueError):
+        return ""
+
+
+def _csv_join_ints(values: Sequence[int]) -> str:
+    """把 exact cluster id 列表压成 CSV 友好的分号分隔文本。"""
+
+    return ";".join(str(int(value)) for value in values)
+
+
+def _csv_sample_row(
+    *,
+    group_id: int,
+    internal_cluster_id: int,
+    cluster_size: int,
+    cluster_exact_cluster_ids: Sequence[int],
+    representative: CandidateClip,
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """把单个 seed/sample metadata 扁平化成 CSV 行。"""
+
+    clip_bbox = list(metadata.get("clip_bbox") or [])
+    marker_bbox = list(metadata.get("marker_bbox") or [])
+    marker_center = list(metadata.get("marker_center") or [])
+    seed_bbox = list(metadata.get("seed_bbox") or [])
+    grid_cell_bbox = list(metadata.get("grid_cell_bbox") or [])
+    row = {
+        "groupID": int(group_id),
+        "x1": _bbox_item(clip_bbox, 0),
+        "y1": _bbox_item(clip_bbox, 1),
+        "x2": _bbox_item(clip_bbox, 2),
+        "y2": _bbox_item(clip_bbox, 3),
+        "marker_id": _csv_scalar(metadata.get("marker_id")),
+        "exact_cluster_id": _csv_scalar(metadata.get("exact_cluster_id")),
+        "source_name": _csv_scalar(metadata.get("source_name")),
+        "source_path": _csv_scalar(metadata.get("source_path")),
+        "marker_bbox_x1": _bbox_item(marker_bbox, 0),
+        "marker_bbox_y1": _bbox_item(marker_bbox, 1),
+        "marker_bbox_x2": _bbox_item(marker_bbox, 2),
+        "marker_bbox_y2": _bbox_item(marker_bbox, 3),
+        "marker_center_x": _bbox_item(marker_center, 0),
+        "marker_center_y": _bbox_item(marker_center, 1),
+        "clip_bbox_x1": _bbox_item(clip_bbox, 0),
+        "clip_bbox_y1": _bbox_item(clip_bbox, 1),
+        "clip_bbox_x2": _bbox_item(clip_bbox, 2),
+        "clip_bbox_y2": _bbox_item(clip_bbox, 3),
+        "seed_bbox_x1": _bbox_item(seed_bbox, 0),
+        "seed_bbox_y1": _bbox_item(seed_bbox, 1),
+        "seed_bbox_x2": _bbox_item(seed_bbox, 2),
+        "seed_bbox_y2": _bbox_item(seed_bbox, 3),
+        "grid_ix": _csv_scalar(metadata.get("grid_ix")),
+        "grid_iy": _csv_scalar(metadata.get("grid_iy")),
+        "grid_cell_bbox_x1": _bbox_item(grid_cell_bbox, 0),
+        "grid_cell_bbox_y1": _bbox_item(grid_cell_bbox, 1),
+        "grid_cell_bbox_x2": _bbox_item(grid_cell_bbox, 2),
+        "grid_cell_bbox_y2": _bbox_item(grid_cell_bbox, 3),
+        "seed_type": _csv_scalar(metadata.get("seed_type")),
+        "seed_weight": _csv_scalar(metadata.get("seed_weight")),
+        "selected_candidate_id": _csv_scalar(metadata.get("selected_candidate_id")),
+        "selected_shift_direction": _csv_scalar(metadata.get("selected_shift_direction")),
+        "selected_shift_distance_um": _csv_scalar(metadata.get("selected_shift_distance_um")),
+        "pipeline_mode": _csv_scalar(metadata.get("pipeline_mode")),
+        "geometry_match_mode": _csv_scalar(metadata.get("geometry_match_mode")),
+        "internal_cluster_id": int(internal_cluster_id),
+        "cluster_size": int(cluster_size),
+        "cluster_exact_cluster_ids": _csv_join_ints(cluster_exact_cluster_ids),
+        "representative_marker_id": str(representative.source_marker_id),
+        "representative_exact_cluster_id": int(representative.origin_exact_cluster_id),
+        "representative_shift_direction": str(representative.shift_direction),
+        "representative_shift_distance_um": float(representative.shift_distance_um),
+    }
+    return {column: _csv_scalar(row.get(column)) for column in CSV_OUTPUT_COLUMNS}
 
 
 def _invariant_distance(desc_a: GraphDescriptor, desc_b: GraphDescriptor) -> Tuple[float, bool]:
@@ -2330,23 +2527,31 @@ def _topology_distance(desc_a: GraphDescriptor, desc_b: GraphDescriptor) -> floa
     return float(np.linalg.norm(a - b))
 
 
-def _graph_prefilter_passes(candidate: Any, target: Any, *, strict: bool) -> Tuple[bool, str]:
-    """执行 invariant / topology / signature 的统一图特征预筛选。"""
+def _graph_prefilter_passes_with_thresholds(
+    candidate: Any,
+    target: Any,
+    thresholds: GraphThresholds,
+) -> Tuple[bool, str]:
+    """按指定阈值执行 invariant / topology / signature 图特征预筛选。"""
 
     desc_a = _descriptor(candidate)
     desc_b = _descriptor(target)
-    invariant_limit = STRICT_INVARIANT_LIMIT if strict else GRAPH_INVARIANT_LIMIT
-    topology_threshold = STRICT_TOPOLOGY_THRESHOLD if strict else GRAPH_TOPOLOGY_THRESHOLD
-    signature_threshold = STRICT_SIGNATURE_THRESHOLD if strict else GRAPH_SIGNATURE_THRESHOLD
 
     invariant_score, critical = _invariant_distance(desc_a, desc_b)
-    if critical or invariant_score > invariant_limit:
+    if critical or invariant_score > float(thresholds.invariant_limit):
         return False, "invariant"
-    if _topology_distance(desc_a, desc_b) > topology_threshold:
+    if _topology_distance(desc_a, desc_b) > float(thresholds.topology_threshold):
         return False, "topology"
-    if _signature_similarity(desc_a, desc_b) < signature_threshold:
+    if _signature_similarity(desc_a, desc_b) < float(thresholds.signature_threshold):
         return False, "signature"
     return True, "pass"
+
+
+def _graph_prefilter_passes(candidate: Any, target: Any, *, strict: bool) -> Tuple[bool, str]:
+    """执行默认阈值的统一图特征预筛选，兼容旧测试与默认路径。"""
+
+    thresholds = DEFAULT_STRICT_GRAPH_THRESHOLDS if strict else DEFAULT_GRAPH_THRESHOLDS
+    return _graph_prefilter_passes_with_thresholds(candidate, target, thresholds)
 
 
 def _coverage_structure(tol_px: int) -> np.ndarray:
@@ -2496,13 +2701,14 @@ class OptimizedMainlineRunner(MainlineRunner):
             "geometry_mode": "exact",
             "pixel_size_nm": int(config.get("pixel_size_nm", DEFAULT_PIXEL_SIZE_NM)),
             "area_match_ratio": float(config.get("area_match_ratio", 0.96)),
-            "edge_tolerance_um": float(config.get("edge_tolerance_um", 0.02)),
+            "edge_tolerance_um": float(config.get("edge_tolerance_um", 0.035)),
             "clip_shift_directions": "left,right,up,down",
-            "clip_shift_boundary_tolerance_um": float(config.get("edge_tolerance_um", 0.02)),
+            "clip_shift_boundary_tolerance_um": float(config.get("edge_tolerance_um", 0.035)),
         }
         super().__init__(config=clean_config, temp_dir=temp_dir, layer_processor=layer_processor)
         self.prefilter_stats = _empty_prefilter_stats()
         self.final_verification_stats = _empty_verification_stats()
+        self.final_verification_breakdown = _empty_final_verification_breakdown()
         self.final_verification_detail_seconds = _empty_verification_detail_seconds()
         self.coverage_detail_seconds = _empty_coverage_detail_seconds()
         self.coverage_debug_stats = _empty_coverage_debug_stats()
@@ -2512,6 +2718,33 @@ class OptimizedMainlineRunner(MainlineRunner):
         self._seed_stats_by_source: Dict[str, Dict[str, Any]] = {}
         self._candidate_bitmap_pool: Dict[Tuple[int, int, bytes], List[np.ndarray]] = {}
         self.materialize_outputs = bool(config.get("materialize_outputs", False))
+        self.graph_thresholds = GraphThresholds(
+            invariant_limit=_config_float(config, "graph_invariant_limit", GRAPH_INVARIANT_LIMIT),
+            topology_threshold=_config_float(config, "graph_topology_threshold", GRAPH_TOPOLOGY_THRESHOLD),
+            signature_threshold=_config_float(config, "graph_signature_threshold", GRAPH_SIGNATURE_THRESHOLD),
+        )
+        self.strict_graph_thresholds = GraphThresholds(
+            invariant_limit=_config_float(config, "strict_invariant_limit", STRICT_INVARIANT_LIMIT),
+            topology_threshold=_config_float(config, "strict_topology_threshold", STRICT_TOPOLOGY_THRESHOLD),
+            signature_threshold=_config_float(config, "strict_signature_threshold", STRICT_SIGNATURE_THRESHOLD),
+        )
+        self.coverage_shortlist_max_targets = _config_int(
+            config,
+            "coverage_shortlist_max_targets",
+            COVERAGE_SHORTLIST_MAX_TARGETS,
+        )
+        self.tuning_enabled = bool(
+            self.graph_thresholds != DEFAULT_GRAPH_THRESHOLDS
+            or self.strict_graph_thresholds != DEFAULT_STRICT_GRAPH_THRESHOLDS
+            or int(self.coverage_shortlist_max_targets) != int(COVERAGE_SHORTLIST_MAX_TARGETS)
+            or abs(float(self.edge_tolerance_um) - 0.035) > 1e-12
+        )
+        self.tuning_diagnostics = _empty_tuning_diagnostics(
+            enabled=self.tuning_enabled,
+            graph_thresholds=self.graph_thresholds,
+            strict_graph_thresholds=self.strict_graph_thresholds,
+            coverage_shortlist_max_targets=self.coverage_shortlist_max_targets,
+        )
 
     def _log(self, message: str) -> None:
         """统一中文过程日志输出入口。"""
@@ -2648,6 +2881,23 @@ class OptimizedMainlineRunner(MainlineRunner):
             if _release_marker_clip_payload(record, keep_clip_bitmap=False):
                 self.memory_debug["released_marker_clip_count"] += 1
         gc.collect()
+
+    def _release_csv_written_marker(self, record: MarkerRecord) -> bool:
+        """写完某个 sample 的 CSV 行后，释放 packed bitmap 与导出缓存。"""
+
+        released = _release_marker_clip_payload(record, keep_clip_bitmap=False)
+        released = _clear_match_cache_keys(
+            record,
+            (
+                PACKED_CLIP_BITMAP_KEY,
+                PACKED_CLIP_SHAPE_KEY,
+                EXPORT_CHEAP_FEATURE_KEY,
+                EXPORT_WORST_SCORE_KEY,
+                EXPORT_DISTANCE_SCORE_KEY,
+                "selected_candidate_info",
+            ),
+        ) or released
+        return bool(released)
 
     def _intern_candidate_bitmap(self, bitmap: np.ndarray, clip_hash: str) -> np.ndarray:
         """按逐像素 exact key 共享 candidate bitmap，减少重复 ndarray 常驻。"""
@@ -3489,14 +3739,14 @@ class OptimizedMainlineRunner(MainlineRunner):
         return int(math.floor(max(fill_ratio, 0.0) / max(float(COVERAGE_FILL_BIN_WIDTH), 1e-12)))
 
     def _build_bundle_fill_bins(self, bundle: Dict[str, Any]) -> Dict[int, np.ndarray]:
-        """把一个超大 shape bundle 切成 fill-bin source 桶。"""
+        """把超大 shape bundle 切成 fill-bin source 桶。"""
 
         started = time.perf_counter()
         clip_pixels = int(bundle["clip_pixels"])
         temp_bins: Dict[int, List[int]] = {}
         for group_idx, area_px in enumerate(np.asarray(bundle["areas"], dtype=np.int64).tolist()):
             fill_bin = self._coverage_fill_bin(int(area_px), clip_pixels)
-            temp_bins.setdefault(fill_bin, []).append(int(group_idx))
+            temp_bins.setdefault(int(fill_bin), []).append(int(group_idx))
         fill_bins = {
             int(fill_bin): np.asarray(indices, dtype=np.int32)
             for fill_bin, indices in sorted(temp_bins.items())
@@ -3746,7 +3996,6 @@ class OptimizedMainlineRunner(MainlineRunner):
         finally:
             release_started = time.perf_counter()
             self._release_shortlist_payloads(shortlist_index)
-            self._release_bundle_full_descriptor_cache(bundle)
             self._release_bundle_geometry_cache(bundle)
             self._release_bundle_bitmap_cache(bundle)
             if str(compared_pairs.get("mode")) == "rows":
@@ -3772,7 +4021,9 @@ class OptimizedMainlineRunner(MainlineRunner):
             return
         self.coverage_debug_stats["bucketed_coverage_bundle_count"] += 1
         radius = int(math.ceil(float(CHEAP_FILL_ABS_LIMIT) / max(float(COVERAGE_FILL_BIN_WIDTH), 1e-12))) + 1
-        for fill_bin, source_global_indices in fill_bins.items():
+        total_windows = int(len(fill_bins))
+        bucket_started = time.perf_counter()
+        for window_number, (fill_bin, source_global_indices) in enumerate(fill_bins.items(), start=1):
             neighbor_arrays = [
                 fill_bins[int(candidate_bin)]
                 for candidate_bin in range(int(fill_bin) - radius, int(fill_bin) + radius + 1)
@@ -3788,6 +4039,12 @@ class OptimizedMainlineRunner(MainlineRunner):
                 int(self.coverage_debug_stats.get("max_bucket_window_group_count", 0)),
                 int(window_global_indices.size),
             )
+            self._log(
+                f"coverage bucket 窗口 {window_number}/{total_windows} 开始: "
+                f"fill_bin={int(fill_bin)}, source={int(source_global_indices.size)}, "
+                f"target={int(window_global_indices.size)}, elapsed={time.perf_counter() - bucket_started:.1f}s"
+            )
+            window_started = time.perf_counter()
             window_bundle = self._bundle_window(bundle, window_global_indices)
             source_local_indices = np.searchsorted(window_global_indices, np.asarray(source_global_indices, dtype=np.int32))
             self._process_coverage_window(
@@ -3800,6 +4057,11 @@ class OptimizedMainlineRunner(MainlineRunner):
                 detail_key="bucket_window_index",
             )
             del window_bundle
+            self._log(
+                f"coverage bucket 窗口 {window_number}/{total_windows} 完成: "
+                f"耗时={time.perf_counter() - window_started:.1f}s, "
+                f"累计={time.perf_counter() - bucket_started:.1f}s"
+            )
 
     def _bundle_geometry_cache(
         self,
@@ -3993,7 +4255,7 @@ class OptimizedMainlineRunner(MainlineRunner):
 
         started = time.perf_counter()
         group_indices = np.asarray(shortlist_index["subgroup_members"][subgroup_key], dtype=np.int32)
-        k = min(int(COVERAGE_SHORTLIST_MAX_TARGETS) + 1, int(group_indices.size))
+        k = min(int(self.coverage_shortlist_max_targets) + 1, int(group_indices.size))
         if group_indices.size <= 1:
             mapped_labels = group_indices.reshape(-1, 1).astype(np.int32, copy=False)
         elif group_indices.size <= k:
@@ -4127,7 +4389,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         inv_denom = np.maximum(np.maximum(np.abs(source_inv)[None, :], np.abs(target_inv)), inv_floors[None, :])
         inv_errs = np.minimum(np.abs(target_inv - source_inv[None, :]) / inv_denom, 1.0)
         critical = (inv_errs[:, 1] > 0.45) | (inv_errs[:, 4] > 0.45) | (inv_errs[:, 5] > 0.45)
-        invariant_ok = (~critical) & ((inv_errs @ inv_weights) <= GRAPH_INVARIANT_LIMIT)
+        invariant_ok = (~critical) & ((inv_errs @ inv_weights) <= float(self.graph_thresholds.invariant_limit))
         self.prefilter_stats["invariant_reject"] += int(np.count_nonzero(~invariant_ok))
         if not np.all(invariant_ok):
             keep = invariant_ok.tolist()
@@ -4138,7 +4400,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             source_topology = np.asarray(source_desc.topology, dtype=np.float64)
             target_topology = np.asarray([desc.topology for desc in target_descs], dtype=np.float64)
             topology_dist = np.linalg.norm(target_topology - source_topology[None, :], axis=1)
-            topology_ok = topology_dist <= GRAPH_TOPOLOGY_THRESHOLD
+            topology_ok = topology_dist <= float(self.graph_thresholds.topology_threshold)
             self.prefilter_stats["topology_reject"] += int(np.count_nonzero(~topology_ok))
             if not np.all(topology_ok):
                 keep = topology_ok.tolist()
@@ -4157,7 +4419,7 @@ class OptimizedMainlineRunner(MainlineRunner):
                 + 0.2 * (target_proj_x @ source_proj_x)
                 + 0.2 * (target_proj_y @ source_proj_y)
             )
-            signature_ok = signature_sim >= GRAPH_SIGNATURE_THRESHOLD
+            signature_ok = signature_sim >= float(self.graph_thresholds.signature_threshold)
             self.prefilter_stats["signature_reject"] += int(np.count_nonzero(~signature_ok))
             target_indices = target_indices[signature_ok]
 
@@ -4385,10 +4647,7 @@ class OptimizedMainlineRunner(MainlineRunner):
             return (
                 -sum(weights[cid] for cid in covered_now),
                 -len(covered_now),
-                -1 if candidate.shift_direction == "base" else 0,
-                abs(candidate.shift_distance_um),
-                int(candidate.origin_exact_cluster_id),
-                candidate.candidate_id,
+                *_candidate_greedy_tiebreak(candidate),
             )
 
         for candidate_group in candidate_groups:
@@ -4482,26 +4741,76 @@ class OptimizedMainlineRunner(MainlineRunner):
         exact_cluster: ExactCluster,
         *,
         strict: bool,
-    ) -> bool:
-        """判断 candidate 是否能够覆盖某个 exact cluster。"""
+    ) -> Tuple[bool, str]:
+        """判断 candidate 是否能够覆盖某个 exact cluster，并返回归因原因。"""
 
         target = exact_cluster.representative
         if candidate.clip_hash == target.clip_hash:
-            return True
+            return True, "exact_hash"
 
         geometry_started = time.perf_counter()
         geometry_ok = self._geometry_passes(candidate, target)
         self.final_verification_detail_seconds["geometry"] += time.perf_counter() - geometry_started
         if not geometry_ok:
-            return False
+            return False, "geometry"
 
         prefilter_started = time.perf_counter()
-        prefilter_ok, reason = _graph_prefilter_passes(candidate, target, strict=strict)
+        graph_thresholds = self.strict_graph_thresholds if strict else self.graph_thresholds
+        prefilter_ok, reason = _graph_prefilter_passes_with_thresholds(candidate, target, graph_thresholds)
         self.final_verification_detail_seconds["graph_prefilter"] += time.perf_counter() - prefilter_started
-        del reason
         if not prefilter_ok:
-            return False
-        return True
+            return False, f"graph_{reason}"
+        return True, "verified"
+
+    def _candidate_matches_default_strict(
+        self,
+        candidate: CandidateClip,
+        exact_cluster: ExactCluster,
+    ) -> Tuple[bool, str]:
+        """用默认 strict 阈值做 shadow verification，只用于调参诊断。"""
+
+        target = exact_cluster.representative
+        if candidate.clip_hash == target.clip_hash:
+            return True, "exact_hash"
+
+        current_edge_tolerance_um = float(self.edge_tolerance_um)
+        try:
+            self.edge_tolerance_um = 0.035
+            geometry_ok = self._geometry_passes(candidate, target)
+        finally:
+            self.edge_tolerance_um = current_edge_tolerance_um
+        if not geometry_ok:
+            return False, "geometry"
+
+        prefilter_ok, reason = _graph_prefilter_passes_with_thresholds(
+            candidate,
+            target,
+            DEFAULT_STRICT_GRAPH_THRESHOLDS,
+        )
+        if not prefilter_ok:
+            return False, f"graph_{reason}"
+        return True, "verified"
+
+    def _record_final_verification_breakdown(
+        self,
+        candidate: CandidateClip,
+        exact_cluster: ExactCluster,
+        *,
+        matched: bool,
+        reason: str,
+        exact_by_id: Dict[int, ExactCluster],
+    ) -> None:
+        """记录 final verification 的方向、seed type 与拒绝原因归因。"""
+
+        breakdown_key = "pass" if matched else "reject"
+        shift_direction = str(candidate.shift_direction)
+        origin_seed_type = _candidate_origin_seed_type(candidate, exact_by_id)
+        target_seed_type = _exact_cluster_seed_type(exact_cluster)
+        _increment_named_counter(self.final_verification_breakdown[f"{breakdown_key}_shift_direction_counts"], shift_direction)
+        _increment_named_counter(self.final_verification_breakdown[f"{breakdown_key}_origin_seed_type_counts"], origin_seed_type)
+        _increment_named_counter(self.final_verification_breakdown[f"{breakdown_key}_target_seed_type_counts"], target_seed_type)
+        if not matched:
+            _increment_named_counter(self.final_verification_breakdown["reject_reason_counts"], reason)
 
     def _verified_cluster_units(
         self,
@@ -4515,14 +4824,40 @@ class OptimizedMainlineRunner(MainlineRunner):
         assignments = self._assign_exact_clusters(selected_candidates, exact_clusters)
         self.final_verification_detail_seconds["assignment"] += time.perf_counter() - assignment_started
         self.final_verification_stats = _empty_verification_stats()
+        self.final_verification_breakdown = _empty_final_verification_breakdown()
+        self.tuning_diagnostics = _empty_tuning_diagnostics(
+            enabled=self.tuning_enabled,
+            graph_thresholds=self.graph_thresholds,
+            strict_graph_thresholds=self.strict_graph_thresholds,
+            coverage_shortlist_max_targets=self.coverage_shortlist_max_targets,
+        )
+        exact_by_id = {int(cluster.exact_cluster_id): cluster for cluster in exact_clusters}
         units: List[Tuple[CandidateClip, List[ExactCluster]]] = []
 
         for candidate in selected_candidates:
             accepted: List[ExactCluster] = []
             for exact_cluster in assignments.get(candidate.candidate_id, []):
-                if self._candidate_matches_exact(candidate, exact_cluster, strict=True):
+                matched, reason = self._candidate_matches_exact(candidate, exact_cluster, strict=True)
+                self._record_final_verification_breakdown(
+                    candidate,
+                    exact_cluster,
+                    matched=matched,
+                    reason=reason,
+                    exact_by_id=exact_by_id,
+                )
+                if matched:
                     accepted.append(exact_cluster)
                     self.final_verification_stats["verified_pass"] += 1
+                    if self.tuning_enabled:
+                        baseline_matched, baseline_reason = self._candidate_matches_default_strict(candidate, exact_cluster)
+                        if not baseline_matched:
+                            self.tuning_diagnostics["relaxed_only_pass_count"] = (
+                                int(self.tuning_diagnostics.get("relaxed_only_pass_count", 0)) + 1
+                            )
+                            _increment_named_counter(
+                                self.tuning_diagnostics["relaxed_only_reject_reason_counts"],
+                                baseline_reason,
+                            )
                 else:
                     self.final_verification_stats["verified_reject"] += 1
                     self.final_verification_stats["singleton_created"] += 1
@@ -4574,78 +4909,6 @@ class OptimizedMainlineRunner(MainlineRunner):
                 for member in exact_cluster.members:
                     member.match_cache["selected_candidate_info"] = dict(payload)
 
-    def _build_stream_cluster_output(
-        self,
-        cluster_index: int,
-        candidate: CandidateClip,
-        assigned_exact_clusters: Sequence[ExactCluster],
-        sample_index_map: Dict[str, int],
-    ) -> Dict[str, Any]:
-        """在流式 JSON 写出时按需构建单个 cluster 的输出字典。"""
-
-        cluster_members = list(
-            sorted(
-                (member for exact_cluster in assigned_exact_clusters for member in exact_cluster.members),
-                key=lambda item: (item.source_name, item.marker_id),
-            )
-        )
-        export_member, export_scores = _rerank_export_representative(cluster_members)
-        sample_indices = [sample_index_map[member.marker_id] for member in cluster_members]
-        sample_metadata = [self._sample_metadata(member) for member in cluster_members]
-        exact_cluster_ids = [int(exact_cluster.exact_cluster_id) for exact_cluster in assigned_exact_clusters]
-        return {
-            "cluster_id": int(cluster_index),
-            "pipeline_mode": PIPELINE_MODE,
-            "size": int(len(cluster_members)),
-            "sample_indices": sample_indices,
-            "sample_files": [],
-            "sample_metadata": sample_metadata,
-            "representative_file": None,
-            "cover_representative_file": None,
-            "export_representative_file": None,
-            "representative_metadata": {
-                "pipeline_mode": PIPELINE_MODE,
-                "marker_id": str(candidate.source_marker_id),
-                "exact_cluster_id": int(candidate.origin_exact_cluster_id),
-                "geometry_match_mode": str(self.matching_mode),
-                "selected_candidate_id": str(candidate.candidate_id),
-                "selected_shift_direction": str(candidate.shift_direction),
-                "selected_shift_distance_um": float(candidate.shift_distance_um),
-                "coverage_exact_cluster_ids": exact_cluster_ids,
-            },
-            "cover_representative_metadata": {
-                "pipeline_mode": PIPELINE_MODE,
-                "marker_id": str(candidate.source_marker_id),
-                "exact_cluster_id": int(candidate.origin_exact_cluster_id),
-                "geometry_match_mode": str(self.matching_mode),
-                "selected_candidate_id": str(candidate.candidate_id),
-                "selected_shift_direction": str(candidate.shift_direction),
-                "selected_shift_distance_um": float(candidate.shift_distance_um),
-                "coverage_exact_cluster_ids": exact_cluster_ids,
-            },
-            "export_representative_metadata": {
-                "pipeline_mode": PIPELINE_MODE,
-                "marker_id": str(export_member.marker_id),
-                "exact_cluster_id": int(export_member.exact_cluster_id),
-                "sample_index": int(sample_index_map[export_member.marker_id]),
-                "source_name": str(export_member.source_name),
-                "seed_weight": int(export_member.seed_weight),
-                "score": float(export_scores["score"]),
-                "medoid_score": float(export_scores["medoid_score"]),
-                "worst_case_score": float(export_scores["worst_case_score"]),
-                "distance_worst_case_score": float(export_scores["distance_worst_case_score"]),
-                "weight_score": float(export_scores["weight_score"]),
-            },
-            "marker_id": str(candidate.source_marker_id),
-            "exact_cluster_id": int(candidate.origin_exact_cluster_id),
-            "marker_ids": [str(member.marker_id) for member in cluster_members],
-            "exact_cluster_ids": exact_cluster_ids,
-            "geometry_match_mode": str(self.matching_mode),
-            "selected_candidate_id": str(candidate.candidate_id),
-            "selected_shift_direction": str(candidate.shift_direction),
-            "selected_shift_distance_um": float(candidate.shift_distance_um),
-        }
-
     def _build_results(
         self,
         marker_records: Sequence[MarkerRecord],
@@ -4657,7 +4920,7 @@ class OptimizedMainlineRunner(MainlineRunner):
         candidate_group_count: int,
         candidate_shift_summary: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """物化 sample/representative clip，并组装最终结果 JSON。"""
+        """物化 review clip，流式写出主结果 CSV，并组装运行统计。"""
 
         del solver_used
         self.result_detail_seconds = _empty_result_detail_seconds()
@@ -4678,10 +4941,16 @@ class OptimizedMainlineRunner(MainlineRunner):
         cluster_units = self._verified_cluster_units(selected_candidates, exact_clusters)
         self.result_detail_seconds["final_verification"] += time.perf_counter() - verification_started
         self._annotate_cluster_member_selection(cluster_units)
-        stream_result = _should_stream_result(len(ordered_records), len(cluster_units), materialize_outputs)
+
+        csv_dir = self.temp_dir / "result_csv"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_spool_path = csv_dir / f"sample_groups_{uuid.uuid4().hex}.csv"
+        csv_row_count = 0
+        csv_release_count = 0
 
         sample_started = time.perf_counter()
         for sample_index, record in enumerate(ordered_records):
+            sample_index_map[record.marker_id] = int(sample_index)
             if materialize_outputs:
                 sample_path = sample_dir / _make_sample_filename("sample", record.source_name, sample_index)
                 clip_bitmap = getattr(record, "clip_bitmap", None)
@@ -4697,123 +4966,140 @@ class OptimizedMainlineRunner(MainlineRunner):
                 self.result_detail_seconds["sample_materialize"] += time.perf_counter() - materialize_started
                 sample_file_map[record.marker_id] = sample_file
                 file_list.append(sample_file)
-            sample_index_map[record.marker_id] = int(sample_index)
-            metadata = self._sample_metadata(record)
-            if not stream_result:
+                metadata = self._sample_metadata(record)
                 file_metadata.append(metadata)
-            if materialize_outputs:
                 _ensure_export_rerank_cache(record, include_distance=False)
                 if _pack_marker_clip_bitmap(record):
                     self.memory_debug["packed_marker_clip_count"] += 1
-            if materialize_outputs and _release_marker_clip_payload(record, keep_clip_bitmap=False):
-                self.memory_debug["released_marker_clip_count"] += 1
         self.result_detail_seconds["sample_metadata"] += time.perf_counter() - sample_started
+
         clusters_output: List[Dict[str, Any]] = []
         cluster_sizes: List[int] = []
         final_cluster_direction_counter: Counter[str] = Counter()
         max_shift = 0.0
 
         cluster_output_started = time.perf_counter()
-        for cluster_index, (candidate, assigned_exact_clusters) in enumerate(cluster_units):
-            cluster_members = list(
-                sorted(
-                    (member for exact_cluster in assigned_exact_clusters for member in exact_cluster.members),
-                    key=lambda item: (item.source_name, item.marker_id),
+        with csv_spool_path.open("w", encoding="utf-8", newline="") as csv_handle:
+            csv_writer = csv.DictWriter(csv_handle, fieldnames=CSV_OUTPUT_COLUMNS, lineterminator="\n")
+            csv_writer.writeheader()
+            for cluster_index, (candidate, assigned_exact_clusters) in enumerate(cluster_units):
+                cluster_members = list(
+                    sorted(
+                        (member for exact_cluster in assigned_exact_clusters for member in exact_cluster.members),
+                        key=lambda item: (item.source_name, item.marker_id),
+                    )
                 )
-            )
-            if not cluster_members:
-                continue
-            cluster_sizes.append(int(len(cluster_members)))
-            final_cluster_direction_counter[str(candidate.shift_direction)] += 1
-            max_shift = max(max_shift, float(abs(candidate.shift_distance_um)))
+                if not cluster_members:
+                    continue
+                cluster_size = int(len(cluster_members))
+                cluster_sizes.append(cluster_size)
+                final_cluster_direction_counter[str(candidate.shift_direction)] += 1
+                max_shift = max(max_shift, float(abs(candidate.shift_distance_um)))
+                exact_cluster_ids = [int(exact_cluster.exact_cluster_id) for exact_cluster in assigned_exact_clusters]
 
-            export_member, export_scores = _rerank_export_representative(cluster_members)
-            representative_file = None
-            if materialize_outputs:
-                rep_path = representative_dir / _make_sample_filename("rep", cluster_members[0].source_name, cluster_index)
-                candidate_bitmap = _candidate_clip_bitmap(candidate)
-                rep_materialize_started = time.perf_counter()
-                representative_file = _materialize_clip_bitmap(
-                    candidate_bitmap,
-                    candidate.clip_bbox,
-                    candidate.candidate_id,
-                    rep_path,
-                    self.pixel_size_um,
-                )
-                self.result_detail_seconds["representative_materialize"] += time.perf_counter() - rep_materialize_started
-            sample_indices = [sample_index_map[member.marker_id] for member in cluster_members]
-            sample_files = [sample_file_map[member.marker_id] for member in cluster_members] if materialize_outputs else []
-            export_sample_index = sample_index_map[export_member.marker_id]
-            export_representative_file = sample_file_map.get(export_member.marker_id) if materialize_outputs else None
-            sample_metadata = (
-                [self._sample_metadata(member) for member in cluster_members]
-                if stream_result
-                else [dict(file_metadata[sample_index_map[member.marker_id]]) for member in cluster_members]
-            )
+                for member in cluster_members:
+                    metadata = self._sample_metadata(member)
+                    csv_writer.writerow(
+                        _csv_sample_row(
+                            group_id=int(cluster_index) + 1,
+                            internal_cluster_id=int(cluster_index),
+                            cluster_size=cluster_size,
+                            cluster_exact_cluster_ids=exact_cluster_ids,
+                            representative=candidate,
+                            metadata=metadata,
+                        )
+                    )
+                    csv_row_count += 1
 
-            exact_cluster_ids = [int(exact_cluster.exact_cluster_id) for exact_cluster in assigned_exact_clusters]
-            if not stream_result:
-                clusters_output.append(
-                    {
-                        "cluster_id": int(cluster_index),
-                        "pipeline_mode": PIPELINE_MODE,
-                        "size": int(len(cluster_members)),
-                        "sample_indices": sample_indices,
-                        "sample_files": sample_files,
-                        "sample_metadata": sample_metadata,
-                        "representative_file": representative_file,
-                        "cover_representative_file": representative_file,
-                        "export_representative_file": export_representative_file,
-                        "representative_metadata": {
+                if materialize_outputs:
+                    export_member, export_scores = _rerank_export_representative(cluster_members)
+                    rep_path = representative_dir / _make_sample_filename("rep", cluster_members[0].source_name, cluster_index)
+                    candidate_bitmap = _candidate_clip_bitmap(candidate)
+                    rep_materialize_started = time.perf_counter()
+                    representative_file = _materialize_clip_bitmap(
+                        candidate_bitmap,
+                        candidate.clip_bbox,
+                        candidate.candidate_id,
+                        rep_path,
+                        self.pixel_size_um,
+                    )
+                    self.result_detail_seconds["representative_materialize"] += time.perf_counter() - rep_materialize_started
+                    sample_indices = [sample_index_map[member.marker_id] for member in cluster_members]
+                    sample_files = [sample_file_map[member.marker_id] for member in cluster_members]
+                    export_sample_index = sample_index_map[export_member.marker_id]
+                    export_representative_file = sample_file_map.get(export_member.marker_id)
+                    sample_metadata = [dict(file_metadata[sample_index_map[member.marker_id]]) for member in cluster_members]
+
+                    clusters_output.append(
+                        {
+                            "cluster_id": int(cluster_index),
                             "pipeline_mode": PIPELINE_MODE,
+                            "size": cluster_size,
+                            "sample_indices": sample_indices,
+                            "sample_files": sample_files,
+                            "sample_metadata": sample_metadata,
+                            "representative_file": representative_file,
+                            "cover_representative_file": representative_file,
+                            "export_representative_file": export_representative_file,
+                            "representative_metadata": {
+                                "pipeline_mode": PIPELINE_MODE,
+                                "marker_id": str(candidate.source_marker_id),
+                                "exact_cluster_id": int(candidate.origin_exact_cluster_id),
+                                "geometry_match_mode": str(self.matching_mode),
+                                "selected_candidate_id": str(candidate.candidate_id),
+                                "selected_shift_direction": str(candidate.shift_direction),
+                                "selected_shift_distance_um": float(candidate.shift_distance_um),
+                                "coverage_exact_cluster_ids": exact_cluster_ids,
+                            },
+                            "cover_representative_metadata": {
+                                "pipeline_mode": PIPELINE_MODE,
+                                "marker_id": str(candidate.source_marker_id),
+                                "exact_cluster_id": int(candidate.origin_exact_cluster_id),
+                                "geometry_match_mode": str(self.matching_mode),
+                                "selected_candidate_id": str(candidate.candidate_id),
+                                "selected_shift_direction": str(candidate.shift_direction),
+                                "selected_shift_distance_um": float(candidate.shift_distance_um),
+                                "coverage_exact_cluster_ids": exact_cluster_ids,
+                            },
+                            "export_representative_metadata": {
+                                "pipeline_mode": PIPELINE_MODE,
+                                "marker_id": str(export_member.marker_id),
+                                "exact_cluster_id": int(export_member.exact_cluster_id),
+                                "sample_index": int(export_sample_index),
+                                "source_name": str(export_member.source_name),
+                                "seed_weight": int(export_member.seed_weight),
+                                "score": float(export_scores["score"]),
+                                "medoid_score": float(export_scores["medoid_score"]),
+                                "worst_case_score": float(export_scores["worst_case_score"]),
+                                "distance_worst_case_score": float(export_scores["distance_worst_case_score"]),
+                                "weight_score": float(export_scores["weight_score"]),
+                            },
                             "marker_id": str(candidate.source_marker_id),
                             "exact_cluster_id": int(candidate.origin_exact_cluster_id),
+                            "marker_ids": [str(member.marker_id) for member in cluster_members],
+                            "exact_cluster_ids": exact_cluster_ids,
                             "geometry_match_mode": str(self.matching_mode),
                             "selected_candidate_id": str(candidate.candidate_id),
                             "selected_shift_direction": str(candidate.shift_direction),
                             "selected_shift_distance_um": float(candidate.shift_distance_um),
-                            "coverage_exact_cluster_ids": exact_cluster_ids,
-                        },
-                        "cover_representative_metadata": {
-                            "pipeline_mode": PIPELINE_MODE,
-                            "marker_id": str(candidate.source_marker_id),
-                            "exact_cluster_id": int(candidate.origin_exact_cluster_id),
-                            "geometry_match_mode": str(self.matching_mode),
-                            "selected_candidate_id": str(candidate.candidate_id),
-                            "selected_shift_direction": str(candidate.shift_direction),
-                            "selected_shift_distance_um": float(candidate.shift_distance_um),
-                            "coverage_exact_cluster_ids": exact_cluster_ids,
-                        },
-                        "export_representative_metadata": {
-                            "pipeline_mode": PIPELINE_MODE,
-                            "marker_id": str(export_member.marker_id),
-                            "exact_cluster_id": int(export_member.exact_cluster_id),
-                            "sample_index": int(export_sample_index),
-                            "source_name": str(export_member.source_name),
-                            "seed_weight": int(export_member.seed_weight),
-                            "score": float(export_scores["score"]),
-                            "medoid_score": float(export_scores["medoid_score"]),
-                            "worst_case_score": float(export_scores["worst_case_score"]),
-                            "distance_worst_case_score": float(export_scores["distance_worst_case_score"]),
-                            "weight_score": float(export_scores["weight_score"]),
-                        },
-                        "marker_id": str(candidate.source_marker_id),
-                        "exact_cluster_id": int(candidate.origin_exact_cluster_id),
-                        "marker_ids": [str(member.marker_id) for member in cluster_members],
-                        "exact_cluster_ids": exact_cluster_ids,
-                        "geometry_match_mode": str(self.matching_mode),
-                        "selected_candidate_id": str(candidate.candidate_id),
-                        "selected_shift_direction": str(candidate.shift_direction),
-                        "selected_shift_distance_um": float(candidate.shift_distance_um),
-                    }
-                )
-            if _release_candidate_geometry_payload(candidate, keep_clip_bitmap=False):
-                self.memory_debug["released_cache_owner_count"] += 1
-                if getattr(candidate, "clip_bitmap", None) is None:
-                    self.memory_debug["released_candidate_clip_count"] += 1
+                        }
+                    )
+                else:
+                    for member in cluster_members:
+                        if self._release_csv_written_marker(member):
+                            csv_release_count += 1
+
+                if _release_candidate_geometry_payload(candidate, keep_clip_bitmap=False):
+                    self.memory_debug["released_cache_owner_count"] += 1
+                    if getattr(candidate, "clip_bitmap", None) is None:
+                        self.memory_debug["released_candidate_clip_count"] += 1
         self.result_detail_seconds["cluster_output"] += time.perf_counter() - cluster_output_started
-        if not stream_result:
-            self._release_marker_records_before_metadata(ordered_records)
+        if int(csv_row_count) != int(len(marker_records)):
+            raise RuntimeError(
+                f"CSV row count mismatch: wrote {csv_row_count}, expected {len(marker_records)} deduped seeds"
+            )
+        if not materialize_outputs:
+            gc.collect()
 
         layer_ops = self._layer_operations()
         layer_summary = self._effective_layer_summary()
@@ -4879,8 +5165,21 @@ class OptimizedMainlineRunner(MainlineRunner):
             str(direction): int(count)
             for direction, count in sorted(final_cluster_direction_counter.items())
         }
-        total_clusters = int(len(cluster_units) if stream_result else len(clusters_output))
-        total_samples = int(len(ordered_records) if stream_result else len(file_metadata))
+        total_clusters = int(len(cluster_sizes))
+        total_samples = int(csv_row_count)
+        target_metrics = _build_target_metrics(
+            selected_candidates,
+            exact_clusters,
+            self.final_verification_stats,
+            cluster_sizes,
+            total_samples,
+            total_clusters,
+        )
+        candidate_direction_conversion = _build_candidate_direction_conversion(
+            dict(candidate_shift_summary["candidate_direction_counts"]),
+            selected_candidate_direction_counts,
+            final_cluster_direction_counts,
+        )
         result = {
             "pipeline_mode": PIPELINE_MODE,
             "seed_mode": SEED_MODE,
@@ -4930,8 +5229,15 @@ class OptimizedMainlineRunner(MainlineRunner):
             "selected_diagonal_candidate_count": int(selected_diagonal_candidate_count),
             "total_clusters": int(total_clusters),
             "total_samples": int(total_samples),
+            "target_metrics": dict(target_metrics),
+            "candidate_direction_conversion": dict(candidate_direction_conversion),
+            "tuning_diagnostics": dict(self.tuning_diagnostics),
+            "relaxed_only_pass_count": int(self.tuning_diagnostics.get("relaxed_only_pass_count", 0)),
             "total_files": int(len(file_list)),
             "materialized_outputs": bool(materialize_outputs),
+            "result_csv_row_count": int(csv_row_count),
+            "result_csv_release_count": int(csv_release_count),
+            "result_csv_columns": list(CSV_OUTPUT_COLUMNS),
             "cluster_sizes": cluster_sizes,
             "final_cluster_direction_counts": final_cluster_direction_counts,
             "max_shift_distance_um": float(max_shift),
@@ -4940,11 +5246,15 @@ class OptimizedMainlineRunner(MainlineRunner):
             "coverage_debug_stats": dict(self.coverage_debug_stats),
             "result_detail_seconds": dict(self.result_detail_seconds),
             "final_verification_stats": dict(self.final_verification_stats),
+            "final_verification_breakdown": {
+                str(name): {str(key): int(value) for key, value in dict(counter).items()}
+                for name, counter in dict(self.final_verification_breakdown).items()
+            },
             "final_verification_detail_seconds": dict(self.final_verification_detail_seconds),
             "memory_debug": dict(self.memory_debug),
-            "clusters": clusters_output if not stream_result else [],
+            "clusters": clusters_output,
             "file_list": file_list,
-            "file_metadata": file_metadata if not stream_result else [],
+            "file_metadata": file_metadata,
             "result_summary": {
                 "pipeline_mode": PIPELINE_MODE,
                 "seed_mode": SEED_MODE,
@@ -4994,8 +5304,15 @@ class OptimizedMainlineRunner(MainlineRunner):
                 "selected_diagonal_candidate_count": int(selected_diagonal_candidate_count),
                 "total_clusters": int(total_clusters),
                 "total_samples": int(total_samples),
+                "target_metrics": dict(target_metrics),
+                "candidate_direction_conversion": dict(candidate_direction_conversion),
+                "tuning_diagnostics": dict(self.tuning_diagnostics),
+                "relaxed_only_pass_count": int(self.tuning_diagnostics.get("relaxed_only_pass_count", 0)),
                 "total_files": int(len(file_list)),
                 "materialized_outputs": bool(materialize_outputs),
+                "result_csv_row_count": int(csv_row_count),
+                "result_csv_release_count": int(csv_release_count),
+                "result_csv_columns": list(CSV_OUTPUT_COLUMNS),
                 "cluster_sizes": cluster_sizes,
                 "final_cluster_direction_counts": final_cluster_direction_counts,
                 "max_shift_distance_um": float(max_shift),
@@ -5004,6 +5321,10 @@ class OptimizedMainlineRunner(MainlineRunner):
                 "coverage_debug_stats": dict(self.coverage_debug_stats),
                 "result_detail_seconds": dict(self.result_detail_seconds),
                 "final_verification_stats": dict(self.final_verification_stats),
+                "final_verification_breakdown": {
+                    str(name): {str(key): int(value) for key, value in dict(counter).items()}
+                    for name, counter in dict(self.final_verification_breakdown).items()
+                },
                 "final_verification_detail_seconds": dict(self.final_verification_detail_seconds),
                 "memory_debug": dict(self.memory_debug),
                 "timing_seconds": dict(runtime_summary),
@@ -5027,39 +5348,26 @@ class OptimizedMainlineRunner(MainlineRunner):
                 "grid_bucket_quant_um": float(GRID_BUCKET_QUANT_UM),
                 "diagonal_shift_axis_max_count": int(DIAGONAL_SHIFT_AXIS_MAX_COUNT),
                 "diagonal_shift_max_count": int(DIAGONAL_SHIFT_MAX_COUNT),
-                "graph_invariant_limit": GRAPH_INVARIANT_LIMIT,
-                "graph_topology_threshold": GRAPH_TOPOLOGY_THRESHOLD,
-                "graph_signature_threshold": GRAPH_SIGNATURE_THRESHOLD,
-                "strict_invariant_limit": STRICT_INVARIANT_LIMIT,
-                "strict_topology_threshold": STRICT_TOPOLOGY_THRESHOLD,
-                "strict_signature_threshold": STRICT_SIGNATURE_THRESHOLD,
+                "coverage_shortlist_max_targets": int(self.coverage_shortlist_max_targets),
+                "coverage_fill_bin_width": float(COVERAGE_FILL_BIN_WIDTH),
+                "graph_invariant_limit": float(self.graph_thresholds.invariant_limit),
+                "graph_topology_threshold": float(self.graph_thresholds.topology_threshold),
+                "graph_signature_threshold": float(self.graph_thresholds.signature_threshold),
+                "strict_invariant_limit": float(self.strict_graph_thresholds.invariant_limit),
+                "strict_topology_threshold": float(self.strict_graph_thresholds.topology_threshold),
+                "strict_signature_threshold": float(self.strict_graph_thresholds.signature_threshold),
+                "tuning_enabled": bool(self.tuning_enabled),
+                "output_format": "csv",
             },
             "cluster_review": {},
         }
-        if stream_result:
-            result["__stream_state"] = {
-                "ordered_records": ordered_records,
-                "sample_index_map": sample_index_map,
-                "cluster_units": cluster_units,
-                "metadata_builder": self._sample_metadata,
-                "cluster_builder": self._build_stream_cluster_output,
-            }
+        result["__csv_state"] = {
+            "csv_spool_path": str(csv_spool_path),
+            "row_count": int(csv_row_count),
+            "column_count": int(len(CSV_OUTPUT_COLUMNS)),
+        }
         result["result_summary"]["config"] = dict(result["config"])
         return result
-
-
-def _json_default(value: Any) -> Any:
-    """把 numpy / Path 等对象转换成 JSON 可序列化类型。"""
-
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _export_review(result: Dict[str, Any], review_dir: str) -> Dict[str, Any]:
@@ -5118,13 +5426,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Optimized geometry-driven layout clustering v1")
     parser.add_argument("input_path", help="Input OASIS file or directory")
-    parser.add_argument("--output", "-o", default="clustering_optimized_v1_results.json", help="Output JSON path")
-    parser.add_argument("--format", "-f", choices=["json", "txt"], default="json", help="Output format")
+    parser.add_argument("--output", "-o", type=_csv_output_path_arg, default="clustering_results.csv", help="Output CSV path")
+    parser.add_argument("--format", "-f", choices=["csv"], default="csv", help="Output format")
     parser.add_argument("--clip-size", type=float, default=1.35, help="Clip side length in um")
     parser.add_argument("--geometry-match-mode", choices=["acc", "ecc"], default="ecc", help="Final geometry gate")
     parser.add_argument("--area-match-ratio", type=float, default=0.96, help="ACC area match threshold")
-    parser.add_argument("--edge-tolerance-um", type=float, default=0.02, help="ECC edge tolerance in um")
+    parser.add_argument("--edge-tolerance-um", type=float, default=0.035, help="ECC edge tolerance in um")
     parser.add_argument("--pixel-size-nm", type=int, default=DEFAULT_PIXEL_SIZE_NM, help="Raster pixel size in nm")
+    parser.add_argument("--graph-invariant-limit", type=float, default=None, help="Experimental coverage graph invariant limit")
+    parser.add_argument("--graph-topology-threshold", type=float, default=None, help="Experimental coverage graph topology threshold")
+    parser.add_argument("--graph-signature-threshold", type=float, default=None, help="Experimental coverage graph signature threshold")
+    parser.add_argument("--strict-invariant-limit", type=float, default=None, help="Experimental final verification invariant limit")
+    parser.add_argument("--strict-topology-threshold", type=float, default=None, help="Experimental final verification topology threshold")
+    parser.add_argument("--strict-signature-threshold", type=float, default=None, help="Experimental final verification signature threshold")
+    parser.add_argument("--coverage-shortlist-max-targets", type=int, default=None, help="Experimental coverage shortlist target count")
     parser.add_argument("--review-dir", default=None, help="Optional review directory")
     parser.add_argument("--export-cluster-review-dir", default=None, help="Compatibility alias for --review-dir")
     parser.add_argument("--apply-layer-ops", action="store_true", help="Apply registered boolean layer operations before clustering")
@@ -5145,10 +5460,10 @@ def main() -> int:
     使用说明：
     1. 最基本的运行方式：
        python layout_clustering_optimized_v1.py input.oas ^
-         --output results.json
+         --output clustering_results.csv
     2. 如果需要导出人工 review 目录：
        python layout_clustering_optimized_v1.py input.oas ^
-         --output results.json ^
+         --output clustering_results.csv ^
          --review-dir review_out
     3. 如果版图在进入聚类前需要先做层间布尔运算，可配合：
        --apply-layer-ops
@@ -5162,6 +5477,8 @@ def main() -> int:
     - candidate 生成会在轴向 shift 之外补少量 diagonal shift，用于覆盖需要同时 x/y 移动的对齐情况。
     - final verification 失败的 exact cluster 不会跨 cluster 重新分配，而是直接退回 singleton，
       这是为了保证结果容易解释和人工 review。
+    - 主结果只输出 CSV；每一行对应一个去重后的 seed/sample，并按最终 cluster 写入 1-based groupID。
+    - `--strict-*` 与 `--graph-*` 参数属于压缩率调参入口；默认不传时保持当前生产阈值。
     - 指定 `--review-dir` 后会复制 sample 和 representative clip；大版图运行时请预留足够磁盘空间。
     """
 
@@ -5196,6 +5513,13 @@ def main() -> int:
         "pixel_size_nm": int(args.pixel_size_nm),
         "apply_layer_operations": apply_layer_operations,
         "materialize_outputs": bool(review_dir),
+        "graph_invariant_limit": args.graph_invariant_limit,
+        "graph_topology_threshold": args.graph_topology_threshold,
+        "graph_signature_threshold": args.graph_signature_threshold,
+        "strict_invariant_limit": args.strict_invariant_limit,
+        "strict_topology_threshold": args.strict_topology_threshold,
+        "strict_signature_threshold": args.strict_signature_threshold,
+        "coverage_shortlist_max_targets": args.coverage_shortlist_max_targets,
     }
     try:
         runner = OptimizedMainlineRunner(
@@ -5223,6 +5547,18 @@ def main() -> int:
         print(f"selected diagonal candidate 数: {result.get('selected_diagonal_candidate_count', 0)}")
         print(f"final cluster 方向分布: {result.get('final_cluster_direction_counts', {})}")
         print(f"final verification: {result.get('final_verification_stats', {})}")
+        print(f"target metrics: {result.get('target_metrics', {})}")
+        tuning = dict(result.get("tuning_diagnostics", {}) or {})
+        print(
+            "tuning diagnostics: "
+            f"enabled={tuning.get('enabled', False)}, "
+            f"relaxed_only_pass_count={tuning.get('relaxed_only_pass_count', 0)}, "
+            f"relaxed_only_reject_reason_counts={tuning.get('relaxed_only_reject_reason_counts', {})}"
+        )
+        # 打印详细的拒绝原因统计
+        breakdown = result.get('final_verification_breakdown', {})
+        reject_counts = breakdown.get('reject_reason_counts', {})
+        print(f"final verification reject details: {dict(reject_counts)}")
         print(f"memory debug: {result.get('memory_debug', {})}")
         return 0
     except Exception as exc:

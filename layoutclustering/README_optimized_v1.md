@@ -30,30 +30,29 @@
 8. coverage 阶段先做 cheap shortlist，再做 lazy full prefilter，最后做 ACC/ECC 几何比较。
 9. 通过 greedy set cover 选择 representative candidate。
 10. 对 selected candidate 做 final verification；失败成员回退成 singleton。
-11. 输出 JSON/TXT 结果；仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
+11. 输出 CSV 主结果；每行对应一个去重后的 seed/sample，仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
 
 ## 运行方式
 
 ```bash
-python layout_clustering_optimized_v1.py ./design.oas --output results.json
+python layout_clustering_optimized_v1.py ./design.oas --output clustering_results.csv
 ```
 
 常用示例：
 
 ```bash
-python layout_clustering_optimized_v1.py ./design.oas --output results.json
-python layout_clustering_optimized_v1.py ./input_dir --output results.json
-python layout_clustering_optimized_v1.py ./design.oas --clip-size 1.35 --geometry-match-mode ecc --output results.json
-python layout_clustering_optimized_v1.py ./design.oas --review-dir review_out --output results.json
-python layout_clustering_optimized_v1.py ./design.oas --format txt --output results.txt
-python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --register-op 2413/0 2410/0 subtract 2411/0 --output results.json
+python layout_clustering_optimized_v1.py ./design.oas --output clustering_results.csv
+python layout_clustering_optimized_v1.py ./input_dir --output clustering_results.csv
+python layout_clustering_optimized_v1.py ./design.oas --clip-size 1.35 --geometry-match-mode ecc --output clustering_results.csv
+python layout_clustering_optimized_v1.py ./design.oas --review-dir review_out --output clustering_results.csv
+python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --register-op 2413/0 2410/0 subtract 2411/0 --output clustering_results.csv
 ```
 
 ## 关键参数
 
 - `input_path`：输入 OAS 文件或目录。
-- `--output`, `-o`：输出路径，默认 `clustering_optimized_v1_results.json`。
-- `--format`, `-f`：输出格式，`json` 或 `txt`，默认 `json`。
+- `--output`, `-o`：输出 CSV 路径，默认 `clustering_results.csv`；必须使用 `.csv` 后缀，传入 `.json`、`.txt` 或无后缀路径会立即报错。
+- `--format`, `-f`：输出格式，当前仅支持 `csv`。
 - `--clip-size`：clip 边长，单位 `um`，默认 `1.35`。
 - `--geometry-match-mode`：最终几何 gate，`acc` 或 `ecc`，默认 `ecc`。
 - `--area-match-ratio`：`acc` 模式的面积匹配阈值，默认 `0.96`。
@@ -83,9 +82,10 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `exact_cluster_count`, `candidate_count`, `candidate_group_count`, `candidate_object_avoided_count`
 - `candidate_direction_counts`, `diagonal_candidate_count`
 - `selected_candidate_count`, `selected_diagonal_candidate_count`, `total_clusters`
+- `result_csv_row_count`, `result_csv_release_count`, `result_csv_columns`
 - `prefilter_stats`, `coverage_detail_seconds`, `coverage_debug_stats`
 - `final_verification_stats`, `final_verification_detail_seconds`
-- `memory_debug`, `clusters`, `file_metadata`, `file_list`, `config`, `result_summary`
+- `memory_debug`, `file_list`, `config`, `result_summary`
 
 单个 cluster 主要包含：
 
@@ -141,11 +141,18 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 
 ### Coverage 阶段
 
-- mega bundle 使用 `shape + fill-bin` 顺序处理，而不是在单个超大 bundle 上长期常驻 dense 结构。
+- mega bundle 使用 4月29日已验证可完成的 `shape + fill-bin` window 顺序处理，而不是在单个超大 bundle 上长期常驻 dense 结构。
+- area-density 仍只保留在 `_batch_prefilter()` 的 cheap reject 中，默认不再参与 window 分桶，避免把 mega bundle 切成过多重叠窗口。
+- exact-hash coverage 仍然在完整 shape bundle 内传播，不被 fill-bin window 限制。
 - shortlist 不再为整个 window 预建全量 `(group_count, 120)` 的 `signature_embeddings`。
-- `signature_embedding` 改成 subgroup 级懒计算，并在 payload 释放时同步回收。
-- full descriptor 改成 lazy 构建，只对 shortlist 幸存 pair 计算。
+- cheap descriptor 和 signature embedding 在 window 内按需计算；full descriptor 使用 window-local cache，并在每个 source prefilter 后释放。
 - geometry cache 只保留 packed-first 形态，不长期保留二维 bool 中间结果。
+
+### Result 流式输出
+
+- 大样本默认 `materialized_outputs=false` 时，`_build_results()` 会把每个去重 seed/sample 按最终 group 直接写入临时 CSV spool。
+- `_save_results()` 只把 CSV spool 复制到用户指定的 `.csv` 主输出路径，不再写旧主结果格式或 summary sidecar。
+- 新增 `result_csv_row_count`、`result_csv_release_count`、`result_csv_columns`，用于确认 CSV 写出与释放路径是否生效。
 
 ### Candidate Group Packed-at-Rest
 

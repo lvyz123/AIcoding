@@ -3,12 +3,12 @@
 
 from __future__ import annotations
 
-import json
+import csv
 import os
 import shutil
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -19,6 +19,7 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SAMPLE_LAYOUT = REPO_ROOT / "layoutgenerator" / "out_oas" / "sample_layout_001.oas"
+OUTPUT_TEMPLATE = SCRIPT_DIR / "output_template.csv"
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -200,9 +201,41 @@ class OptimizedGridV1Tests(unittest.TestCase):
         )
 
     def test_parser_removes_seed_strategy(self) -> None:
-        help_text = optimized._build_parser().format_help()
+        parser = optimized._build_parser()
+        help_text = parser.format_help()
         self.assertNotIn("--seed-strategy", help_text)
         self.assertIn("--clip-size", help_text)
+        args = parser.parse_args(["input.oas"])
+        self.assertEqual(args.output, "clustering_results.csv")
+        self.assertEqual(args.format, "csv")
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            parser.parse_args(["input.oas", "--format", "json"])
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            parser.parse_args(["input.oas", "--output", "clustering_results.json"])
+        with self.assertRaises(SystemExit), redirect_stderr(StringIO()):
+            parser.parse_args(["input.oas", "--output", "clustering_results.txt"])
+        csv_args = parser.parse_args(["input.oas", "--output", "custom_result.CSV"])
+        self.assertEqual(csv_args.output, "custom_result.CSV")
+        tuning_args = parser.parse_args(
+            [
+                "input.oas",
+                "--strict-invariant-limit",
+                "0.24",
+                "--strict-topology-threshold",
+                "5.0",
+                "--strict-signature-threshold",
+                "0.78",
+                "--graph-signature-threshold",
+                "0.70",
+                "--coverage-shortlist-max-targets",
+                "96",
+            ]
+        )
+        self.assertEqual(tuning_args.strict_invariant_limit, 0.24)
+        self.assertEqual(tuning_args.strict_topology_threshold, 5.0)
+        self.assertEqual(tuning_args.strict_signature_threshold, 0.78)
+        self.assertEqual(tuning_args.graph_signature_threshold, 0.70)
+        self.assertEqual(tuning_args.coverage_shortlist_max_targets, 96)
 
     def test_geometry_driven_array_seed_reduces_regular_grid(self) -> None:
         input_oas = self.temp_root / "array_seed.oas"
@@ -555,10 +588,53 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertEqual(bucketed_shift, normal_shift)
         self.assertGreater(bucket_stats["bucketed_coverage_bundle_count"], 0)
         self.assertGreater(bucket_stats["coverage_fill_bin_count"], 0)
+        self.assertNotIn("coverage_density_bin_count", bucket_stats)
+
+    def test_bucketed_coverage_uses_fill_only_windows_by_default(self) -> None:
+        """强制走 bucketed coverage，并验证默认 fill-only window 不降低 coverage。"""
+
+        bitmap_solid = np.zeros((12, 12), dtype=bool)
+        bitmap_solid[1:3, 1:3] = True
+        bitmap_sparse = np.zeros((12, 12), dtype=bool)
+        bitmap_sparse[1, 1] = True
+        bitmap_sparse[1, 10] = True
+        bitmap_sparse[10, 1] = True
+        bitmap_sparse[10, 10] = True
+        exact_a = ExactCluster(0, _record("a0", bitmap_solid, seed_weight=1), [_record("a0", bitmap_solid, seed_weight=1)])
+        exact_b = ExactCluster(1, _record("b0", bitmap_sparse, seed_weight=1), [_record("b0", bitmap_sparse, seed_weight=1)])
+
+        def run_once(force_bucketed: bool) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, int]]:
+            """运行一次 coverage，返回两个候选的 coverage 与内部统计。"""
+
+            runner = self._make_runner(geometry_match_mode="acc")
+            cand_solid = _candidate("cand_solid", bitmap_solid, origin_exact_cluster_id=0, shift_direction="base")
+            cand_sparse = _candidate("cand_sparse", bitmap_sparse, origin_exact_cluster_id=1, shift_direction="base")
+            old_threshold = optimized.COVERAGE_BUCKETED_GROUP_THRESHOLD
+            try:
+                if force_bucketed:
+                    optimized.COVERAGE_BUCKETED_GROUP_THRESHOLD = 1
+                runner.prefilter_stats = optimized._empty_prefilter_stats()
+                with redirect_stdout(StringIO()):
+                    runner._evaluate_candidate_coverage([cand_solid, cand_sparse], [exact_a, exact_b])
+            finally:
+                optimized.COVERAGE_BUCKETED_GROUP_THRESHOLD = old_threshold
+            return tuple(cand_solid.coverage), tuple(cand_sparse.coverage), dict(runner.coverage_debug_stats)
+
+        normal_solid, normal_sparse, _ = run_once(False)
+        bucketed_solid, bucketed_sparse, bucket_stats = run_once(True)
+
+        self.assertEqual(bucketed_solid, normal_solid)
+        self.assertEqual(bucketed_sparse, normal_sparse)
+        self.assertGreater(bucket_stats["coverage_fill_bin_count"], 0)
+        self.assertNotIn("coverage_density_bin_count", bucket_stats)
+        self.assertNotIn("descriptor_lru_live_peak_count", bucket_stats)
 
     def test_same_hash_exact_pass_crosses_fill_bins_without_geometry_cache(self) -> None:
         bitmap_sparse = np.zeros((12, 12), dtype=bool)
-        bitmap_sparse[1:3, 1:3] = True
+        bitmap_sparse[1, 1] = True
+        bitmap_sparse[1, 10] = True
+        bitmap_sparse[10, 1] = True
+        bitmap_sparse[10, 10] = True
         bitmap_dense = np.ones((12, 12), dtype=bool)
         runner = self._make_runner(geometry_match_mode="ecc")
         cand_sparse = _candidate("cand_sparse", bitmap_sparse, origin_exact_cluster_id=0, shift_direction="base")
@@ -584,6 +660,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
             runner.coverage_debug_stats["max_bucket_window_group_count"],
             runner.coverage_debug_stats["max_bundle_group_count"],
         )
+        self.assertNotIn("coverage_density_bin_count", runner.coverage_debug_stats)
 
     def test_exact_hash_coverage_does_not_build_geometry_cache(self) -> None:
         bitmap_left = np.zeros((12, 12), dtype=bool)
@@ -640,6 +717,38 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertNotIn("optimized_graph_descriptor", cand_b.match_cache)
         self.assertNotIn("optimized_graph_descriptor", cand_c.match_cache)
 
+    def test_full_descriptor_cache_is_window_local_and_released_per_source(self) -> None:
+        """验证 full descriptor 使用 window-local cache，并在 source prefilter 后释放。"""
+
+        bitmap = np.zeros((16, 16), dtype=bool)
+        bitmap[4:12, 4:12] = True
+        bitmap_shifted = bitmap.copy()
+        bitmap_shifted[6, 6] = False
+        runner = self._make_runner(geometry_match_mode="ecc")
+        cand_a = _candidate("cand_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        cand_b = _candidate("cand_b", bitmap_shifted, origin_exact_cluster_id=1, shift_direction="base")
+        exact_a = ExactCluster(0, _record("a0", bitmap, seed_weight=1), [_record("a0", bitmap, seed_weight=1)])
+        exact_b = ExactCluster(1, _record("b0", bitmap_shifted, seed_weight=1), [_record("b0", bitmap_shifted, seed_weight=1)])
+        release_snapshots: list[tuple[int, int]] = []
+        original_release = runner._release_bundle_full_descriptor_cache
+
+        def recording_release(bundle: dict[str, object]) -> None:
+            """记录释放前后的 full descriptor cache 大小。"""
+
+            before = len(bundle.get("full_descriptor_cache_by_idx", {}))
+            original_release(bundle)
+            after = len(bundle.get("full_descriptor_cache_by_idx", {}))
+            release_snapshots.append((before, after))
+
+        runner._release_bundle_full_descriptor_cache = recording_release
+        runner.prefilter_stats = optimized._empty_prefilter_stats()
+        with redirect_stdout(StringIO()):
+            runner._evaluate_candidate_coverage([cand_a, cand_b], [exact_a, exact_b])
+
+        self.assertTrue(any(before > 0 and after == 0 for before, after in release_snapshots))
+        self.assertGreater(runner.coverage_debug_stats["full_descriptor_cache_group_count"], 0)
+        self.assertNotIn("full_descriptor_lru_hit", runner.coverage_debug_stats)
+
     def test_lazy_signature_embedding_shortlist_matches_reference(self) -> None:
         bitmap_a = np.zeros((16, 16), dtype=bool)
         bitmap_a[4:12, 4:12] = True
@@ -658,24 +767,23 @@ class OptimizedGridV1Tests(unittest.TestCase):
         group_indices = np.asarray(shortlist_index["subgroup_members"][subgroup_key], dtype=np.int32)
         self.assertGreaterEqual(int(group_indices.size), 2)
 
-        old_shortlist_max = optimized.COVERAGE_SHORTLIST_MAX_TARGETS
-        try:
-            optimized.COVERAGE_SHORTLIST_MAX_TARGETS = 1
-            payload = runner._ensure_shortlist_payload(shortlist_index, subgroup_key)
-            group_vectors = np.asarray(
-                [
-                    optimized._signature_embedding(
-                        optimized._cheap_bitmap_descriptor(bundle["representatives"][int(group_idx)].clip_bitmap)
-                    )
-                    for group_idx in group_indices.tolist()
-                ],
-                dtype=np.float32,
+        runner.coverage_shortlist_max_targets = 1
+        payload = runner._ensure_shortlist_payload(shortlist_index, subgroup_key)
+        group_vectors = np.asarray(
+            [
+                optimized._signature_embedding(
+                    optimized._cheap_bitmap_descriptor(bundle["representatives"][int(group_idx)].clip_bitmap)
+                )
+                for group_idx in group_indices.tolist()
+            ],
+            dtype=np.float32,
+        )
+        expected_labels = group_indices[
+            optimized._exact_cosine_topk_labels(
+                group_vectors,
+                min(int(runner.coverage_shortlist_max_targets) + 1, int(group_indices.size)),
             )
-            expected_labels = group_indices[
-                optimized._exact_cosine_topk_labels(group_vectors, min(int(optimized.COVERAGE_SHORTLIST_MAX_TARGETS) + 1, int(group_indices.size)))
-            ].astype(np.int32, copy=False)
-        finally:
-            optimized.COVERAGE_SHORTLIST_MAX_TARGETS = old_shortlist_max
+        ].astype(np.int32, copy=False)
 
         np.testing.assert_array_equal(np.asarray(payload["mapped_labels"], dtype=np.int32), expected_labels)
         self.assertGreater(runner.coverage_debug_stats["lazy_signature_embedding_group_count"], 0)
@@ -711,6 +819,196 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIn(1, runner._base_candidate_by_exact_id)
         self.assertEqual(runner._base_candidate_by_exact_id[0].shift_direction, "base")
         self.assertEqual(runner._base_candidate_by_exact_id[1].shift_direction, "base")
+
+    def test_greedy_cover_prefers_base_candidate_when_coverage_same(self) -> None:
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[3:7, 3:7] = True
+        rec_a = _record("a0", bitmap, seed_weight=1)
+        rec_b = _record("b0", bitmap, seed_weight=1)
+        rec_a.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_ARRAY}
+        rec_b.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_ARRAY}
+        exact_a = ExactCluster(0, rec_a, [rec_a])
+        exact_b = ExactCluster(1, rec_b, [rec_b])
+        runner = self._make_runner()
+
+        base_candidate = _candidate(
+            "cand_base",
+            bitmap,
+            origin_exact_cluster_id=0,
+            shift_direction="base",
+            coverage=(0, 1),
+        )
+        shift_candidate = _candidate(
+            "cand_shift",
+            bitmap,
+            origin_exact_cluster_id=1,
+            shift_direction="right",
+            coverage=(0, 1),
+        )
+
+        selected = runner._greedy_cover([shift_candidate, base_candidate], [exact_a, exact_b])
+
+        self.assertEqual([candidate.candidate_id for candidate in selected], ["cand_base"])
+
+    def test_greedy_cover_uses_0429_tiebreak_without_seed_family(self) -> None:
+        bitmap_candidate = np.zeros((10, 10), dtype=bool)
+        bitmap_candidate[2:5, 2:5] = True
+        bitmap_target = np.zeros((10, 10), dtype=bool)
+        bitmap_target[5:8, 5:8] = True
+        rec_array = _record("array0", bitmap_target, seed_weight=1)
+        rec_long = _record("long0", bitmap_target, seed_weight=1)
+        rec_target = _record("target0", bitmap_target, seed_weight=1)
+        rec_array.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_ARRAY}
+        rec_long.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_LONG}
+        rec_target.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_LONG}
+        exact_clusters = [
+            ExactCluster(0, rec_array, [rec_array]),
+            ExactCluster(1, rec_long, [rec_long]),
+            ExactCluster(2, rec_target, [rec_target]),
+        ]
+        runner = self._make_runner()
+
+        low_distance_diag = _candidate(
+            "cand_low_diag",
+            bitmap_candidate,
+            origin_exact_cluster_id=0,
+            shift_direction="diag_ne",
+            coverage=(0, 1, 2),
+        )
+        low_distance_diag.shift_distance_um = 0.01
+        same_family_axis = _candidate(
+            "cand_same_family_axis",
+            bitmap_candidate,
+            origin_exact_cluster_id=1,
+            shift_direction="right",
+            coverage=(0, 1, 2),
+        )
+        same_family_axis.shift_distance_um = 0.08
+
+        selected = runner._greedy_cover([same_family_axis, low_distance_diag], exact_clusters)
+
+        self.assertEqual([candidate.candidate_id for candidate in selected], ["cand_low_diag"])
+
+    def test_assign_exact_clusters_uses_0429_tiebreak_without_seed_family(self) -> None:
+        bitmap_candidate = np.zeros((10, 10), dtype=bool)
+        bitmap_candidate[2:5, 2:5] = True
+        bitmap_target = np.zeros((10, 10), dtype=bool)
+        bitmap_target[5:8, 5:8] = True
+        rec_array = _record("array0", bitmap_target, seed_weight=1)
+        rec_long = _record("long0", bitmap_target, seed_weight=1)
+        rec_target = _record("target0", bitmap_target, seed_weight=1)
+        rec_array.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_ARRAY}
+        rec_long.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_LONG}
+        rec_target.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_LONG}
+        exact_array = ExactCluster(0, rec_array, [rec_array])
+        exact_long = ExactCluster(1, rec_long, [rec_long])
+        exact_target = ExactCluster(2, rec_target, [rec_target])
+        runner = self._make_runner()
+
+        low_distance_diag = _candidate(
+            "cand_low_diag",
+            bitmap_candidate,
+            origin_exact_cluster_id=0,
+            shift_direction="diag_ne",
+            coverage=(0, 2),
+        )
+        low_distance_diag.shift_distance_um = 0.01
+        same_family_axis = _candidate(
+            "cand_same_family_axis",
+            bitmap_candidate,
+            origin_exact_cluster_id=1,
+            shift_direction="right",
+            coverage=(1, 2),
+        )
+        same_family_axis.shift_distance_um = 0.08
+
+        assignments = runner._assign_exact_clusters(
+            [same_family_axis, low_distance_diag],
+            [exact_array, exact_long, exact_target],
+        )
+
+        assigned_to_low = [int(cluster.exact_cluster_id) for cluster in assignments["cand_low_diag"]]
+        assigned_to_same_family = [int(cluster.exact_cluster_id) for cluster in assignments["cand_same_family_axis"]]
+        self.assertIn(2, assigned_to_low)
+        self.assertNotIn(2, assigned_to_same_family)
+
+    def test_final_verification_breakdown_tracks_reject_reason_and_seed_type(self) -> None:
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[3:7, 3:7] = True
+        rec_a = _record("a0", bitmap, seed_weight=1)
+        rec_b = _record("b0", bitmap, seed_weight=1)
+        rec_a.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_ARRAY}
+        rec_b.match_cache["auto_seed"] = {"seed_type": optimized.SEED_TYPE_LONG}
+        exact_a = ExactCluster(0, rec_a, [rec_a])
+        exact_b = ExactCluster(1, rec_b, [rec_b])
+        runner = self._make_runner()
+
+        selected = _candidate(
+            "cand_diag",
+            bitmap,
+            origin_exact_cluster_id=0,
+            shift_direction="diag_ne",
+            coverage=(0, 1),
+        )
+        runner._base_candidate_by_exact_id = {
+            0: _candidate("cand_base_a", bitmap, origin_exact_cluster_id=0, shift_direction="base"),
+            1: _candidate("cand_base_b", bitmap, origin_exact_cluster_id=1, shift_direction="base"),
+        }
+
+        def fake_match(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str]:
+            del candidate, strict
+            if int(exact_cluster.exact_cluster_id) == 0:
+                return False, "geometry"
+            return False, "graph_topology"
+
+        runner._candidate_matches_exact = fake_match  # type: ignore[method-assign]
+        units = runner._verified_cluster_units([selected], [exact_a, exact_b])
+
+        self.assertEqual(len(units), 2)
+        breakdown = runner.final_verification_breakdown
+        self.assertEqual(breakdown["reject_reason_counts"]["geometry"], 1)
+        self.assertEqual(breakdown["reject_reason_counts"]["graph_topology"], 1)
+        self.assertEqual(breakdown["reject_shift_direction_counts"]["diag_ne"], 2)
+        self.assertEqual(breakdown["reject_origin_seed_type_counts"][optimized.SEED_TYPE_ARRAY], 2)
+        self.assertEqual(breakdown["reject_target_seed_type_counts"][optimized.SEED_TYPE_ARRAY], 1)
+        self.assertEqual(breakdown["reject_target_seed_type_counts"][optimized.SEED_TYPE_LONG], 1)
+
+    def test_shadow_baseline_counts_relaxed_only_pass_without_changing_grouping(self) -> None:
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[3:7, 3:7] = True
+        runner = self._make_runner(strict_signature_threshold=0.0)
+        candidate = _candidate("cand_relaxed", bitmap, origin_exact_cluster_id=0, shift_direction="right", coverage=(0,))
+        candidate.clip_hash = "candidate_hash"
+        record = _record("target0", bitmap, seed_weight=1)
+        record.clip_hash = "target_hash"
+        candidate.match_cache["optimized_graph_descriptor"] = optimized.GraphDescriptor(
+            invariants=np.zeros(8, dtype=np.float64),
+            topology=np.zeros(8, dtype=np.float64),
+            signature_grid=np.asarray([1.0, 0.0], dtype=np.float64),
+            signature_proj_x=np.asarray([1.0, 0.0], dtype=np.float64),
+            signature_proj_y=np.asarray([1.0, 0.0], dtype=np.float64),
+        )
+        record.match_cache["optimized_graph_descriptor"] = optimized.GraphDescriptor(
+            invariants=np.zeros(8, dtype=np.float64),
+            topology=np.zeros(8, dtype=np.float64),
+            signature_grid=np.asarray([0.0, 1.0], dtype=np.float64),
+            signature_proj_x=np.asarray([0.0, 1.0], dtype=np.float64),
+            signature_proj_y=np.asarray([0.0, 1.0], dtype=np.float64),
+        )
+        exact = ExactCluster(0, record, [record])
+        runner._base_candidate_by_exact_id = {
+            0: _candidate("cand_base", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        }
+        runner._geometry_passes = lambda candidate, target: True  # type: ignore[method-assign]
+
+        units = runner._verified_cluster_units([candidate], [exact])
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0][0].candidate_id, "cand_relaxed")
+        self.assertEqual(runner.final_verification_stats["verified_pass"], 1)
+        self.assertEqual(runner.final_verification_stats["verified_reject"], 0)
+        self.assertEqual(runner.tuning_diagnostics["relaxed_only_pass_count"], 1)
+        self.assertEqual(runner.tuning_diagnostics["relaxed_only_reject_reason_counts"]["graph_signature"], 1)
 
     def test_full_prefilter_rejects_before_geometry_cache(self) -> None:
         bitmap_source = np.zeros((16, 16), dtype=bool)
@@ -1035,33 +1333,66 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIsNotNone(base_candidate.clip_bitmap)
         self.assertTrue(any(candidate.clip_bitmap is None for candidate in candidates if candidate.shift_direction != "base"))
 
-    def test_stream_save_results_preserves_schema(self) -> None:
-        input_oas = self.temp_root / "stream_save.oas"
+    def test_save_results_writes_csv_with_template_columns(self) -> None:
+        input_oas = self.temp_root / "csv_save.oas"
         _write_oas(
             input_oas,
             [gdstk.rectangle((0.00, 0.00), (0.20, 0.20), layer=1, datatype=0)],
         )
         runner = self._make_runner()
-        original = optimized._should_stream_result
-        optimized._should_stream_result = lambda sample_count, cluster_count, materialize_outputs: True
-        try:
-            with redirect_stdout(StringIO()):
-                result = runner.run(str(input_oas))
-        finally:
-            optimized._should_stream_result = original
+        with redirect_stdout(StringIO()):
+            result = runner.run(str(input_oas))
 
-        self.assertIn("__stream_state", result)
+        self.assertIn("__csv_state", result)
         self.assertEqual(result["clusters"], [])
         self.assertEqual(result["file_metadata"], [])
+        self.assertEqual(result["result_csv_row_count"], result["total_samples"])
+        self.assertGreaterEqual(result["result_csv_release_count"], 0)
 
-        output_path = self.temp_root / "stream_result.json"
+        output_path = self.temp_root / "csv_result.csv"
         with redirect_stdout(StringIO()):
-            optimized._save_results(result, str(output_path), "json")
-        loaded = json.loads(output_path.read_text(encoding="utf-8"))
-        self.assertEqual(loaded["total_samples"], len(loaded["file_metadata"]))
-        self.assertEqual(loaded["total_clusters"], len(loaded["clusters"]))
-        self.assertTrue(all("seed_type" in sample for sample in loaded["file_metadata"]))
-        self.assertTrue(all("sample_metadata" in cluster for cluster in loaded["clusters"]))
+            optimized._save_results(result, str(output_path), "csv")
+        if OUTPUT_TEMPLATE.exists():
+            template_header = OUTPUT_TEMPLATE.read_text(encoding="utf-8-sig").splitlines()[0].split(",")
+        else:
+            template_header = ["groupID", "x1", "y1", "x2", "y2"]
+        with output_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        self.assertEqual(reader.fieldnames[:5], template_header)
+        self.assertEqual(len(rows), result["total_samples"])
+        self.assertEqual(int(rows[0]["groupID"]), 1)
+        self.assertEqual(float(rows[0]["x1"]), float(rows[0]["clip_bbox_x1"]))
+        self.assertEqual(float(rows[0]["y1"]), float(rows[0]["clip_bbox_y1"]))
+        self.assertIn("seed_type", rows[0])
+        self.assertIn("grid_ix", rows[0])
+        self.assertIn("selected_shift_direction", rows[0])
+        with self.assertRaises(ValueError):
+            optimized._save_results(result, str(self.temp_root / "csv_result.json"), "csv")
+
+    def test_tuning_config_records_effective_thresholds(self) -> None:
+        input_oas = self.temp_root / "tuning_config.oas"
+        _write_oas(
+            input_oas,
+            [gdstk.rectangle((0.00, 0.00), (0.20, 0.20), layer=1, datatype=0)],
+        )
+        runner = self._make_runner(
+            graph_signature_threshold=0.70,
+            strict_invariant_limit=0.24,
+            strict_topology_threshold=5.0,
+            strict_signature_threshold=0.78,
+            coverage_shortlist_max_targets=96,
+        )
+        with redirect_stdout(StringIO()):
+            result = runner.run(str(input_oas))
+
+        self.assertTrue(result["tuning_diagnostics"]["enabled"])
+        self.assertEqual(result["config"]["graph_signature_threshold"], 0.70)
+        self.assertEqual(result["config"]["strict_invariant_limit"], 0.24)
+        self.assertEqual(result["config"]["strict_topology_threshold"], 5.0)
+        self.assertEqual(result["config"]["strict_signature_threshold"], 0.78)
+        self.assertEqual(result["config"]["coverage_shortlist_max_targets"], 96)
+        self.assertIn("relaxed_only_pass_count", result)
 
     def test_output_uses_geometry_driven_fields(self) -> None:
         input_oas = self.temp_root / "geometry_driven_output.oas"
@@ -1094,8 +1425,21 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIn("coverage_debug_stats", result)
         self.assertIn("result_detail_seconds", result)
         self.assertIn("final_verification_detail_seconds", result)
+        self.assertIn("target_metrics", result)
+        self.assertIn("candidate_direction_conversion", result)
+        self.assertIn("final_verification_breakdown", result)
+        self.assertFalse(result["tuning_diagnostics"]["enabled"])
+        self.assertEqual(result["relaxed_only_pass_count"], 0)
+        self.assertEqual(result["config"]["strict_invariant_limit"], optimized.STRICT_INVARIANT_LIMIT)
+        self.assertEqual(result["config"]["strict_topology_threshold"], optimized.STRICT_TOPOLOGY_THRESHOLD)
+        self.assertEqual(result["config"]["strict_signature_threshold"], optimized.STRICT_SIGNATURE_THRESHOLD)
+        self.assertEqual(result["config"]["coverage_shortlist_max_targets"], optimized.COVERAGE_SHORTLIST_MAX_TARGETS)
         self.assertGreaterEqual(int(result["diagonal_candidate_count"]), 0)
         self.assertGreaterEqual(int(result["selected_diagonal_candidate_count"]), 0)
+        self.assertEqual(result["target_metrics"]["coverage_sample_count"], result["total_samples"])
+        self.assertEqual(result["target_metrics"]["covered_exact_cluster_count"], result["exact_cluster_count"])
+        self.assertGreaterEqual(float(result["target_metrics"]["verified_pass_ratio"]), 0.0)
+        self.assertLessEqual(float(result["target_metrics"]["verified_pass_ratio"]), 1.0)
         for key in (
             "geometry_dilated_cache_group_count",
             "geometry_donut_cache_group_count",
@@ -1177,20 +1521,26 @@ class OptimizedGridV1Tests(unittest.TestCase):
             "candidate_group_bitmap_bytes_avoided_estimate_mb",
         ):
             self.assertIn(key, result["memory_debug"])
+        for key in ("result_csv_row_count", "result_csv_release_count"):
+            self.assertIn(key, result)
+            self.assertGreaterEqual(int(result[key]), 0)
+        self.assertEqual(int(result["result_csv_row_count"]), int(result["total_samples"]))
+        self.assertEqual(result["result_csv_columns"][:5], ["groupID", "x1", "y1", "x2", "y2"])
         for value in result["coverage_detail_seconds"].values():
             self.assertGreaterEqual(float(value), 0.0)
         for value in result["result_detail_seconds"].values():
             self.assertGreaterEqual(float(value), 0.0)
         for value in result["final_verification_detail_seconds"].values():
             self.assertGreaterEqual(float(value), 0.0)
-        self.assertTrue(all("export_representative_metadata" in cluster for cluster in result["clusters"]))
-        self.assertTrue(all("seed_type" in sample for cluster in result["clusters"] for sample in cluster["sample_metadata"]))
-        self.assertTrue(
-            all(sample["grid_cell_bbox"] == sample["seed_bbox"] for cluster in result["clusters"] for sample in cluster["sample_metadata"])
-        )
-        for cluster in result["clusters"]:
-            self.assertIn("distance_worst_case_score", cluster["export_representative_metadata"])
-            self.assertGreaterEqual(float(cluster["export_representative_metadata"]["distance_worst_case_score"]), 0.0)
+        for direction, generated_count in result["candidate_direction_counts"].items():
+            self.assertIn(direction, result["candidate_direction_conversion"])
+            self.assertEqual(
+                int(result["candidate_direction_conversion"][direction]["generated_count"]),
+                int(generated_count),
+            )
+        self.assertIn("reject_reason_counts", result["final_verification_breakdown"])
+        self.assertEqual(result["clusters"], [])
+        self.assertEqual(result["file_metadata"], [])
 
     def test_default_run_does_not_materialize_clip_files(self) -> None:
         input_oas = self.temp_root / "no_materialize.oas"
@@ -1202,14 +1552,13 @@ class OptimizedGridV1Tests(unittest.TestCase):
         with redirect_stdout(StringIO()):
             result = runner.run(str(input_oas))
         self.assertFalse(result["materialized_outputs"])
-        self.assertEqual(result["total_samples"], len(result["file_metadata"]))
+        self.assertEqual(result["total_samples"], result["result_csv_row_count"])
         self.assertEqual(result["total_files"], 0)
         self.assertEqual(result["file_list"], [])
+        self.assertEqual(result["file_metadata"], [])
+        self.assertEqual(result["clusters"], [])
         self.assertFalse((runner.temp_dir / "samples").exists())
         self.assertFalse((runner.temp_dir / "representatives").exists())
-        for cluster in result["clusters"]:
-            self.assertEqual(cluster["sample_files"], [])
-            self.assertIsNone(cluster["representative_file"])
 
     def test_review_mode_materializes_clip_files(self) -> None:
         input_oas = self.temp_root / "materialize.oas"
@@ -1227,6 +1576,11 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertTrue(all(Path(path).exists() for path in result["file_list"]))
         representative_files = [cluster["representative_file"] for cluster in result["clusters"]]
         self.assertTrue(all(Path(path).exists() for path in representative_files if path))
+        review_dir = self.temp_root / "review_export"
+        info = optimized._export_review(result, str(review_dir))
+        self.assertTrue(info["exported"])
+        self.assertTrue((review_dir / "representative_files.txt").exists())
+        self.assertGreaterEqual(info["exported_file_count"], 1)
 
     def test_sample_layout_001_validation(self) -> None:
         if os.environ.get("RUN_LAYOUT_REAL_SAMPLE") != "1":
@@ -1234,7 +1588,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
         if not SAMPLE_LAYOUT.exists():
             self.skipTest(f"missing sample layout: {SAMPLE_LAYOUT}")
 
-        output_path = self.temp_root / "sample_layout_001_v1_result.json"
+        output_path = self.temp_root / "sample_layout_001_v1_result.csv"
         runner = optimized.OptimizedMainlineRunner(
             config={
                 "clip_size_um": 1.35,
@@ -1250,27 +1604,23 @@ class OptimizedGridV1Tests(unittest.TestCase):
         captured = StringIO()
         with redirect_stdout(captured):
             result = runner.run(str(SAMPLE_LAYOUT))
-            optimized._save_results(result, str(output_path), "json")
+            optimized._save_results(result, str(output_path), "csv")
 
         self.assertTrue(output_path.exists())
-        loaded = json.loads(output_path.read_text(encoding="utf-8"))
-        self.assertEqual(loaded["pipeline_mode"], optimized.PIPELINE_MODE)
-        self.assertEqual(loaded["seed_strategy"], "geometry_driven")
-        self.assertGreater(loaded["grid_seed_count"], 0)
-        self.assertGreater(loaded["bucketed_seed_count"], 0)
-        self.assertGreater(loaded["exact_cluster_count"], 0)
-        self.assertGreater(loaded["candidate_count"], 0)
-        self.assertGreater(loaded["total_clusters"], 0)
-        self.assertIn("seed_type_counts", loaded)
-        self.assertIn("seed_audit", loaded)
-        self.assertIn("diagonal_candidate_count", loaded)
-        self.assertFalse(loaded["materialized_outputs"])
-        self.assertEqual(loaded["total_samples"], len(loaded["file_metadata"]))
-        self.assertEqual(loaded["total_files"], 0)
-        self.assertIn("effective_clustering_layers", loaded)
-        self.assertIn("excluded_helper_layers", loaded)
-        self.assertNotIn("contact_pair_seed_count", loaded)
-        self.assertNotIn("drc_component_seed_count", loaded)
+        with output_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertGreater(result["grid_seed_count"], 0)
+        self.assertGreater(result["bucketed_seed_count"], 0)
+        self.assertGreater(result["exact_cluster_count"], 0)
+        self.assertGreater(result["candidate_count"], 0)
+        self.assertGreater(result["total_clusters"], 0)
+        self.assertFalse(result["materialized_outputs"])
+        self.assertEqual(len(rows), result["total_samples"])
+        self.assertEqual(result["total_files"], 0)
+        self.assertIn("effective_clustering_layers", result)
+        self.assertIn("excluded_helper_layers", result)
+        self.assertNotIn("contact_pair_seed_count", result)
+        self.assertNotIn("drc_component_seed_count", result)
 
 
 if __name__ == "__main__":

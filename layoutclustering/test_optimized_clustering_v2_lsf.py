@@ -2,6 +2,7 @@
 """Tests for the Python 3.6 compatible LSF v2 clustering pipeline."""
 
 import ast
+import csv
 import json
 import shutil
 import sys
@@ -26,7 +27,7 @@ from mainline_lsf import MarkerRecord
 from mainline_lsf import _canonical_bitmap_hash
 from mainline_lsf import _dedupe_geometry_seeds
 from mainline_lsf import add_candidates_to_candidate_bundle_accumulator
-from mainline_lsf import build_uniform_grid_seed_candidates
+from mainline_lsf import build_geometry_driven_seed_candidates
 from mainline_lsf import candidate_shift_summary
 from mainline_lsf import create_candidate_bundle_accumulator
 from mainline_lsf import evaluate_candidate_coverage
@@ -124,6 +125,13 @@ def _make_dummy_exact_cluster(cluster_id, area_px):
     cluster.exact_cluster_id = int(cluster_id)
     cluster.representative = representative
     return cluster
+
+
+def _read_csv_rows(path):
+    """读取测试输出 CSV。"""
+
+    with Path(str(path)).open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 class OptimizedV2LsfTests(unittest.TestCase):
@@ -353,7 +361,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             v2_lsf.run_shard_stage(str(manifest_path), int(shard["shard_id"]))
         with mock.patch.object(v2_lsf, "CENTRAL_MERGE_EXACT_CLUSTER_LIMIT", 0):
             with self.assertRaises(RuntimeError) as ctx:
-                v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_limit.json"))
+                v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_limit.csv"))
         self.assertIn("prepare-coverage", str(ctx.exception))
 
     def test_coverage_source_shards_are_grouped_by_fill_bin(self):
@@ -392,7 +400,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         layout_index = prepare_layout(str(input_oas), None, False)
-        default_seeds, default_stats = build_uniform_grid_seed_candidates(layout_index, 1.0)
+        default_seeds, default_stats = build_geometry_driven_seed_candidates(layout_index, 1.0)
         self.assertEqual(default_stats["seed_strategy"], "geometry_driven")
         self.assertEqual(default_stats["grid_step_ratio"], 0.5)
         self.assertEqual(default_stats["grid_step_um"], 0.5)
@@ -472,7 +480,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
                 shapes.append(gdstk.rectangle((x0, y0), (x0 + 0.18, y0 + 0.18), layer=1, datatype=0))
         _write_oas(input_oas, shapes)
         layout_index = prepare_layout(str(input_oas), None, False)
-        seeds, stats = build_uniform_grid_seed_candidates(layout_index, 1.0)
+        seeds, stats = build_geometry_driven_seed_candidates(layout_index, 1.0)
         self.assertEqual(stats["seed_strategy"], "geometry_driven")
         self.assertGreater(stats["array_group_count"], 0)
         self.assertGreater(stats["array_seed_count"], 0)
@@ -515,7 +523,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         layout_index = prepare_layout(str(input_oas), None, False)
-        seeds, stats = build_uniform_grid_seed_candidates(layout_index, 1.0)
+        seeds, stats = build_geometry_driven_seed_candidates(layout_index, 1.0)
         self.assertEqual(stats["long_shape_count"], 2)
         self.assertGreater(stats["long_shape_seed_count"], 0)
         self.assertEqual(stats["residual_element_count"], 0)
@@ -616,7 +624,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         work_dir = self.temp_root / "work_merge"
-        output = self.temp_root / "merge_result.json"
+        output = self.temp_root / "merge_result.csv"
         config = {
             "clip_size_um": 1.0,
             "geometry_match_mode": "ecc",
@@ -642,6 +650,12 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertFalse(summary["layout_apply_layer_operations"])
         result = v2_lsf.merge_stage(str(manifest_path), str(output))
         self.assertTrue(output.exists())
+        rows = _read_csv_rows(output)
+        self.assertEqual(list(rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
+        self.assertEqual(len(rows), result["marker_count"])
+        self.assertEqual(result["output_format"], "csv")
+        self.assertEqual(result["result_csv_row_count"], result["marker_count"])
+        self.assertEqual(result["result_csv_columns"], v2_lsf.CSV_OUTPUT_COLUMNS)
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
         self.assertEqual(result["seed_strategy"], "geometry_driven")
         self.assertGreater(result["marker_count"], 0)
@@ -651,6 +665,8 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertTrue(all("distance_worst_case_score" in cluster for cluster in result["clusters"]))
         self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in result["clusters"]))
         self.assertIn("lsf_manifest", result)
+        with self.assertRaises(ValueError):
+            v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_result.json"))
 
     def test_distributed_coverage_matches_central_merge(self):
         """coverage 分片流程应与集中 merge 保持核心结果一致。"""
@@ -666,8 +682,8 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         work_dir = self.temp_root / "work_coverage"
-        baseline_output = self.temp_root / "coverage_baseline.json"
-        distributed_output = self.temp_root / "coverage_distributed.json"
+        baseline_output = self.temp_root / "coverage_baseline.csv"
+        distributed_output = self.temp_root / "coverage_distributed.csv"
         config = {
             "clip_size_um": 1.0,
             "geometry_match_mode": "ecc",
@@ -681,10 +697,14 @@ class OptimizedV2LsfTests(unittest.TestCase):
             v2_lsf.run_shard_stage(str(manifest_path), int(shard["shard_id"]))
 
         baseline = v2_lsf.merge_stage(str(manifest_path), str(baseline_output))
+        self.assertTrue(baseline_output.exists())
         manifest = v2_lsf.prepare_coverage_stage(str(manifest_path), coverage_shard_count=2, coverage_shard_size=1)
         self.assertGreater(manifest["coverage_shard_count"], 0)
         self.assertTrue(Path(manifest["exact_index"]["output_json"]).exists())
         self.assertTrue(Path(manifest["exact_index"]["output_npz"]).exists())
+        self.assertIn("exact_member_index", manifest)
+        self.assertTrue(Path(manifest["exact_member_index"]["output_json"]).exists())
+        self.assertEqual(manifest["exact_member_index"]["member_count"], baseline["marker_count"])
         self.assertGreater(manifest["exact_target_buckets"]["bucket_count"], 0)
         self.assertIn("candidate_bundle_index", manifest)
         self.assertGreater(manifest["candidate_bundle_index"]["candidate_group_count"], 0)
@@ -695,6 +715,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             "prepare_coverage_exact_cluster",
             "prepare_coverage_source_sort",
             "prepare_coverage_exact_index_write",
+            "prepare_coverage_exact_member_index_write",
             "prepare_coverage_target_bucket_write",
             "prepare_coverage_candidate_generation",
             "prepare_coverage_candidate_bundle_write",
@@ -764,6 +785,11 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertTrue(any(candidate.coverage for candidate in metadata_candidates))
 
         distributed = v2_lsf.merge_coverage_stage(str(manifest_path), str(distributed_output))
+        distributed_rows = _read_csv_rows(distributed_output)
+        self.assertEqual(list(distributed_rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
+        self.assertEqual(len(distributed_rows), distributed["marker_count"])
+        self.assertEqual(distributed["output_format"], "csv")
+        self.assertEqual(distributed["result_csv_row_count"], distributed["marker_count"])
         self.assertEqual(distributed["total_clusters"], baseline["total_clusters"])
         self.assertEqual(distributed["exact_cluster_count"], baseline["exact_cluster_count"])
         self.assertEqual(distributed["candidate_count"], baseline["candidate_count"])
@@ -792,6 +818,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             distributed["selected_candidate_count"],
         )
         self.assertEqual(distributed["lsf_manifest"]["coverage_shard_count"], manifest["coverage_shard_count"])
+        self.assertIn("result_csv", distributed["lsf_manifest"])
         self.assertTrue(distributed_output.exists())
 
         inspect_output = self.temp_root / "coverage_inspect.json"
@@ -812,6 +839,9 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertGreater(inspection["shards"]["tile_oas_bytes"], 0)
         self.assertIn("lsf_wrapper", inspection)
         self.assertIn("run_coverage_shards", inspection["lsf_wrapper"])
+        self.assertEqual(inspection["exact_member_index"]["member_count"], distributed["marker_count"])
+        self.assertTrue(inspection["result_csv"]["exists"])
+        self.assertGreater(inspection["result_csv"]["bytes"], 0)
         self.assertGreater(inspection["coverage_shards"]["npz_zip_uncompressed_bytes"], 0)
         self.assertGreater(len(inspection["largest_files"]), 0)
 
@@ -827,7 +857,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         work_dir = self.temp_root / "work_local"
-        output = self.temp_root / "local_result.json"
+        output = self.temp_root / "local_result.csv"
         config = {
             "clip_size_um": 1.0,
             "geometry_match_mode": "ecc",
@@ -836,15 +866,15 @@ class OptimizedV2LsfTests(unittest.TestCase):
             "pixel_size_nm": 20,
         }
         result = v2_lsf.run_local_stage(str(input_oas), str(work_dir), str(output), config, [], shard_count=2, shard_size=1)
-        loaded = json.loads(output.read_text(encoding="utf-8"))
-        self.assertEqual(loaded["pipeline_mode"], v2_lsf.PIPELINE_MODE)
-        self.assertEqual(result["total_clusters"], loaded["total_clusters"])
-        self.assertGreaterEqual(loaded["selected_candidate_count"], 1)
-        self.assertTrue(all("distance_worst_case_score" in cluster for cluster in loaded["clusters"]))
-        self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in loaded["clusters"]))
-        self.assertNotIn("contact_pair_seed_count", loaded)
-        self.assertNotIn("drc_component_seed_count", loaded)
-        distributed_output = self.temp_root / "local_distributed_result.json"
+        rows = _read_csv_rows(output)
+        self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
+        self.assertEqual(len(rows), result["marker_count"])
+        self.assertGreaterEqual(result["selected_candidate_count"], 1)
+        self.assertTrue(all("distance_worst_case_score" in cluster for cluster in result["clusters"]))
+        self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in result["clusters"]))
+        self.assertNotIn("contact_pair_seed_count", result)
+        self.assertNotIn("drc_component_seed_count", result)
+        distributed_output = self.temp_root / "local_distributed_result.csv"
         distributed = v2_lsf.run_local_stage(
             str(input_oas),
             str(self.temp_root / "work_local_distributed"),
@@ -857,7 +887,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             coverage_shard_count=2,
             coverage_shard_size=1,
         )
-        self.assertEqual(distributed["total_clusters"], loaded["total_clusters"])
+        self.assertEqual(distributed["total_clusters"], result["total_clusters"])
         self.assertGreater(distributed["lsf_manifest"]["coverage_shard_count"], 0)
 
     def test_layer_operation_lsf_path(self):
@@ -872,7 +902,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             ],
         )
         work_dir = self.temp_root / "work_layer_ops"
-        output = self.temp_root / "layer_ops_result.json"
+        output = self.temp_root / "layer_ops_result.csv"
         config = {
             "clip_size_um": 1.0,
             "geometry_match_mode": "ecc",
