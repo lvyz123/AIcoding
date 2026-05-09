@@ -8,7 +8,6 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import gdstk
 import numpy as np
@@ -25,6 +24,8 @@ from mainline_lsf import ExactCluster
 from mainline_lsf import GridSeedCandidate
 from mainline_lsf import MarkerRecord
 from mainline_lsf import _canonical_bitmap_hash
+from mainline_lsf import _candidate_matches_exact
+from mainline_lsf import _candidate_matches_witness
 from mainline_lsf import _dedupe_geometry_seeds
 from mainline_lsf import add_candidates_to_candidate_bundle_accumulator
 from mainline_lsf import build_geometry_driven_seed_candidates
@@ -138,7 +139,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
     def setUp(self):
         self.temp_root = SCRIPT_DIR / "test_outputs" / "_optimized_v2_lsf"
         shutil.rmtree(str(self.temp_root), ignore_errors=True)
-        self.temp_root.mkdir(parents=True)
+        self.temp_root.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
         shutil.rmtree(str(self.temp_root), ignore_errors=True)
@@ -168,6 +169,15 @@ class OptimizedV2LsfTests(unittest.TestCase):
         for path in LSF_FILES:
             source = path.read_text(encoding="utf-8")
             ast.parse(source, filename=str(path), feature_version=(3, 6))
+
+    def test_final_output_cli_is_csv_only(self):
+        """最终主输出 CLI 不再接受旧 JSON/TXT 或 --format 入口。"""
+
+        parser = v2_lsf.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run-local", "input.oas", "--work-dir", "work", "--output", "result.json"])
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["run-local", "input.oas", "--work-dir", "work", "--output", "result.csv", "--format", "json"])
 
     def test_legacy_bitmap_prefilter_removed(self):
         """v2_lsf coverage 不再保留旧的 bitmap/XOR prefilter 路径。"""
@@ -235,10 +245,13 @@ class OptimizedV2LsfTests(unittest.TestCase):
         shape_item = next(iter(bundle_index["shape_buckets"].values()))
         first_bucket = next(iter(shape_item["buckets"].values()))
         arrays = np.load(first_bucket["output_npz"], allow_pickle=False)
-        self.assertIn("packed_bitmaps", arrays.files)
-        self.assertIn("cheap_invariants", arrays.files)
-        self.assertIn("cheap_signature_vectors", arrays.files)
-        self.assertIn("cheap_subgroup_keys", arrays.files)
+        try:
+            self.assertIn("packed_bitmaps", arrays.files)
+            self.assertIn("cheap_invariants", arrays.files)
+            self.assertIn("cheap_signature_vectors", arrays.files)
+            self.assertIn("cheap_subgroup_keys", arrays.files)
+        finally:
+            arrays.close()
 
         target_bundles, load_stats = load_candidate_bundle_buckets_for_candidates(bundle_index, [candidates[0]])
         self.assertEqual(load_stats["shape_count_loaded"], 1)
@@ -359,9 +372,13 @@ class OptimizedV2LsfTests(unittest.TestCase):
         manifest_path = work_dir / "manifest.json"
         for shard in manifest["shards"]:
             v2_lsf.run_shard_stage(str(manifest_path), int(shard["shard_id"]))
-        with mock.patch.object(v2_lsf, "CENTRAL_MERGE_EXACT_CLUSTER_LIMIT", 0):
+        previous_limit = v2_lsf.CENTRAL_MERGE_EXACT_CLUSTER_LIMIT
+        try:
+            v2_lsf.CENTRAL_MERGE_EXACT_CLUSTER_LIMIT = 0
             with self.assertRaises(RuntimeError) as ctx:
                 v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_limit.csv"))
+        finally:
+            v2_lsf.CENTRAL_MERGE_EXACT_CLUSTER_LIMIT = previous_limit
         self.assertIn("prepare-coverage", str(ctx.exception))
 
     def test_coverage_source_shards_are_grouped_by_fill_bin(self):
@@ -467,6 +484,58 @@ class OptimizedV2LsfTests(unittest.TestCase):
         summary = candidate_shift_summary(candidates)
         self.assertEqual(summary["diagonal_candidate_count"], len(diagonal_candidates))
         self.assertGreater(summary["max_shift_distance_um"], 0.0)
+
+    def test_final_verification_accepts_shift_witness_match(self):
+        """final verification 应匹配 target shift witness，而不是只比较 target base。"""
+
+        cluster = _make_shiftable_exact_cluster()
+        config = {"pixel_size_nm": 10, "edge_tolerance_um": 0.0, "geometry_match_mode": "ecc"}
+        witnesses = generate_candidates_for_cluster(cluster, config)
+        base = [candidate for candidate in witnesses if str(candidate.shift_direction) == "base"][0]
+        shifted = [candidate for candidate in witnesses if str(candidate.shift_direction) != "base" and candidate.clip_hash != base.clip_hash][0]
+        selected = _make_candidate("selected_shift", 99, np.ascontiguousarray(shifted.clip_bitmap, dtype=bool), "right")
+        matched, reason, witness_direction = _candidate_matches_exact(selected, cluster, config, {})
+
+        self.assertTrue(matched)
+        self.assertEqual(reason, "exact_hash")
+        self.assertEqual(witness_direction, shifted.shift_direction)
+
+    def test_final_verification_reject_reason_is_detailed(self):
+        """所有 witness 都失败时应输出细分几何原因，不再输出粗粒度 geometry。"""
+
+        cluster = _make_shiftable_exact_cluster()
+        empty = np.zeros_like(cluster.representative.clip_bitmap, dtype=bool)
+        selected = _make_candidate("selected_empty", 99, empty, "right")
+        config = {
+            "pixel_size_nm": 10,
+            "edge_tolerance_um": 0.01,
+            "geometry_match_mode": "acc",
+            "area_match_ratio": 0.99,
+        }
+        matched, reason, _ = _candidate_matches_exact(selected, cluster, config, {})
+
+        self.assertFalse(matched)
+        self.assertEqual(reason, "geometry_acc_xor")
+        self.assertNotEqual(reason, "geometry")
+
+    def test_final_verification_strict_graph_gate_rejects_after_geometry(self):
+        """geometry 通过后仍必须通过内部 strict graph gate。"""
+
+        candidate_bitmap = np.zeros((8, 8), dtype=bool)
+        candidate_bitmap[0:2, 0:2] = True
+        witness_bitmap = np.zeros((8, 8), dtype=bool)
+        witness_bitmap[2:7, 2:7] = True
+        candidate = _make_candidate("selected_graph", 0, candidate_bitmap, "right")
+        witness = _make_candidate("witness_graph", 1, witness_bitmap, "base")
+        matched, reason = _candidate_matches_witness(
+            candidate,
+            witness,
+            {"geometry_match_mode": "acc", "area_match_ratio": 0.0},
+            {},
+        )
+
+        self.assertFalse(matched)
+        self.assertIn(reason, ("graph_invariant", "graph_topology", "graph_signature"))
 
     def test_array_representative_seed_reduces_regular_grid(self):
         """规则二维阵列应生成中心代表和间距代表，且数量受控。"""
@@ -599,8 +668,9 @@ class OptimizedV2LsfTests(unittest.TestCase):
         }
         manifest = v2_lsf.prepare_stage(str(input_oas), str(work_dir), config, [], shard_count=1, shard_size=10)
         manifest_path = work_dir / "manifest.json"
-        backup_path = input_oas.with_suffix(".bak")
-        input_oas.rename(backup_path)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["input_path"] = str(input_oas.with_suffix(".missing"))
+        manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         summary = v2_lsf.run_shard_stage(str(manifest_path), int(manifest["shards"][0]["shard_id"]))
 
@@ -652,10 +722,14 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertTrue(output.exists())
         rows = _read_csv_rows(output)
         self.assertEqual(list(rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
-        self.assertEqual(len(rows), result["marker_count"])
-        self.assertEqual(result["output_format"], "csv")
-        self.assertEqual(result["result_csv_row_count"], result["marker_count"])
+        self.assertEqual(len(rows), result["candidate_group_count"])
+        self.assertNotIn("output_format", result)
+        self.assertEqual(result["result_csv_row_count"], result["candidate_group_count"])
         self.assertEqual(result["result_csv_columns"], v2_lsf.CSV_OUTPUT_COLUMNS)
+        self.assertEqual(v2_lsf.CSV_OUTPUT_COLUMNS, ["groupID", "cluster_id", "center_x_um", "center_y_um", "clip_size"])
+        self.assertEqual([int(row["groupID"]) for row in rows], list(range(1, len(rows) + 1)))
+        self.assertTrue(all(int(row["cluster_id"]) >= 1 for row in rows))
+        self.assertTrue(all(float(row["clip_size"]) == 1.0 for row in rows))
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
         self.assertEqual(result["seed_strategy"], "geometry_driven")
         self.assertGreater(result["marker_count"], 0)
@@ -664,7 +738,17 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertGreater(result["total_clusters"], 0)
         self.assertTrue(all("distance_worst_case_score" in cluster for cluster in result["clusters"]))
         self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in result["clusters"]))
+        self.assertIn("final_verification_breakdown", result)
+        self.assertIn("reject_reason_counts", result["final_verification_breakdown"])
+        self.assertNotIn("geometry", result["final_verification_breakdown"]["reject_reason_counts"])
+        self.assertIn("witness_attempted", result["final_verification_stats"])
+        self.assertIn("witness_verified_pass", result["final_verification_stats"])
         self.assertIn("lsf_manifest", result)
+        self.assertNotIn("max_rss_mb", result["lsf_manifest"])
+        payload = v2_lsf._final_stage_output_payload(str(output), result)
+        self.assertIn("final_verification_reject_reason_counts", payload)
+        self.assertIn("candidate_group_count", payload)
+        self.assertNotIn("max_rss_mb", payload)
         with self.assertRaises(ValueError):
             v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_result.json"))
 
@@ -751,10 +835,13 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertTrue(all("source_index_json" in shard for shard in manifest["coverage_shards"]))
         self.assertTrue(all("source_fill_bin_count" in shard for shard in manifest["coverage_shards"]))
         self.assertTrue(all(shard["source_fill_bin_count"] <= 1 for shard in manifest["coverage_shards"]))
-        for shard in manifest["shards"]:
-            Path(shard["output_npz"]).unlink()
-        Path(manifest["exact_index"]["output_json"]).unlink()
-        Path(manifest["exact_index"]["output_npz"]).unlink()
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for shard in manifest_payload["shards"]:
+            shard["output_npz"] = str(Path(shard["output_npz"]).with_suffix(".missing"))
+        manifest_payload["exact_index"]["output_json"] = str(Path(manifest_payload["exact_index"]["output_json"]).with_suffix(".missing"))
+        manifest_payload["exact_index"]["output_npz"] = str(Path(manifest_payload["exact_index"]["output_npz"]).with_suffix(".missing"))
+        manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        manifest = manifest_payload
         for coverage_shard in manifest["coverage_shards"]:
             summary = v2_lsf.run_coverage_shard_stage(str(manifest_path), int(coverage_shard["coverage_shard_id"]))
             self.assertTrue(Path(coverage_shard["output_json"]).exists())
@@ -787,9 +874,12 @@ class OptimizedV2LsfTests(unittest.TestCase):
         distributed = v2_lsf.merge_coverage_stage(str(manifest_path), str(distributed_output))
         distributed_rows = _read_csv_rows(distributed_output)
         self.assertEqual(list(distributed_rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
-        self.assertEqual(len(distributed_rows), distributed["marker_count"])
-        self.assertEqual(distributed["output_format"], "csv")
-        self.assertEqual(distributed["result_csv_row_count"], distributed["marker_count"])
+        self.assertEqual(len(distributed_rows), distributed["candidate_group_count"])
+        self.assertNotIn("output_format", distributed)
+        self.assertEqual(distributed["result_csv_row_count"], distributed["candidate_group_count"])
+        self.assertEqual(distributed["candidate_group_count"], manifest["candidate_bundle_index"]["candidate_group_count"])
+        self.assertEqual([int(row["groupID"]) for row in distributed_rows], list(range(1, len(distributed_rows) + 1)))
+        self.assertTrue(all(int(row["cluster_id"]) >= 1 for row in distributed_rows))
         self.assertEqual(distributed["total_clusters"], baseline["total_clusters"])
         self.assertEqual(distributed["exact_cluster_count"], baseline["exact_cluster_count"])
         self.assertEqual(distributed["candidate_count"], baseline["candidate_count"])
@@ -819,6 +909,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
         )
         self.assertEqual(distributed["lsf_manifest"]["coverage_shard_count"], manifest["coverage_shard_count"])
         self.assertIn("result_csv", distributed["lsf_manifest"])
+        self.assertNotIn("max_rss_mb", distributed["lsf_manifest"])
         self.assertTrue(distributed_output.exists())
 
         inspect_output = self.temp_root / "coverage_inspect.json"
@@ -868,7 +959,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
         result = v2_lsf.run_local_stage(str(input_oas), str(work_dir), str(output), config, [], shard_count=2, shard_size=1)
         rows = _read_csv_rows(output)
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
-        self.assertEqual(len(rows), result["marker_count"])
+        self.assertEqual(len(rows), result["candidate_group_count"])
         self.assertGreaterEqual(result["selected_candidate_count"], 1)
         self.assertTrue(all("distance_worst_case_score" in cluster for cluster in result["clusters"]))
         self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in result["clusters"]))

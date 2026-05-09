@@ -11,16 +11,18 @@
    - run-shard：每个 LSF job 只处理一段 seed，输出 marker records 的 JSON/NPZ。
    - prepare-coverage：汇总 marker，生成 exact clusters、全局 candidate bundle buckets 和 coverage source shards。
    - run-coverage-shard：每个 LSF job 读取本 source shard 与需要的 candidate bundle bucket，计算 coverage CSR。
-   - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap 后输出最终 CSV。
+   - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap，
+     用 shift-witness final verification 生成最终 cluster，再输出 candidate group 级 CSV。
 3. run-local 用于开发和小 crop 验证；默认走集中式小样本流程，带 --distributed-coverage 时顺序模拟完整 LSF 流程。
 4. 代码保持 Python 3.6 兼容：不使用 dataclasses、现代 union type、内置泛型类型标注或 scipy.optimize.milp。
 
 注意点：
 - grid_step_ratio 固定保持 v1 主线默认值 0.5，当前版本不开放采样密度实验入口。
-- 默认不物化 sample/representative 文件，最终用户主输出是 CSV。
+- 默认不物化 sample/representative 文件，最终用户主输出只保留 candidate group 级 CSV。
 - prepare-coverage 不 eager 构建 full descriptor 或 ECC geometry cache；这些缓存只在 coverage shard 内按需生成。
 - candidate coverage set 使用 NPZ offsets/values 存储，JSON 只保留轻量索引和诊断字段。
-- merge-coverage 的 greedy set cover 基于 CSR 数组运行，只把 selected candidates 还原成对象。
+- merge-coverage 的 greedy set cover 基于 CSR 数组运行，只把 selected candidates 还原成对象；
+  final verification 临时生成 target witness candidates，不保留旧 base-only 验证路径。
 - inspect-workdir 只读取 manifest/JSON/zip metadata，用于评估 shard 文件规模和下一轮优化方向。
 """
 
@@ -29,10 +31,6 @@ import hashlib
 import json
 import math
 import os
-try:
-    import resource
-except ImportError:
-    resource = None
 import sys
 import time
 import zipfile
@@ -159,22 +157,6 @@ def _file_stat(path):
 
     target = Path(str(path))
     return {"path": str(target), "exists": bool(target.exists()), "bytes": _file_size_bytes(target)}
-
-
-def _max_rss_mb():
-    """杩斿洖褰撳墠杩涚▼宄板€间綇鐣欏唴瀛橈紝鏃犳硶鑾峰彇鏃惰繑鍥?None銆?"""
-
-    if resource is None:
-        return None
-    try:
-        value = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    except (AttributeError, ValueError):
-        return None
-    if value <= 0.0:
-        return None
-    if sys.platform == "darwin":
-        return round(value / (1024.0 * 1024.0), 3)
-    return round(value / 1024.0, 3)
 
 
 def _input_file_bytes(manifest):
@@ -479,23 +461,6 @@ def _load_all_marker_records(manifest):
     return marker_records, shard_summaries
 
 
-def _load_marker_metadata_by_exact_id(manifest):
-    """读取 prepare-coverage 写出的 exact cluster 成员 metadata，供最终 CSV 写出使用。"""
-
-    by_exact_id = {}
-    total = 0
-    member_index = dict(manifest.get("exact_member_index", {}) or {})
-    member_index_json = member_index.get("output_json", "")
-    if not member_index_json or not Path(str(member_index_json)).exists():
-        raise RuntimeError("merge-coverage 输出 CSV 需要先运行 prepare-coverage 生成 exact_members.json")
-    payload = _read_json(member_index_json)
-    for metadata in payload.get("members", []):
-        exact_id = int(metadata.get("exact_cluster_id", -1))
-        by_exact_id.setdefault(exact_id, []).append(metadata)
-        total += 1
-    return by_exact_id, int(total)
-
-
 def _save_exact_member_index(exact_clusters, output_json):
     """保存 exact cluster 成员的轻量 metadata，不写 bitmap。"""
 
@@ -723,7 +688,6 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         "shards": shards,
         "result_output": str((work_root / "final_result.csv").resolve()),
         "input_file_bytes": _file_size_bytes(input_path),
-        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": {"prepare": round(time.perf_counter() - started, 6)},
     }
     manifest["lsf_wrapper"] = {
@@ -792,7 +756,6 @@ def run_shard_stage(manifest_path, shard_id):
         "layout_element_count": int(layout_element_count),
         "halo_filtered_element_count": int(halo_filtered_element_count),
         "input_file_bytes": _input_file_bytes(manifest),
-        "max_rss_mb": _max_rss_mb(),
         "spatial_index_stats": shard_spatial_index_stats,
         "query_candidate_count_stats": query_stats,
         "local_exact_cluster_count": 0,
@@ -854,10 +817,9 @@ def merge_stage(manifest_path, output_path=None):
         "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
     }
     result["lsf_manifest"]["input_file_bytes"] = _input_file_bytes(manifest)
-    result["lsf_manifest"]["max_rss_mb"] = _max_rss_mb()
     result["result_summary"]["timing_seconds"]["merge_total"] = round(time.perf_counter() - started, 6)
     output = _validate_csv_output_path(output_path or manifest.get("result_output"))
-    csv_info = write_result_csv(output, result, exact_clusters, selected, config)
+    csv_info = write_result_csv(output, result, exact_clusters, selected, config, candidates=candidates)
     result["lsf_manifest"]["result_csv"] = dict(csv_info)
     manifest["result_output"] = str(output)
     _write_json(manifest_path, manifest)
@@ -1062,7 +1024,6 @@ def prepare_coverage_stage(manifest_path, coverage_shard_count, coverage_shard_s
         "max_source_fill_bin_count_per_shard": int(max_source_fill_bin_count),
         "source_shard_order": "fill_bin",
         "input_file_bytes": _input_file_bytes(manifest),
-        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": dict((key, round(float(value), 6)) for key, value in detail_seconds.items()),
     }
     lsf_wrapper = dict(manifest.get("lsf_wrapper", {}))
@@ -1167,7 +1128,6 @@ def run_coverage_shard_stage(manifest_path, coverage_shard_id):
         "candidate_fill_bin_values_sample": [int(value) for value in candidate_fill_bins[:64]],
         "coverage_debug_stats": dict(coverage_stats),
         "input_file_bytes": _input_file_bytes(manifest),
-        "max_rss_mb": _max_rss_mb(),
         "timing_seconds": {
             "coverage_source_index_load": round(source_seconds, 6),
             "coverage_candidate_generation": round(candidate_seconds, 6),
@@ -1309,23 +1269,20 @@ def merge_coverage_stage(manifest_path, output_path=None):
         "candidate_bundle_index": dict(manifest.get("candidate_bundle_index", {})),
         "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
         "input_file_bytes": _input_file_bytes(manifest),
-        "max_rss_mb": _max_rss_mb(),
     }
     result["marker_count"] = int(exact_payload.get("marker_count", result["marker_count"]))
     result["total_samples"] = int(exact_payload.get("marker_count", result["total_samples"]))
     result["result_summary"]["timing_seconds"]["merge_coverage_total"] = round(time.perf_counter() - started, 6)
     output = _validate_csv_output_path(output_path or manifest.get("result_output"))
-    marker_metadata_by_exact_id, marker_metadata_count = _load_marker_metadata_by_exact_id(manifest)
     csv_info = write_result_csv(
         output,
         result,
         exact_clusters,
         selected,
         config,
-        marker_metadata_by_exact_id=marker_metadata_by_exact_id,
+        candidate_bundle_index=manifest.get("candidate_bundle_index", {}),
     )
     result["lsf_manifest"]["result_csv"] = dict(csv_info)
-    result["lsf_manifest"]["marker_metadata_csv_source_count"] = int(marker_metadata_count)
     manifest["result_output"] = str(output)
     _write_json(manifest_path, manifest)
     return result
@@ -1573,7 +1530,6 @@ def inspect_workdir_stage(manifest_path, output_path=None):
         "manifest_path": str(Path(str(manifest_path)).resolve()),
         "work_dir": str(manifest.get("work_dir", "")),
         "input_file_bytes": _input_file_bytes(manifest),
-        "max_rss_mb": _max_rss_mb(),
         "manifest": manifest_stat,
         "seed_file": seed_stat,
         "result_csv": result_csv_stat,
@@ -1692,6 +1648,25 @@ def build_parser():
     return parser
 
 
+def _final_stage_output_payload(output_path, result):
+    """生成最终类 stage 的精简终端 JSON 输出。"""
+
+    stats = dict(result.get("final_verification_stats", {}) or {})
+    breakdown = dict(result.get("final_verification_breakdown", {}) or {})
+    reject_reasons = dict(breakdown.get("reject_reason_counts", {}) or {})
+    return {
+        "output": str(output_path),
+        "exact_cluster_count": int(result.get("exact_cluster_count", 0)),
+        "candidate_group_count": int(result.get("candidate_group_count", 0)),
+        "selected_candidate_count": int(result.get("selected_candidate_count", 0)),
+        "final_verification_pass": int(stats.get("verified_pass", 0)),
+        "final_verification_reject": int(stats.get("verified_reject", 0)),
+        "final_verification_singleton": int(stats.get("singleton_created", 0)),
+        "final_verification_reject_reason_counts": reject_reasons,
+        "total_clusters": int(result.get("total_clusters", 0)),
+    }
+
+
 def main():
     """
     命令行主入口：解析 stage 参数，并调度 prepare/run-shard/coverage/merge 等 LSF 分阶段流程。
@@ -1718,7 +1693,8 @@ def main():
     - grid_step_ratio 固定保持 0.5；当前版本不开放 0.6/0.7 采样密度实验入口。
     - prepare 会为每个 seed shard 写出 halo tile OAS；run-shard 优先读取 tile，避免每个 LSF job 重读全版图。
     - 大样本不要走集中式 merge；应使用 prepare-coverage、run-coverage-shard、merge-coverage 的分布式 coverage 流程。
-    - 最终用户主输出只支持 CSV；LSF 中间产物仍使用 JSON/NPZ，_temp_runs 和 work_dir 产物不应提交进仓库。
+    - 最终用户主输出只支持 5 列 candidate group CSV；LSF 中间产物仍使用 JSON/NPZ，
+      _temp_runs 和 work_dir 产物不应提交进仓库。
     """
 
     parser = build_parser()
@@ -1737,7 +1713,7 @@ def main():
         return 0
     if args.stage == "merge":
         result = merge_stage(args.manifest, args.output)
-        print(json.dumps({"output": args.output or _read_json(args.manifest).get("result_output"), "total_clusters": result["total_clusters"]}, ensure_ascii=False))
+        print(json.dumps(_final_stage_output_payload(args.output or _read_json(args.manifest).get("result_output"), result), ensure_ascii=False))
         return 0
     if args.stage == "prepare-coverage":
         manifest = prepare_coverage_stage(args.manifest, args.coverage_shard_count, args.coverage_shard_size)
@@ -1749,7 +1725,7 @@ def main():
         return 0
     if args.stage == "merge-coverage":
         result = merge_coverage_stage(args.manifest, args.output)
-        print(json.dumps({"output": args.output or _read_json(args.manifest).get("result_output"), "total_clusters": result["total_clusters"]}, ensure_ascii=False))
+        print(json.dumps(_final_stage_output_payload(args.output or _read_json(args.manifest).get("result_output"), result), ensure_ascii=False))
         return 0
     if args.stage == "inspect-workdir":
         result = inspect_workdir_stage(args.manifest, args.output)
@@ -1781,7 +1757,7 @@ def main():
             args.coverage_shard_count,
             args.coverage_shard_size,
         )
-        print(json.dumps({"output": args.output, "total_clusters": result["total_clusters"]}, ensure_ascii=False))
+        print(json.dumps(_final_stage_output_payload(args.output, result), ensure_ascii=False))
         return 0
     raise ValueError("Unsupported stage: %s" % args.stage)
 

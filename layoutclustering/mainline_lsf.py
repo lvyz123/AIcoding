@@ -15,7 +15,8 @@
    执行 v1 风格 coverage：exact hash direct、cheap shortlist、lazy full GraphDescriptor prefilter、
    packed/dilated/donut 懒 geometry cache，并把 coverage set 压成 CSR offsets/values。
 5. merge-coverage 汇总 CSR coverage，用 lazy greedy set cover 选择代表 candidate，再只为 selected
-   candidates 懒加载 bitmap 做最终验证，避免在汇总阶段长期持有全部 candidate Python 对象。
+   candidates 懒加载 bitmap，并为 target exact cluster 临时生成 shift-witness candidates 做最终验证，
+   避免在汇总阶段长期持有全部 candidate Python 对象。
 6. 代码保持 Python 3.6 兼容：不使用 dataclasses、from __future__ annotations、现代 union type、
    内置泛型类型标注或 scipy.optimize.milp。
 """
@@ -72,6 +73,9 @@ COVERAGE_EXACT_SHORTLIST_MAX_GROUPS = 512
 GRAPH_INVARIANT_LIMIT = 0.22
 GRAPH_TOPOLOGY_THRESHOLD = 6.5
 GRAPH_SIGNATURE_THRESHOLD = 0.74
+STRICT_INVARIANT_LIMIT = 0.20
+STRICT_TOPOLOGY_THRESHOLD = 3.0
+STRICT_SIGNATURE_THRESHOLD = 0.84
 CHEAP_FILL_ABS_LIMIT = 0.12
 CHEAP_AREA_DENSITY_ABS_LIMIT = 0.18
 COVERAGE_FULL_PREFILTER_MIN_PROBE_PAIRS = 512
@@ -80,6 +84,15 @@ CANDIDATE_BUNDLE_SPLIT_MIN_GROUPS = 64
 CANDIDATE_BUNDLE_FILL_BIN_WIDTH = 0.04
 DIAGONAL_SHIFT_AXIS_MAX_COUNT = 3
 DIAGONAL_SHIFT_MAX_COUNT = 2
+GEOMETRY_REJECT_REASON_ORDER = (
+    "geometry_shape_mismatch",
+    "geometry_empty_mismatch",
+    "geometry_exact_mismatch",
+    "geometry_acc_xor",
+    "geometry_residual_candidate",
+    "geometry_residual_target",
+    "geometry_donut_overlap",
+)
 _POOL_EDGE_CACHE = {}
 _COVERAGE_STRUCTURE_CACHE = {}
 
@@ -768,6 +781,45 @@ def _normalized_matrix(rows):
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms = np.where(norms <= 1e-12, 1.0, norms)
     return matrix / norms
+
+
+def _graph_invariant_distance(desc_a, desc_b):
+    """计算 full graph invariant 加权距离，并标记关键维度是否越界。"""
+
+    source_inv = np.asarray(desc_a.invariants, dtype=np.float64)
+    target_inv = np.asarray(desc_b.invariants, dtype=np.float64)
+    floors = np.asarray([0.25, 0.02, 0.02, 0.02, 0.03, 0.03, 0.02, 0.02], dtype=np.float64)
+    weights = np.asarray([0.08, 0.24, 0.10, 0.08, 0.18, 0.14, 0.10, 0.08], dtype=np.float64)
+    denom = np.maximum(np.maximum(np.abs(source_inv), np.abs(target_inv)), floors)
+    errs = np.minimum(np.abs(target_inv - source_inv) / denom, 1.0)
+    critical = bool((errs[1] > 0.45) or (errs[4] > 0.45) or (errs[5] > 0.45))
+    return float(errs @ weights), critical
+
+
+def _graph_signature_similarity(desc_a, desc_b):
+    """计算 full graph signature 的 v1 风格相似度。"""
+
+    source_grid = _normalized_matrix([desc_a.signature_grid])[0]
+    source_proj_x = _normalized_matrix([desc_a.signature_proj_x])[0]
+    source_proj_y = _normalized_matrix([desc_a.signature_proj_y])[0]
+    target_grid = _normalized_matrix([desc_b.signature_grid])[0]
+    target_proj_x = _normalized_matrix([desc_b.signature_proj_x])[0]
+    target_proj_y = _normalized_matrix([desc_b.signature_proj_y])[0]
+    return float(0.6 * (target_grid @ source_grid) + 0.2 * (target_proj_x @ source_proj_x) + 0.2 * (target_proj_y @ source_proj_y))
+
+
+def _strict_graph_gate_reason(candidate_desc, witness_desc):
+    """执行 final verification 专用 strict graph gate，并返回细分原因。"""
+
+    invariant_score, critical = _graph_invariant_distance(candidate_desc, witness_desc)
+    if critical or invariant_score > float(STRICT_INVARIANT_LIMIT):
+        return False, "graph_invariant"
+    topology_dist = float(np.linalg.norm(np.asarray(candidate_desc.topology, dtype=np.float64) - np.asarray(witness_desc.topology, dtype=np.float64)))
+    if topology_dist > float(STRICT_TOPOLOGY_THRESHOLD):
+        return False, "graph_topology"
+    if _graph_signature_similarity(candidate_desc, witness_desc) < float(STRICT_SIGNATURE_THRESHOLD):
+        return False, "graph_signature"
+    return True, "verified_shift_witness"
 
 
 def _coverage_cheap_subgroup_key(desc):
@@ -1937,48 +1989,10 @@ def candidate_shift_summary(candidates):
 
 CSV_OUTPUT_COLUMNS = [
     "groupID",
-    "x1",
-    "y1",
-    "x2",
-    "y2",
-    "marker_id",
-    "exact_cluster_id",
-    "source_name",
-    "source_path",
-    "marker_bbox_x1",
-    "marker_bbox_y1",
-    "marker_bbox_x2",
-    "marker_bbox_y2",
-    "marker_center_x",
-    "marker_center_y",
-    "clip_bbox_x1",
-    "clip_bbox_y1",
-    "clip_bbox_x2",
-    "clip_bbox_y2",
-    "seed_bbox_x1",
-    "seed_bbox_y1",
-    "seed_bbox_x2",
-    "seed_bbox_y2",
-    "grid_ix",
-    "grid_iy",
-    "grid_cell_bbox_x1",
-    "grid_cell_bbox_y1",
-    "grid_cell_bbox_x2",
-    "grid_cell_bbox_y2",
-    "seed_type",
-    "seed_weight",
-    "selected_candidate_id",
-    "selected_shift_direction",
-    "selected_shift_distance_um",
-    "pipeline_mode",
-    "geometry_match_mode",
-    "internal_cluster_id",
-    "cluster_size",
-    "cluster_exact_cluster_ids",
-    "representative_marker_id",
-    "representative_exact_cluster_id",
-    "representative_shift_direction",
-    "representative_shift_distance_um",
+    "cluster_id",
+    "center_x_um",
+    "center_y_um",
+    "clip_size",
 ]
 
 
@@ -1992,149 +2006,65 @@ def _csv_scalar(value):
     return value
 
 
-def _bbox_item(values, index):
-    """从 bbox / center 列表中安全取值。"""
+def _csv_candidate_group_row(group_id, cluster_id, representative, clip_size_um):
+    """把一个 candidate group representative 转成最终主 CSV 行。"""
 
-    if values is None:
-        return ""
-    try:
-        return _csv_scalar(list(values)[int(index)])
-    except (IndexError, TypeError, ValueError):
-        return ""
-
-
-def _csv_join_ints(values):
-    """把 exact cluster id 列表写成分号分隔文本。"""
-
-    return ";".join(str(int(value)) for value in values)
-
-
-def _record_csv_metadata(record_or_metadata):
-    """把 MarkerRecord 或 record_metadata dict 转成 CSV 行所需的扁平 metadata。"""
-
-    if isinstance(record_or_metadata, dict):
-        payload = dict(record_or_metadata)
-        nested = dict(payload.get("metadata", {}) or {})
-        return {
-            "marker_id": payload.get("marker_id"),
-            "exact_cluster_id": payload.get("exact_cluster_id"),
-            "source_name": payload.get("source_name"),
-            "source_path": payload.get("source_path"),
-            "marker_bbox": payload.get("marker_bbox"),
-            "marker_center": payload.get("marker_center"),
-            "clip_bbox": payload.get("clip_bbox"),
-            "seed_bbox": nested.get("seed_bbox"),
-            "grid_ix": nested.get("grid_ix"),
-            "grid_iy": nested.get("grid_iy"),
-            "grid_cell_bbox": nested.get("grid_cell_bbox", nested.get("seed_bbox")),
-            "seed_type": nested.get("seed_type"),
-            "seed_weight": payload.get("seed_weight", nested.get("bucket_weight", 1)),
-        }
-
-    nested = dict(getattr(record_or_metadata, "metadata", {}) or {})
-    return {
-        "marker_id": getattr(record_or_metadata, "marker_id", ""),
-        "exact_cluster_id": getattr(record_or_metadata, "exact_cluster_id", ""),
-        "source_name": getattr(record_or_metadata, "source_name", ""),
-        "source_path": getattr(record_or_metadata, "source_path", ""),
-        "marker_bbox": getattr(record_or_metadata, "marker_bbox", []),
-        "marker_center": getattr(record_or_metadata, "marker_center", []),
-        "clip_bbox": getattr(record_or_metadata, "clip_bbox", []),
-        "seed_bbox": nested.get("seed_bbox"),
-        "grid_ix": nested.get("grid_ix"),
-        "grid_iy": nested.get("grid_iy"),
-        "grid_cell_bbox": nested.get("grid_cell_bbox", nested.get("seed_bbox")),
-        "seed_type": nested.get("seed_type"),
-        "seed_weight": getattr(record_or_metadata, "seed_weight", nested.get("bucket_weight", 1)),
-    }
-
-
-def _csv_sample_row(
-    group_id,
-    internal_cluster_id,
-    cluster_size,
-    cluster_exact_cluster_ids,
-    selected_candidate_id,
-    selected_shift_direction,
-    selected_shift_distance_um,
-    representative_marker_id,
-    representative_exact_cluster_id,
-    representative_shift_direction,
-    representative_shift_distance_um,
-    geometry_match_mode,
-    member_metadata,
-):
-    """把一个最终归属 sample 扁平化成 v1 兼容 CSV 行。"""
-
-    metadata = _record_csv_metadata(member_metadata)
-    clip_bbox = list(metadata.get("clip_bbox") or [])
-    marker_bbox = list(metadata.get("marker_bbox") or [])
-    marker_center = list(metadata.get("marker_center") or [])
-    seed_bbox = list(metadata.get("seed_bbox") or [])
-    grid_cell_bbox = list(metadata.get("grid_cell_bbox") or [])
+    center = list(getattr(representative, "center", ()) or [])
     row = {
         "groupID": int(group_id),
-        "x1": _bbox_item(clip_bbox, 0),
-        "y1": _bbox_item(clip_bbox, 1),
-        "x2": _bbox_item(clip_bbox, 2),
-        "y2": _bbox_item(clip_bbox, 3),
-        "marker_id": _csv_scalar(metadata.get("marker_id")),
-        "exact_cluster_id": _csv_scalar(metadata.get("exact_cluster_id")),
-        "source_name": _csv_scalar(metadata.get("source_name")),
-        "source_path": _csv_scalar(metadata.get("source_path")),
-        "marker_bbox_x1": _bbox_item(marker_bbox, 0),
-        "marker_bbox_y1": _bbox_item(marker_bbox, 1),
-        "marker_bbox_x2": _bbox_item(marker_bbox, 2),
-        "marker_bbox_y2": _bbox_item(marker_bbox, 3),
-        "marker_center_x": _bbox_item(marker_center, 0),
-        "marker_center_y": _bbox_item(marker_center, 1),
-        "clip_bbox_x1": _bbox_item(clip_bbox, 0),
-        "clip_bbox_y1": _bbox_item(clip_bbox, 1),
-        "clip_bbox_x2": _bbox_item(clip_bbox, 2),
-        "clip_bbox_y2": _bbox_item(clip_bbox, 3),
-        "seed_bbox_x1": _bbox_item(seed_bbox, 0),
-        "seed_bbox_y1": _bbox_item(seed_bbox, 1),
-        "seed_bbox_x2": _bbox_item(seed_bbox, 2),
-        "seed_bbox_y2": _bbox_item(seed_bbox, 3),
-        "grid_ix": _csv_scalar(metadata.get("grid_ix")),
-        "grid_iy": _csv_scalar(metadata.get("grid_iy")),
-        "grid_cell_bbox_x1": _bbox_item(grid_cell_bbox, 0),
-        "grid_cell_bbox_y1": _bbox_item(grid_cell_bbox, 1),
-        "grid_cell_bbox_x2": _bbox_item(grid_cell_bbox, 2),
-        "grid_cell_bbox_y2": _bbox_item(grid_cell_bbox, 3),
-        "seed_type": _csv_scalar(metadata.get("seed_type")),
-        "seed_weight": _csv_scalar(metadata.get("seed_weight")),
-        "selected_candidate_id": _csv_scalar(selected_candidate_id),
-        "selected_shift_direction": _csv_scalar(selected_shift_direction),
-        "selected_shift_distance_um": _csv_scalar(selected_shift_distance_um),
-        "pipeline_mode": PIPELINE_MODE,
-        "geometry_match_mode": _csv_scalar(geometry_match_mode),
-        "internal_cluster_id": int(internal_cluster_id),
-        "cluster_size": int(cluster_size),
-        "cluster_exact_cluster_ids": _csv_join_ints(cluster_exact_cluster_ids),
-        "representative_marker_id": _csv_scalar(representative_marker_id),
-        "representative_exact_cluster_id": _csv_scalar(representative_exact_cluster_id),
-        "representative_shift_direction": _csv_scalar(representative_shift_direction),
-        "representative_shift_distance_um": _csv_scalar(representative_shift_distance_um),
+        "cluster_id": int(cluster_id),
+        "center_x_um": _csv_scalar(center[0] if len(center) > 0 else ""),
+        "center_y_um": _csv_scalar(center[1] if len(center) > 1 else ""),
+        "clip_size": float(clip_size_um),
     }
     return dict((column, _csv_scalar(row.get(column))) for column in CSV_OUTPUT_COLUMNS)
 
 
-def _cluster_members_for_csv(exact_cluster, marker_metadata_by_exact_id):
-    """返回一个 exact cluster 下需要写入 CSV 的成员 metadata。"""
+def _final_cluster_id_by_exact_id(result):
+    """建立 exact cluster 到最终 1-based cluster_id 的映射。"""
 
-    members = list(getattr(exact_cluster, "members", []) or [])
-    if members:
-        return members
-    if marker_metadata_by_exact_id is not None:
-        found = list(marker_metadata_by_exact_id.get(int(exact_cluster.exact_cluster_id), []))
-        if found:
-            return found
-    raise RuntimeError("CSV 输出缺少 exact cluster %s 的成员 metadata" % str(exact_cluster.exact_cluster_id))
+    mapping = {}
+    for cluster in result.get("clusters", []):
+        final_cluster_id = int(cluster.get("cluster_id", 0)) + 1
+        for exact_id in cluster.get("exact_cluster_ids", []):
+            mapping[int(exact_id)] = int(final_cluster_id)
+    return mapping
 
 
-def write_result_csv(output_path, result, exact_clusters, selected_candidates, config, marker_metadata_by_exact_id=None):
-    """把最终聚类结果写成 v1 兼容 CSV，并把 CSV 诊断字段回填到 result。"""
+def _candidate_group_representatives_from_candidates(candidates):
+    """从内存 candidates 构造全局 candidate group representative 顺序。"""
+
+    bundles = build_candidate_match_bundles(list(candidates or []))
+    for shape in sorted(bundles):
+        bundle = bundles[shape]
+        for group in bundle["candidate_groups"]:
+            yield group["representative"]
+
+
+def _candidate_group_representatives_from_index(candidate_bundle_index):
+    """从 candidate bundle JSON metadata 读取 representative，不加载 group bitmap。"""
+
+    shape_bucket_map = dict(candidate_bundle_index.get("shape_buckets", {}))
+    for shape_key in sorted(shape_bucket_map):
+        shape_item = shape_bucket_map[str(shape_key)]
+        for bucket_item in _candidate_bundle_bucket_items_for_shape(shape_item):
+            with Path(str(bucket_item["output_json"])).open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            for metadata in payload.get("groups", []):
+                yield candidate_from_metadata_light(metadata)
+
+
+def write_result_csv(
+    output_path,
+    result,
+    exact_clusters,
+    selected_candidates,
+    config,
+    marker_metadata_by_exact_id=None,
+    candidates=None,
+    candidate_bundle_index=None,
+):
+    """把最终聚类结果按 candidate group 粒度写成 5 列主 CSV。"""
 
     output = Path(str(output_path))
     if output.suffix.lower() != ".csv":
@@ -2142,81 +2072,68 @@ def write_result_csv(output_path, result, exact_clusters, selected_candidates, c
     if not output.parent.exists():
         output.parent.mkdir(parents=True)
 
-    exact_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in exact_clusters)
-    candidate_by_id = {}
-    for candidate in selected_candidates:
-        candidate_by_id[str(getattr(candidate, "candidate_id", ""))] = candidate
-
+    del exact_clusters, selected_candidates, marker_metadata_by_exact_id
+    exact_to_final_cluster = _final_cluster_id_by_exact_id(result)
     row_count = 0
-    geometry_match_mode = str(config.get("geometry_match_mode", result.get("geometry_match_mode", "ecc")))
+    clip_size_um = float(config.get("clip_size_um", result.get("clip_size_um", 1.35)))
+    if candidate_bundle_index is not None:
+        representatives = _candidate_group_representatives_from_index(candidate_bundle_index)
+        expected = int(candidate_bundle_index.get("candidate_group_count", 0))
+    elif candidates is not None:
+        representatives = _candidate_group_representatives_from_candidates(candidates)
+        expected = int(result.get("candidate_group_count", 0))
+    else:
+        raise RuntimeError("CSV 输出需要 candidates 或 candidate_bundle_index 作为 candidate group 来源")
+
     with output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_OUTPUT_COLUMNS, lineterminator="\n")
         writer.writeheader()
-        for cluster in result.get("clusters", []):
-            cluster_exact_ids = [int(value) for value in cluster.get("exact_cluster_ids", [])]
-            selected_candidate_id = str(cluster.get("selected_candidate_id", ""))
-            candidate = candidate_by_id.get(selected_candidate_id)
-            if candidate is not None:
-                representative_exact_cluster_id = int(getattr(candidate, "origin_exact_cluster_id", cluster_exact_ids[0] if cluster_exact_ids else -1))
-                representative_marker_id = str(getattr(candidate, "source_marker_id", cluster.get("representative_marker_id", "")))
-                representative_shift_direction = str(getattr(candidate, "shift_direction", cluster.get("selected_shift_direction", "")))
-                representative_shift_distance_um = float(getattr(candidate, "shift_distance_um", cluster.get("selected_shift_distance_um", 0.0)))
-            else:
-                representative_exact_cluster_id = int(cluster_exact_ids[0]) if cluster_exact_ids else -1
-                representative_marker_id = str(cluster.get("representative_marker_id", ""))
-                representative_shift_direction = str(cluster.get("selected_shift_direction", "base"))
-                representative_shift_distance_um = float(cluster.get("selected_shift_distance_um", 0.0))
+        for representative in representatives:
+            row_count += 1
+            origin_exact_id = int(getattr(representative, "origin_exact_cluster_id", -1))
+            final_cluster_id = exact_to_final_cluster.get(origin_exact_id)
+            if final_cluster_id is None:
+                raise RuntimeError("CSV 输出找不到 candidate group 来源 exact cluster %d 的最终 cluster" % int(origin_exact_id))
+            writer.writerow(
+                _csv_candidate_group_row(
+                    int(row_count),
+                    int(final_cluster_id),
+                    representative,
+                    clip_size_um,
+                )
+            )
 
-            for exact_id in cluster_exact_ids:
-                exact_cluster = exact_by_id[int(exact_id)]
-                for member in _cluster_members_for_csv(exact_cluster, marker_metadata_by_exact_id):
-                    writer.writerow(
-                        _csv_sample_row(
-                            int(cluster.get("cluster_id", 0)) + 1,
-                            int(cluster.get("cluster_id", 0)),
-                            int(cluster.get("size", 0)),
-                            cluster_exact_ids,
-                            selected_candidate_id,
-                            str(cluster.get("selected_shift_direction", "")),
-                            float(cluster.get("selected_shift_distance_um", 0.0)),
-                            representative_marker_id,
-                            representative_exact_cluster_id,
-                            representative_shift_direction,
-                            representative_shift_distance_um,
-                            geometry_match_mode,
-                            member,
-                        )
-                    )
-                    row_count += 1
-
-    expected = int(result.get("total_samples", result.get("marker_count", row_count)))
+    if int(expected) <= 0:
+        expected = int(row_count)
     if int(row_count) != int(expected):
-        raise RuntimeError("CSV row count mismatch: wrote %d, expected %d deduped seeds" % (int(row_count), int(expected)))
+        raise RuntimeError("CSV row count mismatch: wrote %d, expected %d candidate groups" % (int(row_count), int(expected)))
 
-    result["output_format"] = "csv"
     result["result_csv_path"] = str(output)
     result["result_csv_row_count"] = int(row_count)
     result["result_csv_columns"] = list(CSV_OUTPUT_COLUMNS)
+    result["candidate_group_count"] = int(row_count)
     summary = result.setdefault("result_summary", {})
-    summary["output_format"] = "csv"
     summary["result_csv_path"] = str(output)
     summary["result_csv_row_count"] = int(row_count)
     summary["result_csv_columns"] = list(CSV_OUTPUT_COLUMNS)
+    summary["candidate_group_count"] = int(row_count)
     return {"path": str(output), "row_count": int(row_count), "columns": list(CSV_OUTPUT_COLUMNS)}
 
 
-def _bitmap_ecc_match(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
-    """执行 ECC 几何匹配。"""
+def _bitmap_ecc_match_reason(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
+    """执行 ECC 几何匹配，并返回细分拒绝原因。"""
 
     if bitmap_a.shape != bitmap_b.shape:
-        return False
+        return False, "geometry_shape_mismatch"
     if not bitmap_a.any() and not bitmap_b.any():
-        return True
+        return True, "geometry_verified"
     if not bitmap_a.any() or not bitmap_b.any():
-        return False
+        return False, "geometry_empty_mismatch"
     tol_px = max(0, int(math.ceil(float(edge_tolerance_um) / max(float(pixel_size_um), 1e-12) - 1e-12)))
     if tol_px <= 0:
-        return bool(np.array_equal(bitmap_a, bitmap_b))
+        if bool(np.array_equal(bitmap_a, bitmap_b)):
+            return True, "geometry_verified"
+        return False, "geometry_exact_mismatch"
     structure = np.ones((2 * tol_px + 1, 2 * tol_px + 1), dtype=bool)
     dilated_a = ndimage.binary_dilation(bitmap_a, structure=structure)
     dilated_b = ndimage.binary_dilation(bitmap_b, structure=structure)
@@ -2224,8 +2141,10 @@ def _bitmap_ecc_match(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
     area_b = max(float(np.count_nonzero(bitmap_b)), 1.0)
     residual_a = np.count_nonzero(bitmap_a & ~dilated_b) / area_a
     residual_b = np.count_nonzero(bitmap_b & ~dilated_a) / area_b
-    if residual_a > ECC_RESIDUAL_RATIO or residual_b > ECC_RESIDUAL_RATIO:
-        return False
+    if residual_a > ECC_RESIDUAL_RATIO:
+        return False, "geometry_residual_candidate"
+    if residual_b > ECC_RESIDUAL_RATIO:
+        return False, "geometry_residual_target"
     eroded_a = ndimage.binary_erosion(bitmap_a, structure=structure, border_value=0)
     eroded_b = ndimage.binary_erosion(bitmap_b, structure=structure, border_value=0)
     donut_a = dilated_a & ~eroded_a
@@ -2233,22 +2152,99 @@ def _bitmap_ecc_match(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
     donut_area_a = int(np.count_nonzero(donut_a))
     donut_area_b = int(np.count_nonzero(donut_b))
     if donut_area_a == 0 or donut_area_b == 0:
-        return True
+        return True, "geometry_verified"
     overlap = int(np.count_nonzero(donut_a & donut_b))
     denom = max(min(donut_area_a, donut_area_b), 1)
-    return float(overlap) / float(denom) >= ECC_DONUT_OVERLAP_RATIO
+    if float(overlap) / float(denom) >= ECC_DONUT_OVERLAP_RATIO:
+        return True, "geometry_verified"
+    return False, "geometry_donut_overlap"
 
 
-def candidate_matches_marker(candidate, marker, config):
-    """判断 candidate 是否覆盖某 marker representative。"""
+def _bitmap_ecc_match(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um):
+    """执行 ECC 几何匹配，保留 bool 形式供内部兼容。"""
 
-    if candidate.clip_hash == marker.clip_hash:
-        return True
+    matched, _ = _bitmap_ecc_match_reason(bitmap_a, bitmap_b, edge_tolerance_um, pixel_size_um)
+    return bool(matched)
+
+
+def _geometry_match_reason(candidate, witness, config):
+    """执行 final verification 几何判定，并返回细分原因。"""
+
+    candidate_bitmap = np.asarray(candidate.clip_bitmap, dtype=bool)
+    witness_bitmap = np.asarray(witness.clip_bitmap, dtype=bool)
+    if candidate_bitmap.shape != witness_bitmap.shape:
+        return False, "geometry_shape_mismatch"
     if str(config.get("geometry_match_mode", "ecc")).lower() == "acc":
-        xor_ratio = float(np.count_nonzero(candidate.clip_bitmap ^ marker.clip_bitmap)) / float(max(candidate.clip_bitmap.size, 1))
-        return bool(xor_ratio <= max(0.0, 1.0 - float(config.get("area_match_ratio", 0.96))) + 1e-12)
+        xor_ratio = float(np.count_nonzero(candidate_bitmap ^ witness_bitmap)) / float(max(candidate_bitmap.size, 1))
+        if xor_ratio <= max(0.0, 1.0 - float(config.get("area_match_ratio", 0.96))) + 1e-12:
+            return True, "geometry_verified"
+        return False, "geometry_acc_xor"
     pixel_size_um = float(int(config.get("pixel_size_nm", DEFAULT_PIXEL_SIZE_NM))) / 1000.0
-    return _bitmap_ecc_match(candidate.clip_bitmap, marker.clip_bitmap, float(config.get("edge_tolerance_um", 0.02)), pixel_size_um)
+    return _bitmap_ecc_match_reason(
+        candidate_bitmap,
+        witness_bitmap,
+        float(config.get("edge_tolerance_um", 0.02)),
+        pixel_size_um,
+    )
+
+
+def _descriptor_for_candidate(candidate, descriptor_cache):
+    """读取或计算 selected candidate 的 full graph descriptor。"""
+
+    key = str(getattr(candidate, "candidate_id", id(candidate)))
+    descriptor = descriptor_cache.get(key)
+    if descriptor is None:
+        descriptor = _graph_bitmap_descriptor(candidate.clip_bitmap)
+        descriptor_cache[key] = descriptor
+    return descriptor
+
+
+def _candidate_matches_witness(candidate, witness, config, descriptor_cache):
+    """判断 selected candidate 是否能通过单个 target witness 的严格验证。"""
+
+    if str(candidate.clip_hash) == str(witness.clip_hash):
+        return True, "exact_hash"
+
+    geometry_ok, geometry_reason = _geometry_match_reason(candidate, witness, config)
+    if not geometry_ok:
+        return False, geometry_reason
+
+    candidate_desc = _descriptor_for_candidate(candidate, descriptor_cache)
+    witness_desc = _graph_bitmap_descriptor(witness.clip_bitmap)
+    return _strict_graph_gate_reason(candidate_desc, witness_desc)
+
+
+def _dominant_reject_reason(reasons):
+    """从多个 witness 失败原因中挑出最有诊断价值的最终拒绝原因。"""
+
+    reason_counts = Counter(str(reason) for reason in reasons if reason)
+    if not reason_counts:
+        return "unknown"
+    graph_reasons = [reason for reason in reason_counts if str(reason).startswith("graph_")]
+    if graph_reasons:
+        return max(sorted(graph_reasons), key=lambda reason: reason_counts[reason])
+    for reason in GEOMETRY_REJECT_REASON_ORDER:
+        if reason in reason_counts:
+            return reason
+    return max(sorted(reason_counts), key=lambda reason: reason_counts[reason])
+
+
+def _target_witness_candidates(exact_cluster, config):
+    """为 target exact cluster 临时生成 witness candidates。"""
+
+    return generate_candidates_for_cluster(exact_cluster, config)
+
+
+def _candidate_matches_exact(candidate, exact_cluster, config, descriptor_cache):
+    """使用统一 shift-witness 语义判断 candidate 是否覆盖某个 exact cluster。"""
+
+    reject_reasons = []
+    for witness in _target_witness_candidates(exact_cluster, config):
+        matched, reason = _candidate_matches_witness(candidate, witness, config, descriptor_cache)
+        if matched:
+            return True, reason, str(witness.shift_direction)
+        reject_reasons.append(str(reason))
+    return False, _dominant_reject_reason(reject_reasons), "none"
 
 
 def distance_worst_case_proxy(bitmap):
@@ -2617,40 +2613,43 @@ def load_candidate_bundle_bucket(json_path, npz_path):
     with Path(str(json_path)).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     arrays = np.load(str(npz_path), allow_pickle=False)
-    bitmaps = arrays["group_bitmaps"]
-    groups = []
-    for idx, metadata in enumerate(payload.get("groups", [])):
-        candidate = candidate_from_metadata(metadata, bitmaps[int(idx)])
-        origin_ids = set(int(value) for value in metadata.get("origin_ids", []))
-        if not origin_ids:
-            origin_ids.add(int(candidate.origin_exact_cluster_id))
-        groups.append(
-            {
-                "representative": candidate,
-                "candidates": [],
-                "origin_ids": origin_ids,
-                "strict_key": _bitmap_exact_key(candidate.clip_bitmap),
-                "candidate_ids": [str(value) for value in metadata.get("candidate_ids", [])],
-                "candidate_count": int(metadata.get("candidate_count", len(metadata.get("candidate_ids", [])))),
-            }
-        )
-    if len(groups):
-        shape = tuple(int(value) for value in groups[0]["representative"].clip_bitmap.shape)
-    else:
-        shape = tuple(int(value) for value in str(payload.get("shape_key", "0x0")).split("x"))
-    bundle = _finalize_candidate_bundle({"shape": shape, "candidate_groups": groups})
-    for key in (
-        "packed_bitmaps",
-        "area_px",
-        "cheap_invariants",
-        "cheap_signature_grid",
-        "cheap_signature_proj_x",
-        "cheap_signature_proj_y",
-        "cheap_signature_vectors",
-        "cheap_subgroup_keys",
-    ):
-        if key in arrays:
-            bundle["precomputed_" + key] = np.asarray(arrays[key])
+    try:
+        bitmaps = arrays["group_bitmaps"]
+        groups = []
+        for idx, metadata in enumerate(payload.get("groups", [])):
+            candidate = candidate_from_metadata(metadata, bitmaps[int(idx)])
+            origin_ids = set(int(value) for value in metadata.get("origin_ids", []))
+            if not origin_ids:
+                origin_ids.add(int(candidate.origin_exact_cluster_id))
+            groups.append(
+                {
+                    "representative": candidate,
+                    "candidates": [],
+                    "origin_ids": origin_ids,
+                    "strict_key": _bitmap_exact_key(candidate.clip_bitmap),
+                    "candidate_ids": [str(value) for value in metadata.get("candidate_ids", [])],
+                    "candidate_count": int(metadata.get("candidate_count", len(metadata.get("candidate_ids", [])))),
+                }
+            )
+        if len(groups):
+            shape = tuple(int(value) for value in groups[0]["representative"].clip_bitmap.shape)
+        else:
+            shape = tuple(int(value) for value in str(payload.get("shape_key", "0x0")).split("x"))
+        bundle = _finalize_candidate_bundle({"shape": shape, "candidate_groups": groups})
+        for key in (
+            "packed_bitmaps",
+            "area_px",
+            "cheap_invariants",
+            "cheap_signature_grid",
+            "cheap_signature_proj_x",
+            "cheap_signature_proj_y",
+            "cheap_signature_vectors",
+            "cheap_subgroup_keys",
+        ):
+            if key in arrays:
+                bundle["precomputed_" + key] = np.asarray(arrays[key])
+    finally:
+        arrays.close()
     return bundle, payload
 
 
@@ -3416,17 +3415,20 @@ def load_coverage_shard(json_path, npz_path):
     with Path(str(json_path)).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     arrays = np.load(str(npz_path), allow_pickle=False)
-    bitmaps = arrays["candidate_bitmaps"]
-    has_npz_coverage = "coverage_offsets" in arrays.files and "coverage_values" in arrays.files
-    if has_npz_coverage:
-        coverage_offsets = arrays["coverage_offsets"]
-        coverage_values = arrays["coverage_values"]
-    candidates = []
-    for idx, metadata in enumerate(payload.get("candidates", [])):
-        candidate = candidate_from_metadata(metadata, bitmaps[int(idx)])
+    try:
+        bitmaps = arrays["candidate_bitmaps"]
+        has_npz_coverage = "coverage_offsets" in arrays.files and "coverage_values" in arrays.files
         if has_npz_coverage:
-            candidate.coverage = _coverage_from_arrays(coverage_offsets, coverage_values, int(metadata.get("coverage_index", idx)))
-        candidates.append(candidate)
+            coverage_offsets = arrays["coverage_offsets"]
+            coverage_values = arrays["coverage_values"]
+        candidates = []
+        for idx, metadata in enumerate(payload.get("candidates", [])):
+            candidate = candidate_from_metadata(metadata, bitmaps[int(idx)])
+            if has_npz_coverage:
+                candidate.coverage = _coverage_from_arrays(coverage_offsets, coverage_values, int(metadata.get("coverage_index", idx)))
+            candidates.append(candidate)
+    finally:
+        arrays.close()
     return candidates, payload
 
 
@@ -3440,10 +3442,13 @@ def load_coverage_shard_metadata(json_path, npz_path=None):
     coverage_values = None
     if npz_path is not None:
         arrays = np.load(str(npz_path), allow_pickle=False)
-        has_npz_coverage = "coverage_offsets" in arrays.files and "coverage_values" in arrays.files
-        if has_npz_coverage:
-            coverage_offsets = arrays["coverage_offsets"]
-            coverage_values = arrays["coverage_values"]
+        try:
+            has_npz_coverage = "coverage_offsets" in arrays.files and "coverage_values" in arrays.files
+            if has_npz_coverage:
+                coverage_offsets = np.asarray(arrays["coverage_offsets"], dtype=np.int64)
+                coverage_values = np.asarray(arrays["coverage_values"], dtype=np.int64)
+        finally:
+            arrays.close()
     candidates = []
     for idx, metadata in enumerate(payload.get("candidates", [])):
         candidate = candidate_from_metadata_light(metadata)
@@ -3460,10 +3465,13 @@ def load_coverage_shard_csr_metadata(json_path, npz_path):
         payload = json.load(handle)
     metadata_items = list(payload.get("candidates", []))
     arrays = np.load(str(npz_path), allow_pickle=False)
-    if "coverage_offsets" in arrays.files and "coverage_values" in arrays.files:
-        offsets = np.asarray(arrays["coverage_offsets"], dtype=np.int64)
-        values = np.asarray(arrays["coverage_values"], dtype=np.int64)
-        return metadata_items, offsets, values, payload
+    try:
+        if "coverage_offsets" in arrays.files and "coverage_values" in arrays.files:
+            offsets = np.asarray(arrays["coverage_offsets"], dtype=np.int64)
+            values = np.asarray(arrays["coverage_values"], dtype=np.int64)
+            return metadata_items, offsets, values, payload
+    finally:
+        arrays.close()
 
     offsets = [0]
     values = []
@@ -3478,10 +3486,13 @@ def load_coverage_candidate_bitmaps(npz_path, bitmap_indexes):
     """从 coverage shard npz 中按下标读取候选 bitmap。"""
 
     arrays = np.load(str(npz_path), allow_pickle=False)
-    bitmaps = arrays["candidate_bitmaps"]
-    loaded = {}
-    for idx in sorted(set(int(value) for value in bitmap_indexes)):
-        loaded[int(idx)] = np.ascontiguousarray(bitmaps[int(idx)], dtype=bool)
+    try:
+        bitmaps = arrays["candidate_bitmaps"]
+        loaded = {}
+        for idx in sorted(set(int(value) for value in bitmap_indexes)):
+            loaded[int(idx)] = np.ascontiguousarray(bitmaps[int(idx)], dtype=bool)
+    finally:
+        arrays.close()
     return loaded
 
 
@@ -3644,36 +3655,106 @@ def greedy_cover(candidates, exact_clusters):
     return selected
 
 
+def _empty_verification_stats():
+    """返回 final verification 统计字段。"""
+
+    return {
+        "verified_pass": 0,
+        "verified_reject": 0,
+        "singleton_created": 0,
+        "witness_attempted": 0,
+        "witness_verified_pass": 0,
+    }
+
+
+def _empty_final_verification_breakdown():
+    """返回 final verification 通过与拒绝原因统计。"""
+
+    return {
+        "pass_reason_counts": {},
+        "reject_reason_counts": {},
+        "witness_shift_direction_counts": {},
+    }
+
+
+def _increment_named_counter(counter, name, amount=1):
+    """对字符串键的计数器做自增。"""
+
+    key = str(name) if name not in (None, "") else "unknown"
+    counter[key] = int(counter.get(key, 0)) + int(amount)
+
+
+def _assign_exact_clusters(selected_candidates, exact_clusters):
+    """把 exact clusters 分配给最合适的 selected candidate，再进入最终验证。"""
+
+    assignments = dict((str(candidate.candidate_id), []) for candidate in selected_candidates)
+    exact_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in exact_clusters)
+    best_candidate_by_exact = {}
+    best_key_by_exact = {}
+    for candidate in selected_candidates:
+        for exact_id in candidate.coverage:
+            exact_cluster = exact_by_id.get(int(exact_id))
+            if exact_cluster is None:
+                continue
+            key = (
+                0 if str(candidate.clip_hash) == str(exact_cluster.representative.clip_hash) else 1,
+                0 if int(candidate.origin_exact_cluster_id) == int(exact_cluster.exact_cluster_id) else 1,
+                0 if str(candidate.shift_direction) == "base" else 1,
+                abs(float(candidate.shift_distance_um)),
+                str(candidate.candidate_id),
+            )
+            previous_key = best_key_by_exact.get(int(exact_id))
+            if previous_key is None or key < previous_key:
+                best_key_by_exact[int(exact_id)] = key
+                best_candidate_by_exact[int(exact_id)] = candidate
+
+    for exact_cluster in exact_clusters:
+        exact_id = int(exact_cluster.exact_cluster_id)
+        candidate = best_candidate_by_exact.get(exact_id)
+        if candidate is None:
+            raise RuntimeError("No selected candidate covers exact cluster %d" % int(exact_id))
+        assignments[str(candidate.candidate_id)].append(exact_cluster)
+    return assignments
+
+
 def build_compact_result(marker_records, exact_clusters, candidates, selected_candidates, coverage_stats, config, runtime_summary):
     """构建最终 compact 结果字典。"""
 
     marker_count = len(marker_records) if marker_records is not None else sum(int(cluster.member_count) for cluster in exact_clusters)
     cluster_sizes = []
     clusters = []
-    exact_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in exact_clusters)
     assigned = set()
-    verification_stats = {"verified_pass": 0, "verified_reject": 0, "singleton_created": 0}
-    for cluster_index, candidate in enumerate(selected_candidates):
-        exact_ids = sorted(
-            int(cid) for cid in candidate.coverage if int(cid) in exact_by_id and int(cid) not in assigned
-        )
+    verification_stats = _empty_verification_stats()
+    verification_breakdown = _empty_final_verification_breakdown()
+    descriptor_cache = {}
+    assignments = _assign_exact_clusters(selected_candidates, exact_clusters)
+    for candidate in selected_candidates:
+        assigned_exact_clusters = sorted(assignments.get(str(candidate.candidate_id), []), key=lambda item: int(item.exact_cluster_id))
         accepted_ids = []
-        for exact_id in exact_ids:
-            if candidate_matches_marker(candidate, exact_by_id[exact_id].representative, config):
+        for exact_cluster in assigned_exact_clusters:
+            exact_id = int(exact_cluster.exact_cluster_id)
+            verification_stats["witness_attempted"] += 1
+            matched, reason, witness_direction = _candidate_matches_exact(candidate, exact_cluster, config, descriptor_cache)
+            if matched:
                 accepted_ids.append(int(exact_id))
                 assigned.add(int(exact_id))
                 verification_stats["verified_pass"] += 1
+                verification_stats["witness_verified_pass"] += 1
+                _increment_named_counter(verification_breakdown["pass_reason_counts"], reason)
+                _increment_named_counter(verification_breakdown["witness_shift_direction_counts"], witness_direction)
             else:
                 verification_stats["verified_reject"] += 1
                 verification_stats["singleton_created"] += 1
+                _increment_named_counter(verification_breakdown["reject_reason_counts"], reason)
         if not accepted_ids:
             continue
-        size = sum(int(exact_by_id[exact_id].member_count) for exact_id in accepted_ids)
+        accepted_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in assigned_exact_clusters)
+        size = sum(int(accepted_by_id[exact_id].member_count) for exact_id in accepted_ids)
         distance_score = distance_worst_case_proxy(candidate.clip_bitmap)
         cluster_sizes.append(int(size))
         clusters.append(
             {
-                "cluster_id": int(cluster_index),
+                "cluster_id": int(len(clusters)),
                 "size": int(size),
                 "selected_candidate_id": str(candidate.candidate_id),
                 "selected_shift_direction": str(candidate.shift_direction),
@@ -3703,6 +3784,7 @@ def build_compact_result(marker_records, exact_clusters, candidates, selected_ca
     coverage_debug_stats = dict((key, value) for key, value in coverage_stats.items() if key != "coverage_detail_seconds")
     shift_summary = candidate_shift_summary(candidates)
     selected_shift_summary = candidate_shift_summary(selected_candidates)
+    candidate_group_count = int(coverage_debug_stats.get("candidate_group_count", 0))
     return {
         "pipeline_mode": PIPELINE_MODE,
         "seed_mode": SEED_MODE,
@@ -3714,6 +3796,7 @@ def build_compact_result(marker_records, exact_clusters, candidates, selected_ca
         "marker_count": int(marker_count),
         "exact_cluster_count": int(len(exact_clusters)),
         "candidate_count": int(len(candidates)),
+        "candidate_group_count": int(candidate_group_count),
         "selected_candidate_count": int(len(selected_candidates)),
         "total_clusters": int(len(clusters)),
         "total_samples": int(marker_count),
@@ -3721,6 +3804,7 @@ def build_compact_result(marker_records, exact_clusters, candidates, selected_ca
         "coverage_detail_seconds": coverage_detail_seconds,
         "coverage_debug_stats": coverage_debug_stats,
         "final_verification_stats": dict(verification_stats),
+        "final_verification_breakdown": dict(verification_breakdown),
         "candidate_direction_counts": dict(shift_summary["candidate_direction_counts"]),
         "diagonal_candidate_count": int(shift_summary["diagonal_candidate_count"]),
         "max_shift_distance_um": float(shift_summary["max_shift_distance_um"]),
@@ -3737,6 +3821,9 @@ def build_compact_result(marker_records, exact_clusters, candidates, selected_ca
             "max_shift_distance_um": float(shift_summary["max_shift_distance_um"]),
             "coverage_detail_seconds": coverage_detail_seconds,
             "coverage_debug_stats": coverage_debug_stats,
+            "final_verification_stats": dict(verification_stats),
+            "final_verification_breakdown": dict(verification_breakdown),
+            "candidate_group_count": int(candidate_group_count),
             "timing_seconds": dict(runtime_summary),
         },
     }
@@ -3817,11 +3904,14 @@ def load_shard_records(json_path, npz_path):
     with Path(str(json_path)).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     arrays = np.load(str(npz_path), allow_pickle=False)
-    clip_bitmaps = arrays["clip_bitmaps"]
-    expanded_bitmaps = arrays["expanded_bitmaps"]
-    records = []
-    for idx, metadata in enumerate(payload.get("records", [])):
-        records.append(record_from_metadata(metadata, clip_bitmaps[int(idx)], expanded_bitmaps[int(idx)]))
+    try:
+        clip_bitmaps = arrays["clip_bitmaps"]
+        expanded_bitmaps = arrays["expanded_bitmaps"]
+        records = []
+        for idx, metadata in enumerate(payload.get("records", [])):
+            records.append(record_from_metadata(metadata, clip_bitmaps[int(idx)], expanded_bitmaps[int(idx)]))
+    finally:
+        arrays.close()
     return records, payload
 
 
@@ -3872,34 +3962,37 @@ def load_exact_index(json_path, npz_path):
     with Path(str(json_path)).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     arrays = np.load(str(npz_path), allow_pickle=False)
-    has_stacked = "clip_bitmaps" in arrays.files
-    if has_stacked:
-        clip_bitmaps = arrays["clip_bitmaps"]
-        expanded_bitmaps = arrays["expanded_bitmaps"]
-    exact_clusters = []
-    for idx, cluster_payload in enumerate(payload.get("clusters", [])):
+    try:
+        has_stacked = "clip_bitmaps" in arrays.files
         if has_stacked:
-            clip_bitmap = clip_bitmaps[int(idx)]
-            expanded_bitmap = expanded_bitmaps[int(idx)]
-        else:
-            clip_bitmap = arrays["clip_%06d" % int(idx)]
-            expanded_bitmap = arrays["expanded_%06d" % int(idx)]
-        representative = record_from_metadata(
-            cluster_payload["representative"],
-            clip_bitmap,
-            expanded_bitmap,
-        )
-        representative.exact_cluster_id = int(cluster_payload["exact_cluster_id"])
-        exact_clusters.append(
-            ExactCluster(
-                int(cluster_payload["exact_cluster_id"]),
-                str(cluster_payload["exact_key"]),
-                representative,
-                [],
-                int(cluster_payload.get("member_count", 1)),
-                int(cluster_payload.get("weight_sum", 1)),
+            clip_bitmaps = arrays["clip_bitmaps"]
+            expanded_bitmaps = arrays["expanded_bitmaps"]
+        exact_clusters = []
+        for idx, cluster_payload in enumerate(payload.get("clusters", [])):
+            if has_stacked:
+                clip_bitmap = clip_bitmaps[int(idx)]
+                expanded_bitmap = expanded_bitmaps[int(idx)]
+            else:
+                clip_bitmap = arrays["clip_%06d" % int(idx)]
+                expanded_bitmap = arrays["expanded_%06d" % int(idx)]
+            representative = record_from_metadata(
+                cluster_payload["representative"],
+                clip_bitmap,
+                expanded_bitmap,
             )
-        )
+            representative.exact_cluster_id = int(cluster_payload["exact_cluster_id"])
+            exact_clusters.append(
+                ExactCluster(
+                    int(cluster_payload["exact_cluster_id"]),
+                    str(cluster_payload["exact_key"]),
+                    representative,
+                    [],
+                    int(cluster_payload.get("member_count", 1)),
+                    int(cluster_payload.get("weight_sum", 1)),
+                )
+            )
+    finally:
+        arrays.close()
     return exact_clusters, payload
 
 

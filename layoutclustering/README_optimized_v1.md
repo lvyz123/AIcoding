@@ -29,8 +29,8 @@
 7. candidate generation 结束后，把逻辑 candidate 压成全局 strict bitmap `CoverageCandidateGroup`。
 8. coverage 阶段先做 cheap shortlist，再做 lazy full prefilter，最后做 ACC/ECC 几何比较。
 9. 通过 greedy set cover 选择 representative candidate。
-10. 对 selected candidate 做 final verification；失败成员回退成 singleton。
-11. 输出 CSV 主结果；每行对应一个去重后的 seed/sample，仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
+10. 对 selected candidate 做统一 shift-witness final verification；所有 witness 都失败的成员回退成 singleton。
+11. 输出 CSV 主结果；每行对应一个 `CoverageCandidateGroup`，仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
 
 ## 运行方式
 
@@ -52,7 +52,6 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 
 - `input_path`：输入 OAS 文件或目录。
 - `--output`, `-o`：输出 CSV 路径，默认 `clustering_results.csv`；必须使用 `.csv` 后缀，传入 `.json`、`.txt` 或无后缀路径会立即报错。
-- `--format`, `-f`：输出格式，当前仅支持 `csv`。
 - `--clip-size`：clip 边长，单位 `um`，默认 `1.35`。
 - `--geometry-match-mode`：最终几何 gate，`acc` 或 `ecc`，默认 `ecc`。
 - `--area-match-ratio`：`acc` 模式的面积匹配阈值，默认 `0.96`。
@@ -68,6 +67,10 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `--seed-strategy`
 - `--marker-layer`
 - `--hotspot-layer`
+- `--format`
+- `--graph-invariant-limit`, `--graph-topology-threshold`, `--graph-signature-threshold`
+- `--strict-invariant-limit`, `--strict-topology-threshold`, `--strict-signature-threshold`
+- `--coverage-shortlist-max-targets`
 - 以及 `pair_contact`、`pair_gap`、`drc_component` 等旧 seed 路线相关字段
 
 ## 输出字段
@@ -79,13 +82,13 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `array_seed_count`, `array_spacing_seed_count`, `long_shape_seed_count`, `residual_seed_count`
 - `array_group_count`, `array_spacing_group_count`, `long_shape_count`, `residual_element_count`
 - `array_spacing_weight_total`, `seed_weight_total`, `seed_type_counts`, `seed_audit`
-- `exact_cluster_count`, `candidate_count`, `candidate_group_count`, `candidate_object_avoided_count`
+- `exact_cluster_count`, `candidate_count`, `candidate_group_count`
 - `candidate_direction_counts`, `diagonal_candidate_count`
 - `selected_candidate_count`, `selected_diagonal_candidate_count`, `total_clusters`
 - `result_csv_row_count`, `result_csv_release_count`, `result_csv_columns`
 - `prefilter_stats`, `coverage_detail_seconds`, `coverage_debug_stats`
 - `final_verification_stats`, `final_verification_detail_seconds`
-- `memory_debug`, `file_list`, `config`, `result_summary`
+- `file_list`, `config`, `result_summary`
 
 单个 cluster 主要包含：
 
@@ -106,9 +109,9 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 
 说明：在 `geometry-driven` 版本里，`grid_cell_bbox` 只是兼容别名，语义等同于 `seed_bbox`，不再表示真实全域 grid cell。
 
-## 当前内存优化
+## 内部资源表示
 
-当前版本针对 12G 笔记本做的是“精度保持型”内存优化，也就是只改变表示方式、缓存策略和生命周期，不改变这些核心语义：
+当前版本仍保留 packed bitmap、按需缓存和生命周期释放等内部表示策略；这些策略只改变对象表示方式，不改变这些核心语义：
 
 - `GRID_STEP_RATIO=0.5`
 - seed 规则
@@ -150,9 +153,10 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 
 ### Result 流式输出
 
-- 大样本默认 `materialized_outputs=false` 时，`_build_results()` 会把每个去重 seed/sample 按最终 group 直接写入临时 CSV spool。
+- 大样本默认 `materialized_outputs=false` 时，`_build_results()` 会把每个 `CoverageCandidateGroup` 按最终 cluster 映射写入临时 CSV spool。
 - `_save_results()` 只把 CSV spool 复制到用户指定的 `.csv` 主输出路径，不再写旧主结果格式或 summary sidecar。
-- 新增 `result_csv_row_count`、`result_csv_release_count`、`result_csv_columns`，用于确认 CSV 写出与释放路径是否生效。
+- 主结果列固定为 `groupID,cluster_id,center_x_um,center_y_um,clip_size`。
+- `result_csv_row_count` 等于 `candidate_group_count`。
 
 ### Candidate Group Packed-at-Rest
 
@@ -170,45 +174,9 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
   - `coverage`
 - coverage window 内需要 bitmap 时，再按需 unpack 到局部缓存。
 - window 结束后立即释放局部 unpack bitmap cache。
-- final verification 阶段选中的 candidate 或 singleton fallback base candidate 也都按需恢复 bitmap，不要求长期常驻二维 bool clip。
+- final verification 阶段选中的 candidate 与临时 witness candidate 都按需恢复 bitmap，不要求长期常驻二维 bool clip。
 
 ## 关键诊断字段
-
-### `memory_debug`
-
-与本版本内存优化直接相关的字段包括：
-
-- `rss_collect_markers_mb`
-- `rss_exact_cluster_mb`
-- `rss_candidate_generation_mb`
-- `rss_coverage_eval_mb`
-- `rss_set_cover_mb`
-- `rss_result_build_mb`
-- `rss_peak_estimate_mb`
-- `online_exact_group_count`
-- `light_member_record_count`
-- `released_marker_clip_early_count`
-- `released_marker_expanded_early_count`
-- `released_marker_expanded_count`
-- `released_marker_clip_count`
-- `released_candidate_clip_count`
-- `released_cache_owner_count`
-- `pre_raster_payload_cache_count`
-- `exact_bitmap_payload_cache_count`
-- `packed_marker_expanded_count`
-- `unpacked_marker_expanded_count`
-- `packed_marker_clip_count`
-- `candidate_bitmap_pool_unique_count`
-- `candidate_bitmap_pool_hit_count`
-- `strict_digest_key_count`
-- `strict_digest_collision_count`
-- `strict_key_bytes_avoided_estimate_mb`
-- `early_duplicate_shift_candidate_count`
-- `candidate_object_avoided_count`
-- `signature_embedding_bytes_avoided_estimate_mb`
-- `packed_candidate_group_bitmap_count`
-- `unpacked_candidate_group_bitmap_count`
-- `candidate_group_bitmap_bytes_avoided_estimate_mb`
 
 ### `coverage_debug_stats`
 
@@ -247,11 +215,6 @@ coverage 细分耗时里常见字段包括：
 - `geometry_cache`
 - `geometry_cache_release`
 - `geometry_match`
-
-说明：
-
-- 如果运行环境无法读取 RSS，`rss_*` 字段可能为 `null`。
-- 即使 RSS 不可用，释放计数和局部峰值计数仍会输出。
 
 ## Review 导出
 
@@ -292,4 +255,4 @@ pip install -r requirements.txt
 
 - 大样本优先在系统终端中运行，不建议直接在 PyCharm 内置运行环境里拉完整数据。
 - 如果只是做精度回归，建议先跑 50um / 100um crop。
-- 如果需要 sample / representative 位图导出，再开启 `--review-dir`；默认关闭能明显降低常驻内存。
+- 如果需要 sample / representative 位图导出，再开启 `--review-dir`；默认关闭可减少额外文件输出。
