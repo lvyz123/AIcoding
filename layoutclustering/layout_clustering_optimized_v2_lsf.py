@@ -12,13 +12,13 @@
    - prepare-coverage：汇总 marker，生成 exact clusters、全局 candidate bundle buckets 和 coverage source shards。
    - run-coverage-shard：每个 LSF job 读取本 source shard 与需要的 candidate bundle bucket，计算 coverage CSR。
    - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap，
-     用 shift-witness final verification 生成最终 cluster，再输出 candidate group 级 CSV。
+     用 shift-witness final verification 生成最终 cluster，再输出 Exact Cluster Review CSV 和代表 CSV。
 3. run-local 用于开发和小 crop 验证；默认走集中式小样本流程，带 --distributed-coverage 时顺序模拟完整 LSF 流程。
 4. 代码保持 Python 3.6 兼容：不使用 dataclasses、现代 union type、内置泛型类型标注或 scipy.optimize.milp。
 
 注意点：
 - grid_step_ratio 固定保持 v1 主线默认值 0.5，当前版本不开放采样密度实验入口。
-- 默认不物化 sample/representative 文件，最终用户主输出只保留 candidate group 级 CSV。
+- 最终用户输出为 CSV-only：--output 指向主 Exact Cluster Review CSV，代表 CSV 自动按同名 stem 派生。
 - prepare-coverage 不 eager 构建 full descriptor 或 ECC geometry cache；这些缓存只在 coverage shard 内按需生成。
 - candidate coverage set 使用 NPZ offsets/values 存储，JSON 只保留轻量索引和诊断字段。
 - merge-coverage 的 greedy set cover 基于 CSR 数组运行，只把 selected candidates 还原成对象；
@@ -45,7 +45,7 @@ from mainline_lsf import (
     PIPELINE_MODE,
     CSV_OUTPUT_COLUMNS,
     bitmap_shape_key,
-    build_compact_result,
+    build_compact_result_exact_review,
     build_geometry_driven_seed_candidates,
     candidate_shift_summary,
     create_candidate_bundle_accumulator,
@@ -85,6 +85,29 @@ from mainline_lsf import (
 CENTRAL_MERGE_EXACT_CLUSTER_LIMIT = 20000
 PREPARE_COVERAGE_CANDIDATE_CHUNK_SIZE = 2000
 TARGET_LOAD_WARNING_RATIO = 0.60
+CONFIG_ALLOWED_KEYS = {
+    "clip_size_um",
+    "geometry_match_mode",
+    "area_match_ratio",
+    "edge_tolerance_um",
+    "pixel_size_nm",
+    "apply_layer_operations",
+    "compute_quality_metrics",
+}
+REMOVED_CONFIG_KEYS = {
+    "format",
+    "output_format",
+    "seed_strategy",
+    "seed_mode",
+    "grid_step_ratio",
+    "graph_invariant_limit",
+    "graph_topology_threshold",
+    "graph_signature_threshold",
+    "strict_invariant_limit",
+    "strict_topology_threshold",
+    "strict_signature_threshold",
+    "coverage_shortlist_max_targets",
+}
 
 
 def _ensure_dir(path):
@@ -324,6 +347,12 @@ def _config_payload(args):
     config_path = getattr(args, "config", None)
     if config_path:
         config.update(_read_json(config_path))
+    unknown_keys = set(str(key) for key in config) - CONFIG_ALLOWED_KEYS
+    removed_keys = unknown_keys & REMOVED_CONFIG_KEYS
+    if removed_keys:
+        raise ValueError("v2_lsf config contains removed keys: %s" % ", ".join(sorted(removed_keys)))
+    if unknown_keys:
+        raise ValueError("v2_lsf config contains unsupported keys: %s" % ", ".join(sorted(unknown_keys)))
     config["clip_size_um"] = float(getattr(args, "clip_size", config.get("clip_size_um", 1.35)))
     config["geometry_match_mode"] = str(getattr(args, "geometry_match_mode", config.get("geometry_match_mode", "ecc")))
     config["area_match_ratio"] = float(getattr(args, "area_match_ratio", config.get("area_match_ratio", 0.96)))
@@ -331,6 +360,7 @@ def _config_payload(args):
     config["pixel_size_nm"] = int(getattr(args, "pixel_size_nm", config.get("pixel_size_nm", DEFAULT_PIXEL_SIZE_NM)))
     config["grid_step_ratio"] = float(GRID_STEP_RATIO)
     config["apply_layer_operations"] = bool(getattr(args, "apply_layer_ops", config.get("apply_layer_operations", False)))
+    config["compute_quality_metrics"] = bool(getattr(args, "compute_quality_metrics", config.get("compute_quality_metrics", False)))
     return config
 
 
@@ -483,6 +513,25 @@ def _save_exact_member_index(exact_clusters, output_json):
     }
 
 
+def _load_exact_member_index(manifest):
+    """读取 exact member index；merge-coverage 不再从 shard JSON 回退猜测成员。"""
+
+    exact_member_index = manifest.get("exact_member_index")
+    if not exact_member_index:
+        raise RuntimeError("Missing exact_member_index in manifest; run prepare-coverage first")
+    json_path = exact_member_index["output_json"]
+    if not Path(json_path).exists():
+        raise RuntimeError("Missing exact member index output; run prepare-coverage first")
+    payload = _read_json(json_path)
+    expected_count = int(exact_member_index.get("member_count", -1))
+    actual_count = int(payload.get("member_count", -2))
+    if actual_count != expected_count:
+        raise RuntimeError(
+            "exact member index count mismatch: manifest=%d, file=%d" % (int(expected_count), int(actual_count))
+        )
+    return payload
+
+
 def _load_shard_summaries_only(manifest):
     """只读取 shard JSON 摘要，不加载 shard bitmap。"""
 
@@ -601,6 +650,7 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         float(config.get("clip_size_um", 1.35)),
     )
     seed_audit = dict(seed_stats.pop("seed_audit", {}))
+    seed_coverage_audit = dict(seed_stats.get("seed_coverage_audit", {}))
     seed_audit_file = work_root / "seed_audit.json"
     _write_json(seed_audit_file, seed_audit)
     seed_file = work_root / "seeds.jsonl"
@@ -676,6 +726,7 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
         "tile_oas_total_element_count": int(tile_oas_total_element_count),
         "spatial_index_stats": spatial_index_stats(layout_index),
         "seed_stats": dict(seed_stats),
+        "seed_coverage_audit": dict(seed_coverage_audit),
         "seed_audit": {
             "output_json": str(seed_audit_file.resolve()),
             "array_group_count": int(seed_audit.get("array_group_count", 0)),
@@ -683,6 +734,15 @@ def prepare_stage(input_path, work_dir, config, register_ops, shard_count, shard
             "array_spacing_seed_count": int(seed_audit.get("array_spacing_seed_count", 0)),
             "array_spacing_weight_total": int(seed_audit.get("array_spacing_weight_total", 0)),
             "seed_type_counts": dict(seed_stats.get("seed_type_counts", {})),
+            "target_edge_length_coverage_ratio": float(
+                seed_coverage_audit.get("target_edge_length_coverage_ratio", 0.0)
+            ),
+            "target_polygon_area_coverage_ratio": float(
+                seed_coverage_audit.get("target_polygon_area_coverage_ratio", 0.0)
+            ),
+            "weighted_pattern_type_coverage_ratio": float(
+                seed_coverage_audit.get("weighted_pattern_type_coverage_ratio", 0.0)
+            ),
         },
         "shard_count": int(len(shards)),
         "shards": shards,
@@ -768,13 +828,15 @@ def run_shard_stage(manifest_path, shard_id):
     return extra
 
 
-def merge_stage(manifest_path, output_path=None):
+def merge_stage(manifest_path, output_path=None, compute_quality_metrics_override=None):
     """merge 阶段：汇总 shard，执行全局聚类。"""
 
     started = time.perf_counter()
     manifest = _read_json(manifest_path)
     _validate_manifest(manifest)
     config = dict(manifest["config"])
+    if compute_quality_metrics_override is not None:
+        config["compute_quality_metrics"] = bool(compute_quality_metrics_override)
     marker_records, shard_summaries = _load_all_marker_records(manifest)
 
     exact_started = time.perf_counter()
@@ -797,7 +859,7 @@ def merge_stage(manifest_path, output_path=None):
     coverage_seconds = time.perf_counter() - coverage_started
 
     cover_started = time.perf_counter()
-    selected = greedy_cover(candidates, exact_clusters)
+    selected = greedy_cover(candidates, exact_clusters, config)
     cover_seconds = time.perf_counter() - cover_started
 
     runtime = {
@@ -806,12 +868,13 @@ def merge_stage(manifest_path, output_path=None):
         "merge_coverage_eval": round(coverage_seconds, 6),
         "merge_set_cover": round(cover_seconds, 6),
     }
-    result = build_compact_result(marker_records, exact_clusters, candidates, selected, coverage_stats, config, runtime)
+    result = build_compact_result_exact_review(marker_records, exact_clusters, candidates, selected, coverage_stats, config, runtime)
     result["lsf_manifest"] = {
         "manifest_path": str(Path(str(manifest_path)).resolve()),
         "shard_count": int(len(manifest["shards"])),
         "shard_summaries": shard_summaries,
         "seed_stats": dict(manifest.get("seed_stats", {})),
+        "seed_coverage_audit": dict(manifest.get("seed_coverage_audit", {})),
         "seed_audit": dict(manifest.get("seed_audit", {})),
         "spatial_index_stats": dict(manifest.get("spatial_index_stats", {})),
         "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
@@ -1140,7 +1203,7 @@ def run_coverage_shard_stage(manifest_path, coverage_shard_id):
     return extra
 
 
-def merge_coverage_stage(manifest_path, output_path=None):
+def merge_coverage_stage(manifest_path, output_path=None, compute_quality_metrics_override=None):
     """merge-coverage 阶段：汇总 coverage shard 并执行全局 set cover。"""
 
     started = time.perf_counter()
@@ -1149,6 +1212,9 @@ def merge_coverage_stage(manifest_path, output_path=None):
     if "coverage_shards" not in manifest:
         raise RuntimeError("Missing coverage_shards in manifest; run prepare-coverage first")
     config = dict(manifest["config"])
+    if compute_quality_metrics_override is not None:
+        config["compute_quality_metrics"] = bool(compute_quality_metrics_override)
+    exact_member_payload = _load_exact_member_index(manifest)
     shard_summaries = _load_shard_summaries_only(manifest)
 
     exact_started = time.perf_counter()
@@ -1199,7 +1265,7 @@ def merge_coverage_stage(manifest_path, output_path=None):
                 "coverage_shard_id": int(coverage_shard["coverage_shard_id"]),
                 "source_exact_count": int(payload.get("source_exact_count", coverage_shard.get("exact_count", 0))),
                 "candidate_count": int(payload.get("candidate_count", len(shard_metadata))),
-                "coverage_storage": str(payload.get("coverage_storage", "json_inline")),
+                "coverage_storage": str(payload["coverage_storage"]),
                 "coverage_value_count": int(payload.get("coverage_value_count", 0)),
                 "target_bucket_count_loaded": int(payload.get("target_bucket_count_loaded", 0)),
                 "target_candidate_group_load_ratio": float(payload.get("target_candidate_group_load_ratio", 0.0)),
@@ -1223,7 +1289,7 @@ def merge_coverage_stage(manifest_path, output_path=None):
     coverage_offsets = np.asarray(coverage_offsets, dtype=np.int64)
 
     cover_started = time.perf_counter()
-    selected_indexes = greedy_cover_csr(candidate_records, coverage_offsets, coverage_values, exact_clusters)
+    selected_indexes = greedy_cover_csr(candidate_records, coverage_offsets, coverage_values, exact_clusters, config)
     selected = selected_candidates_from_csr(candidate_records, coverage_offsets, coverage_values, selected_indexes)
     cover_seconds = time.perf_counter() - cover_started
 
@@ -1252,7 +1318,18 @@ def merge_coverage_stage(manifest_path, output_path=None):
         "merge_set_cover": round(cover_seconds, 6),
         "merge_selected_bitmap_load": round(bitmap_seconds, 6),
     }
-    result = build_compact_result(None, exact_clusters, candidate_records, selected, coverage_stats, config, runtime)
+    result = build_compact_result_exact_review(
+        None,
+        exact_clusters,
+        candidate_records,
+        selected,
+        coverage_stats,
+        config,
+        runtime,
+        coverage_offsets=coverage_offsets,
+        coverage_values=coverage_values,
+        candidate_bitmap_locations=candidate_bitmap_locations,
+    )
     result["lsf_manifest"] = {
         "manifest_path": str(Path(str(manifest_path)).resolve()),
         "shard_count": int(len(manifest["shards"])),
@@ -1260,11 +1337,13 @@ def merge_coverage_stage(manifest_path, output_path=None):
         "shard_summaries": shard_summaries,
         "coverage_shard_summaries": coverage_shard_summaries,
         "seed_stats": dict(manifest.get("seed_stats", {})),
+        "seed_coverage_audit": dict(manifest.get("seed_coverage_audit", {})),
         "seed_audit": dict(manifest.get("seed_audit", {})),
         "spatial_index_stats": dict(manifest.get("spatial_index_stats", {})),
         "coverage_plan": dict(manifest.get("coverage_plan", {})),
         "exact_index": dict(manifest.get("exact_index", {})),
         "exact_member_index": dict(manifest.get("exact_member_index", {})),
+        "exact_member_count": int(exact_member_payload.get("member_count", 0)),
         "exact_target_buckets": dict(manifest.get("exact_target_buckets", {})),
         "candidate_bundle_index": dict(manifest.get("candidate_bundle_index", {})),
         "lsf_wrapper": dict(manifest.get("lsf_wrapper", {})),
@@ -1280,6 +1359,7 @@ def merge_coverage_stage(manifest_path, output_path=None):
         exact_clusters,
         selected,
         config,
+        candidates=candidate_records,
         candidate_bundle_index=manifest.get("candidate_bundle_index", {}),
     )
     result["lsf_manifest"]["result_csv"] = dict(csv_info)
@@ -1594,6 +1674,7 @@ def _add_common_runtime_args(parser):
     parser.add_argument("--edge-tolerance-um", type=float, default=0.02, help="ECC 边缘容差，单位 um")
     parser.add_argument("--pixel-size-nm", type=int, default=DEFAULT_PIXEL_SIZE_NM, help="raster 像素尺寸，单位 nm")
     parser.add_argument("--apply-layer-ops", action="store_true", help="启用已注册的 layer operation")
+    parser.add_argument("--compute-quality-metrics", action="store_true", help="可选计算 purity / recall proxy 指标")
     parser.add_argument(
         "--register-op",
         action="append",
@@ -1620,7 +1701,14 @@ def build_parser():
 
     merge_parser = subparsers.add_parser("merge", help="集中式合并所有 seed shard 输出")
     merge_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
-    merge_parser.add_argument("--output", "-o", type=_csv_output_path_arg, default=None, help="最终结果 CSV 路径")
+    merge_parser.add_argument(
+        "--output",
+        "-o",
+        type=_csv_output_path_arg,
+        default=None,
+        help="主 Exact Cluster Review CSV 路径；Cluster Representative CSV 自动派生",
+    )
+    merge_parser.add_argument("--compute-quality-metrics", action="store_true", help="可选计算 purity / recall proxy 指标")
 
     coverage_prepare_parser = subparsers.add_parser("prepare-coverage", help="生成 coverage shard 计划")
     coverage_prepare_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
@@ -1633,7 +1721,14 @@ def build_parser():
 
     coverage_merge_parser = subparsers.add_parser("merge-coverage", help="合并 coverage shard 输出")
     coverage_merge_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
-    coverage_merge_parser.add_argument("--output", "-o", type=_csv_output_path_arg, default=None, help="最终结果 CSV 路径")
+    coverage_merge_parser.add_argument(
+        "--output",
+        "-o",
+        type=_csv_output_path_arg,
+        default=None,
+        help="主 Exact Cluster Review CSV 路径；Cluster Representative CSV 自动派生",
+    )
+    coverage_merge_parser.add_argument("--compute-quality-metrics", action="store_true", help="可选计算 purity / recall proxy 指标")
 
     inspect_parser = subparsers.add_parser("inspect-workdir", help="检查 LSF 工作目录产物规模")
     inspect_parser.add_argument("--manifest", required=True, help="manifest.json 路径")
@@ -1641,7 +1736,13 @@ def build_parser():
 
     local_parser = subparsers.add_parser("run-local", help="本地顺序模拟 LSF 流程")
     _add_common_runtime_args(local_parser)
-    local_parser.add_argument("--output", "-o", type=_csv_output_path_arg, required=True, help="最终结果 CSV 路径")
+    local_parser.add_argument(
+        "--output",
+        "-o",
+        type=_csv_output_path_arg,
+        required=True,
+        help="主 Exact Cluster Review CSV 路径；Cluster Representative CSV 自动派生",
+    )
     local_parser.add_argument("--distributed-coverage", action="store_true", help="本地顺序模拟 prepare-coverage/coverage-shard/merge-coverage")
     local_parser.add_argument("--coverage-shard-count", type=int, default=1, help="目标 coverage shard 数")
     local_parser.add_argument("--coverage-shard-size", type=int, default=0, help="每个 coverage shard 的 exact cluster 数")
@@ -1654,7 +1755,7 @@ def _final_stage_output_payload(output_path, result):
     stats = dict(result.get("final_verification_stats", {}) or {})
     breakdown = dict(result.get("final_verification_breakdown", {}) or {})
     reject_reasons = dict(breakdown.get("reject_reason_counts", {}) or {})
-    return {
+    payload = {
         "output": str(output_path),
         "exact_cluster_count": int(result.get("exact_cluster_count", 0)),
         "candidate_group_count": int(result.get("candidate_group_count", 0)),
@@ -1665,6 +1766,49 @@ def _final_stage_output_payload(output_path, result):
         "final_verification_reject_reason_counts": reject_reasons,
         "total_clusters": int(result.get("total_clusters", 0)),
     }
+    seed_coverage_audit = dict(result.get("lsf_manifest", {}).get("seed_coverage_audit", result.get("seed_coverage_audit", {})) or {})
+    if seed_coverage_audit:
+        payload["seed_coverage_audit"] = {
+            "target_edge_length_coverage_ratio": float(
+                seed_coverage_audit.get("target_edge_length_coverage_ratio", 0.0)
+            ),
+            "target_polygon_area_coverage_ratio": float(
+                seed_coverage_audit.get("target_polygon_area_coverage_ratio", 0.0)
+            ),
+            "weighted_pattern_type_coverage_ratio": float(
+                seed_coverage_audit.get("weighted_pattern_type_coverage_ratio", 0.0)
+            ),
+        }
+    quality_metrics = dict(result.get("quality_metrics", {}) or {})
+    if quality_metrics:
+        payload["quality_metrics"] = {
+            "singleton_ratio": float(quality_metrics.get("singleton_ratio", 0.0)),
+            "singleton_weight_ratio": float(quality_metrics.get("singleton_weight_ratio", 0.0)),
+            "representative_visual_purity": float(quality_metrics.get("representative_visual_purity", 0.0)),
+            "weighted_representative_visual_purity": float(
+                quality_metrics.get("weighted_representative_visual_purity", 0.0)
+            ),
+            "pairwise_geometry_purity": float(quality_metrics.get("pairwise_geometry_purity", 0.0)),
+            "weighted_pairwise_geometry_purity": float(quality_metrics.get("weighted_pairwise_geometry_purity", 0.0)),
+            "raw_coverage_graph_recall": float(quality_metrics.get("raw_coverage_graph_recall", 0.0)),
+            "trusted_fragmentation_recall": float(quality_metrics.get("trusted_fragmentation_recall", 0.0)),
+            "gate_rejected_edge_weight_ratio": float(quality_metrics.get("gate_rejected_edge_weight_ratio", 0.0)),
+            "review_merge_candidate_weight_ratio": float(
+                quality_metrics.get("review_merge_candidate_weight_ratio", 0.0)
+            ),
+            "safe_recall_merge_candidate_pair_count": int(
+                quality_metrics.get("safe_recall_merge_candidate_pair_count", 0)
+            ),
+            "safe_recall_merge_merged_pair_count": int(
+                quality_metrics.get("safe_recall_merge_merged_pair_count", 0)
+            ),
+            "safe_recall_merge_cluster_reduction": int(
+                quality_metrics.get("safe_recall_merge_cluster_reduction", 0)
+            ),
+        }
+    if result.get("cluster_representative_csv_path"):
+        payload["cluster_representative_csv"] = str(result.get("cluster_representative_csv_path"))
+    return payload
 
 
 def main():
@@ -1693,8 +1837,8 @@ def main():
     - grid_step_ratio 固定保持 0.5；当前版本不开放 0.6/0.7 采样密度实验入口。
     - prepare 会为每个 seed shard 写出 halo tile OAS；run-shard 优先读取 tile，避免每个 LSF job 重读全版图。
     - 大样本不要走集中式 merge；应使用 prepare-coverage、run-coverage-shard、merge-coverage 的分布式 coverage 流程。
-    - 最终用户主输出只支持 5 列 candidate group CSV；LSF 中间产物仍使用 JSON/NPZ，
-      _temp_runs 和 work_dir 产物不应提交进仓库。
+    - 最终用户主输出是 8 列 Exact Cluster Review CSV；Cluster Representative CSV 会自动派生。
+    - LSF 中间产物仍使用 JSON/NPZ，_temp_runs 和 work_dir 产物不应提交进仓库。
     """
 
     parser = build_parser()
@@ -1712,7 +1856,7 @@ def main():
         print(json.dumps({"shard_id": int(args.shard_id), "marker_count": summary["marker_count"]}, ensure_ascii=False))
         return 0
     if args.stage == "merge":
-        result = merge_stage(args.manifest, args.output)
+        result = merge_stage(args.manifest, args.output, args.compute_quality_metrics if getattr(args, "compute_quality_metrics", False) else None)
         print(json.dumps(_final_stage_output_payload(args.output or _read_json(args.manifest).get("result_output"), result), ensure_ascii=False))
         return 0
     if args.stage == "prepare-coverage":
@@ -1724,7 +1868,11 @@ def main():
         print(json.dumps({"coverage_shard_id": int(args.coverage_shard_id), "candidate_count": summary["candidate_count"]}, ensure_ascii=False))
         return 0
     if args.stage == "merge-coverage":
-        result = merge_coverage_stage(args.manifest, args.output)
+        result = merge_coverage_stage(
+            args.manifest,
+            args.output,
+            args.compute_quality_metrics if getattr(args, "compute_quality_metrics", False) else None,
+        )
         print(json.dumps(_final_stage_output_payload(args.output or _read_json(args.manifest).get("result_output"), result), ensure_ascii=False))
         return 0
     if args.stage == "inspect-workdir":

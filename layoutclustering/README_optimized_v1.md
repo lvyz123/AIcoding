@@ -30,7 +30,7 @@
 8. coverage 阶段先做 cheap shortlist，再做 lazy full prefilter，最后做 ACC/ECC 几何比较。
 9. 通过 greedy set cover 选择 representative candidate。
 10. 对 selected candidate 做统一 shift-witness final verification；所有 witness 都失败的成员回退成 singleton。
-11. 输出 CSV 主结果；每行对应一个 `CoverageCandidateGroup`，仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
+11. 输出 Exact Cluster Review CSV 和 Cluster Representative CSV；仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
 
 ## 运行方式
 
@@ -45,6 +45,7 @@ python layout_clustering_optimized_v1.py ./design.oas --output clustering_result
 python layout_clustering_optimized_v1.py ./input_dir --output clustering_results.csv
 python layout_clustering_optimized_v1.py ./design.oas --clip-size 1.35 --geometry-match-mode ecc --output clustering_results.csv
 python layout_clustering_optimized_v1.py ./design.oas --review-dir review_out --output clustering_results.csv
+python layout_clustering_optimized_v1.py ./design.oas --compute-quality-metrics --output clustering_results.csv
 python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --register-op 2413/0 2410/0 subtract 2411/0 --output clustering_results.csv
 ```
 
@@ -58,7 +59,7 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `--edge-tolerance-um`：`ecc` 模式的边界容差，默认 `0.02`。
 - `--pixel-size-nm`：栅格像素尺寸，默认 `10nm`。
 - `--review-dir`：导出 review 目录；指定后会物化 `samples/` 和 `representatives/`。
-- `--export-cluster-review-dir`：`--review-dir` 的兼容别名。
+- `--compute-quality-metrics`：可选计算 purity / recall proxy；默认关闭。开启后只打印全局摘要，并在 cluster representative CSV 追加 per-cluster quality 字段。
 - `--apply-layer-ops`：启用层操作预处理。
 - `--register-op SOURCE_LAYER TARGET_LAYER OPERATION RESULT_LAYER`：注册层操作规则。
 
@@ -86,6 +87,9 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `candidate_direction_counts`, `diagonal_candidate_count`
 - `selected_candidate_count`, `selected_diagonal_candidate_count`, `total_clusters`
 - `result_csv_row_count`, `result_csv_release_count`, `result_csv_columns`
+- `cluster_representative_csv_row_count`, `cluster_representative_csv_columns`
+- `quality_metrics_enabled`；开启 `--compute-quality-metrics` 时额外包含 `quality_metrics`
+- `seed_coverage_audit`、`seed_type_distribution`、`score_summary`
 - `prefilter_stats`, `coverage_detail_seconds`, `coverage_debug_stats`
 - `final_verification_stats`, `final_verification_detail_seconds`
 - `file_list`, `config`, `result_summary`
@@ -105,9 +109,6 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `seed_type`
 - `grid_ix`
 - `grid_iy`
-- `grid_cell_bbox`
-
-说明：在 `geometry-driven` 版本里，`grid_cell_bbox` 只是兼容别名，语义等同于 `seed_bbox`，不再表示真实全域 grid cell。
 
 ## 内部资源表示
 
@@ -153,10 +154,16 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 
 ### Result 流式输出
 
-- 大样本默认 `materialized_outputs=false` 时，`_build_results()` 会把每个 `CoverageCandidateGroup` 按最终 cluster 映射写入临时 CSV spool。
-- `_save_results()` 只把 CSV spool 复制到用户指定的 `.csv` 主输出路径，不再写旧主结果格式或 summary sidecar。
-- 主结果列固定为 `groupID,cluster_id,center_x_um,center_y_um,clip_size`。
-- `result_csv_row_count` 等于 `candidate_group_count`。
+- 大样本默认 `materialized_outputs=false` 时，`_build_results()` 会把每个 marker-defined exact cluster review group 按最终 cluster 映射写入临时 CSV spool。
+- `--output/-o` 指定主 Exact Cluster Review CSV 路径；每行对应一个 marker-defined exact cluster review group。
+- Cluster Representative CSV 不需要单独传参，会自动保存为 `<output_stem>_cluster_representatives.csv`，用于查看最终 cluster 的代表 clip center 与代表性评分。
+- Exact Cluster Review CSV 列固定为 `groupID,cluster_id,center_x_um,center_y_um,clip_size,group_weight,risk_score,risk_rank`。
+- Cluster Representative CSV 默认列为 `cluster_id,center_x_um,center_y_um,clip_size,cluster_size,cluster_weight,exact_cluster_count,representative_seed_type,shift_direction,shift_distance_um,representative_score,opc_center_score,risk_score,risk_rank`。
+- 开启 `--compute-quality-metrics` 后，Cluster Representative CSV 会额外追加 `purity_proxy,intra_cluster_fail_count,intra_cluster_sampled_pair_count`。
+- 默认磁盘输出只有这两个 CSV；seed coverage audit、seed type distribution、score summary 和全局 quality metrics 只打印到终端。
+- `risk_rank` 按 `risk_score` 降序生成，`1` 表示最优先 review / weak-point 关注。
+- `result_csv_row_count` 等于 `exact_cluster_count`。
+- `cluster_representative_csv_row_count` 等于 `total_clusters`。
 
 ### Candidate Group Packed-at-Rest
 

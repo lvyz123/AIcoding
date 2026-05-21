@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import gdstk
@@ -18,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import layout_clustering_optimized_v2_lsf as v2_lsf
+import mainline_lsf
 from layout_utils_lsf import _write_oas_library
 from mainline_lsf import CandidateClip
 from mainline_lsf import ExactCluster
@@ -35,7 +37,7 @@ from mainline_lsf import evaluate_candidate_coverage
 from mainline_lsf import generate_candidates_for_cluster
 from mainline_lsf import prepare_layout
 from mainline_lsf import load_candidate_bundle_buckets_for_candidates
-from mainline_lsf import load_coverage_shard_metadata
+from mainline_lsf import load_coverage_shard_csr_metadata
 from mainline_lsf import load_shard_records
 from mainline_lsf import save_candidate_bundle_index
 from mainline_lsf import save_candidate_bundle_index_from_accumulator
@@ -60,7 +62,7 @@ def _write_oas(path, polygons):
     _write_oas_library(lib, str(path))
 
 
-def _make_candidate(candidate_id, origin_exact_cluster_id, bitmap, shift_direction="base"):
+def _make_candidate(candidate_id, origin_exact_cluster_id, bitmap, shift_direction="base", origin_seed_type="unknown"):
     """构造 coverage 单测使用的最小 CandidateClip。"""
 
     clip_hash, _ = _canonical_bitmap_hash(bitmap)
@@ -78,6 +80,7 @@ def _make_candidate(candidate_id, origin_exact_cluster_id, bitmap, shift_directi
         shift_distance_um=0.0,
         coverage=coverage,
         source_marker_id="marker_%s" % int(origin_exact_cluster_id),
+        origin_seed_type=str(origin_seed_type),
     )
 
 
@@ -113,6 +116,35 @@ def _make_shiftable_exact_cluster():
         metadata={},
     )
     return ExactCluster(0, "exact_shiftable", record, [record])
+
+
+def _make_exact_cluster(cluster_id, bitmap, seed_type=mainline_lsf.SEED_TYPE_ARRAY):
+    """构造 quality/safe-recall 单测使用的 exact cluster。"""
+
+    clip_bitmap = np.ascontiguousarray(bitmap, dtype=bool)
+    clip_hash, _ = _canonical_bitmap_hash(clip_bitmap)
+    record = MarkerRecord(
+        marker_id="marker_%s" % int(cluster_id),
+        source_path="synthetic.oas",
+        source_name="synthetic.oas",
+        marker_bbox=(0.0, 0.0, 1.0, 1.0),
+        marker_center=(0.5 + float(cluster_id), 0.5),
+        clip_bbox=(0.0, 0.0, 1.0, 1.0),
+        expanded_bbox=(0.0, 0.0, 1.0, 1.0),
+        clip_bbox_q=(0, 0, int(clip_bitmap.shape[1]), int(clip_bitmap.shape[0])),
+        expanded_bbox_q=(0, 0, int(clip_bitmap.shape[1]), int(clip_bitmap.shape[0])),
+        marker_bbox_q=(0, 0, int(clip_bitmap.shape[1]), int(clip_bitmap.shape[0])),
+        shift_limits_px={"x": (0, 0), "y": (0, 0)},
+        clip_bitmap=clip_bitmap,
+        expanded_bitmap=clip_bitmap,
+        clip_hash=clip_hash,
+        expanded_hash=clip_hash,
+        clip_area=float(np.count_nonzero(clip_bitmap)),
+        seed_weight=1,
+        exact_cluster_id=int(cluster_id),
+        metadata={"seed_type": str(seed_type)},
+    )
+    return ExactCluster(int(cluster_id), "exact_%s" % int(cluster_id), record, [record])
 
 
 def _make_dummy_exact_cluster(cluster_id, area_px):
@@ -178,6 +210,57 @@ class OptimizedV2LsfTests(unittest.TestCase):
             parser.parse_args(["run-local", "input.oas", "--work-dir", "work", "--output", "result.json"])
         with self.assertRaises(SystemExit):
             parser.parse_args(["run-local", "input.oas", "--work-dir", "work", "--output", "result.csv", "--format", "json"])
+        args = parser.parse_args(
+            ["run-local", "input.oas", "--work-dir", "work", "--output", "result.csv", "--compute-quality-metrics"]
+        )
+        self.assertTrue(args.compute_quality_metrics)
+        merge_args = parser.parse_args(
+            ["merge", "--manifest", "manifest.json", "--output", "result.csv", "--compute-quality-metrics"]
+        )
+        self.assertTrue(merge_args.compute_quality_metrics)
+        coverage_args = parser.parse_args(
+            ["merge-coverage", "--manifest", "manifest.json", "--output", "result.csv", "--compute-quality-metrics"]
+        )
+        self.assertTrue(coverage_args.compute_quality_metrics)
+
+    def test_config_json_rejects_removed_keys(self):
+        """config JSON 不再接受旧方案字段或未知字段。"""
+
+        parser = v2_lsf.build_parser()
+        removed_config = self.temp_root / "removed_config.json"
+        removed_config.write_text(
+            json.dumps({"clip_size_um": 1.0, "strict_signature_threshold": 0.7, "grid_step_ratio": 0.7}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        removed_args = parser.parse_args(
+            [
+                "run-local",
+                "input.oas",
+                "--config",
+                str(removed_config),
+                "--work-dir",
+                "work",
+                "--output",
+                "result.csv",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "strict_signature_threshold"):
+            v2_lsf._config_payload(removed_args)
+
+        unknown_config = self.temp_root / "unknown_config.json"
+        unknown_config.write_text(json.dumps({"clip_size_um": 1.0, "unused_knob": True}, ensure_ascii=False), encoding="utf-8")
+        unknown_args = parser.parse_args(
+            [
+                "prepare",
+                "input.oas",
+                "--config",
+                str(unknown_config),
+                "--work-dir",
+                "work",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "unused_knob"):
+            v2_lsf._config_payload(unknown_args)
 
     def test_legacy_bitmap_prefilter_removed(self):
         """v2_lsf coverage 不再保留旧的 bitmap/XOR prefilter 路径。"""
@@ -190,6 +273,19 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertNotIn("_cheap_coverage_prefilter", function_names)
         self.assertNotIn("_xor_coverage_prefilter", function_names)
         self.assertEqual(function_name_list.count("evaluate_candidate_coverage"), 1)
+
+    def test_legacy_candidate_group_csv_writer_removed(self):
+        """v2_lsf 主 CSV 只保留 exact cluster review writer，不保留旧 candidate group writer。"""
+
+        source = (SCRIPT_DIR / "mainline_lsf.py").read_text(encoding="utf-8")
+        tree = ast.parse(source, filename="mainline_lsf.py")
+        function_names = set(node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef))
+        self.assertNotIn("_csv_candidate_group_row", function_names)
+        self.assertNotIn("_candidate_group_representatives_from_candidates", function_names)
+        self.assertNotIn("_candidate_group_representatives_from_index", function_names)
+        self.assertIn("write_result_csv", function_names)
+        self.assertNotIn("write_result_csv_exact_review", function_names)
+        self.assertNotIn("candidate group 粒度写成 5 列主 CSV", source)
 
     def test_exact_hash_direct_skips_descriptor_and_geometry_cache(self):
         """exact hash 直通应覆盖同 hash origin，且不触发 full descriptor/geometry cache。"""
@@ -218,6 +314,100 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertEqual(stats["geometry_cache_group_count"], 0)
         self.assertIn("coverage_detail_seconds", stats)
         self.assertTrue(all(value >= 0.0 for value in stats["coverage_detail_seconds"].values()))
+
+    def test_donut_degenerate_coverage_requires_strict_graph(self):
+        """donut 退化匹配不应直接 auto-pass，应进入 strict graph 过滤并记录统计。"""
+
+        bitmap_source = np.zeros((8, 8), dtype=bool)
+        bitmap_source[2:6, 2:6] = True
+        bitmap_target = bitmap_source.copy()
+        bitmap_target[0, 0] = True
+        cand_source = _make_candidate("cand_source", 0, bitmap_source, origin_seed_type=mainline_lsf.SEED_TYPE_RESIDUAL)
+        cand_target = _make_candidate("cand_target", 1, bitmap_target, origin_seed_type=mainline_lsf.SEED_TYPE_RESIDUAL)
+        bundle = next(iter(mainline_lsf.build_candidate_match_bundles([cand_source, cand_target]).values()))
+        source_idx = next(idx for idx, candidate in enumerate(bundle["representatives"]) if candidate.candidate_id == "cand_source")
+        target_idx = next(idx for idx, candidate in enumerate(bundle["representatives"]) if candidate.candidate_id == "cand_target")
+        detail_seconds = mainline_lsf._empty_coverage_detail_seconds()
+        debug_stats = mainline_lsf._empty_coverage_debug_stats()
+
+        def fake_values(bundle_arg, indices, tol_px, key, detail_arg, debug_arg):
+            del bundle_arg, tol_px, detail_arg, debug_arg
+            if key == "dilated_area_px":
+                return np.full(int(len(indices)), 100, dtype=np.int64)
+            if key == "donut_area_px":
+                return np.zeros(int(len(indices)), dtype=np.int64)
+            raise AssertionError(key)
+
+        def fake_matrix(bundle_arg, indices, tol_px, key, detail_arg, debug_arg):
+            del bundle_arg, tol_px, detail_arg, debug_arg
+            width = int(np.packbits(np.zeros((8, 8), dtype=np.uint8).reshape(-1)).size)
+            if key == "packed_dilated":
+                return np.full((int(len(indices)), width), 255, dtype=np.uint8)
+            if key == "packed":
+                return np.zeros((int(len(indices)), width), dtype=np.uint8)
+            raise AssertionError(key)
+
+        with mock.patch.object(mainline_lsf, "_bundle_geometry_values", side_effect=fake_values):
+            with mock.patch.object(mainline_lsf, "_bundle_geometry_matrix", side_effect=fake_matrix):
+                with mock.patch.object(mainline_lsf, "_strict_graph_gate_reason", return_value=(False, "graph_signature")):
+                    matched = mainline_lsf._matched_target_indices(
+                        bundle["candidate_groups"][int(source_idx)],
+                        bundle,
+                        np.asarray([int(target_idx)], dtype=np.int64),
+                        {
+                            "geometry_match_mode": "ecc",
+                            "area_match_ratio": 0.96,
+                            "edge_tolerance_um": 0.02,
+                            "pixel_size_nm": 20,
+                        },
+                        1,
+                        detail_seconds,
+                        debug_stats,
+                    )
+
+        self.assertEqual(matched.size, 0)
+        self.assertEqual(debug_stats["donut_auto_pass_pair_count"], 1)
+        self.assertEqual(debug_stats["donut_degenerate_strict_graph_reject_count"], 1)
+
+    def test_long_shape_cross_seed_guard_requires_high_signature(self):
+        """long_shape_path 跨 seed type 覆盖时应额外要求更高 signature 相似度。"""
+
+        bitmap_long = np.zeros((10, 10), dtype=bool)
+        bitmap_long[4:6, 1:9] = True
+        bitmap_array = np.zeros((10, 10), dtype=bool)
+        bitmap_array[2:8, 2:8] = True
+        cand_long = _make_candidate("cand_long", 0, bitmap_long, origin_seed_type=mainline_lsf.SEED_TYPE_LONG)
+        cand_array = _make_candidate("cand_array", 1, bitmap_array, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        bundle = next(iter(mainline_lsf.build_candidate_match_bundles([cand_long, cand_array]).values()))
+        source_idx = next(idx for idx, candidate in enumerate(bundle["representatives"]) if candidate.candidate_id == "cand_long")
+        target_idx = next(idx for idx, candidate in enumerate(bundle["representatives"]) if candidate.candidate_id == "cand_array")
+        detail_seconds = mainline_lsf._empty_coverage_detail_seconds()
+        debug_stats = mainline_lsf._empty_coverage_debug_stats()
+
+        with mock.patch.object(mainline_lsf, "_strict_graph_gate_reason", return_value=(True, "pass")):
+            with mock.patch.object(mainline_lsf, "_graph_signature_similarity", return_value=0.50):
+                rejected = mainline_lsf._apply_long_shape_cross_seed_guard(
+                    bundle["candidate_groups"][int(source_idx)],
+                    bundle,
+                    np.asarray([int(target_idx)], dtype=np.int64),
+                    detail_seconds,
+                    debug_stats,
+                )
+        self.assertEqual(rejected.size, 0)
+        self.assertEqual(debug_stats["long_shape_cross_seed_guard_reject_count"], 1)
+
+        debug_stats = mainline_lsf._empty_coverage_debug_stats()
+        with mock.patch.object(mainline_lsf, "_strict_graph_gate_reason", return_value=(True, "pass")):
+            with mock.patch.object(mainline_lsf, "_graph_signature_similarity", return_value=0.95):
+                accepted = mainline_lsf._apply_long_shape_cross_seed_guard(
+                    bundle["candidate_groups"][int(source_idx)],
+                    bundle,
+                    np.asarray([int(target_idx)], dtype=np.int64),
+                    detail_seconds,
+                    debug_stats,
+                )
+        self.assertEqual(accepted.tolist(), [int(target_idx)])
+        self.assertEqual(debug_stats["long_shape_cross_seed_guard_pass_count"], 1)
 
     def test_candidate_bundle_fill_bucket_loads_only_neighbor_bins(self):
         """大 shape candidate bundle 应按 fill 子桶加载，减少 coverage shard 目标集合。"""
@@ -321,6 +511,11 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertTrue(Path(manifest["seed_file"]).exists())
         self.assertIn("seed_audit", manifest)
         self.assertTrue(Path(manifest["seed_audit"]["output_json"]).exists())
+        self.assertIn("seed_coverage_audit", manifest)
+        self.assertIn("target_edge_length_coverage_ratio", manifest["seed_coverage_audit"])
+        self.assertIn("target_polygon_area_coverage_ratio", manifest["seed_coverage_audit"])
+        self.assertIn("weighted_pattern_type_coverage_ratio", manifest["seed_coverage_audit"])
+        self.assertNotIn("clip_window_union_coverage_ratio", manifest["seed_coverage_audit"])
         self.assertIn("spatial_index_stats", manifest)
         self.assertGreaterEqual(manifest["spatial_index_stats"]["max_bin_load"], 0)
         self.assertIn("seed_type_counts", manifest["seed_stats"])
@@ -347,6 +542,36 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertEqual(run_shards["command_count"], manifest["shard_count"])
         self.assertTrue(Path(run_shards["command_file"]).exists())
         self.assertTrue(Path(run_shards["bsub_template"]).exists())
+
+    def test_seed_coverage_audit_uses_target_pattern_metrics(self):
+        """coverage audit 应按 target 边长、面积和 pattern type 权重统计。"""
+
+        input_oas = self.temp_root / "coverage_audit.oas"
+        _write_oas(
+            input_oas,
+            [
+                gdstk.rectangle((0.0, 0.0), (1.0, 1.0), layer=1, datatype=0),
+                gdstk.rectangle((2.0, 0.0), (3.0, 1.0), layer=1, datatype=0),
+                gdstk.rectangle((4.0, 0.0), (4.4, 0.2), layer=1, datatype=0),
+            ],
+        )
+        layout_index = prepare_layout(str(input_oas))
+        seeds = [
+            GridSeedCandidate((0.5, 0.5), (0.0, 0.0, 1.0, 1.0), 0, 0, seed_type="unit"),
+            GridSeedCandidate((0.6, 0.5), (0.1, 0.0, 1.1, 1.0), 1, 0, seed_type="overlap"),
+            GridSeedCandidate((2.0, 0.5), (1.5, 0.0, 2.5, 1.0), 2, 0, seed_type="partial"),
+            GridSeedCandidate((3.5, 0.5), (3.0, 0.0, 4.0, 1.0), 3, 0, seed_type="tiny_touch"),
+        ]
+        audit = mainline_lsf._seed_coverage_audit(layout_index, seeds, 1.0, 0.5)
+
+        self.assertIn("target_edge_length_coverage_ratio", audit)
+        self.assertIn("target_polygon_area_coverage_ratio", audit)
+        self.assertIn("weighted_pattern_type_coverage_ratio", audit)
+        self.assertNotIn("clip_window_union_coverage_ratio", audit)
+        self.assertLessEqual(audit["target_polygon_area_covered"], audit["target_polygon_area_total"])
+        self.assertGreater(audit["target_polygon_area_coverage_ratio"], 0.0)
+        self.assertLess(audit["target_polygon_area_coverage_ratio"], 1.0)
+        self.assertGreaterEqual(audit["covered_pattern_type_count"], 1)
 
     def test_merge_stage_rejects_large_central_exact_cluster_count(self):
         """大样本不应误走集中式 merge。"""
@@ -440,23 +665,17 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertEqual(manifest["seed_stats"]["grid_step_ratio"], 0.5)
         self.assertEqual(manifest["config"]["grid_step_ratio"], 0.5)
 
-    def test_seed_json_preserves_seed_type(self):
-        """seed JSON 应保留 seed_type，同时兼容旧 payload。"""
+    def test_seed_json_requires_current_fields(self):
+        """seed JSON 必须携带当前 geometry-driven 字段。"""
 
         seed = GridSeedCandidate((1.0, 2.0), (0.5, 1.5, 1.5, 2.5), 3, 4, 7, "array_representative")
         restored = GridSeedCandidate.from_json(seed.to_json())
         self.assertEqual(restored.seed_type, "array_representative")
         self.assertEqual(restored.bucket_weight, 7)
-        legacy = GridSeedCandidate.from_json(
-            {
-                "center": [0.0, 0.0],
-                "seed_bbox": [-0.5, -0.5, 0.5, 0.5],
-                "grid_ix": 0,
-                "grid_iy": 0,
-                "bucket_weight": 1,
-            }
-        )
-        self.assertEqual(legacy.seed_type, "residual_local_grid")
+        payload = seed.to_json()
+        del payload["seed_type"]
+        with self.assertRaises(KeyError):
+            GridSeedCandidate.from_json(payload)
 
     def test_candidate_generation_adds_bounded_diagonal_shifts(self):
         """systematic shift 应包含少量 diagonal 候选，并保持诊断统计可读。"""
@@ -722,14 +941,22 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertTrue(output.exists())
         rows = _read_csv_rows(output)
         self.assertEqual(list(rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
-        self.assertEqual(len(rows), result["candidate_group_count"])
+        self.assertEqual(len(rows), result["exact_cluster_count"])
         self.assertNotIn("output_format", result)
-        self.assertEqual(result["result_csv_row_count"], result["candidate_group_count"])
+        self.assertEqual(result["result_csv_row_count"], result["exact_cluster_count"])
         self.assertEqual(result["result_csv_columns"], v2_lsf.CSV_OUTPUT_COLUMNS)
-        self.assertEqual(v2_lsf.CSV_OUTPUT_COLUMNS, ["groupID", "cluster_id", "center_x_um", "center_y_um", "clip_size"])
+        self.assertEqual(
+            v2_lsf.CSV_OUTPUT_COLUMNS,
+            ["groupID", "cluster_id", "center_x_um", "center_y_um", "clip_size", "group_weight", "risk_score", "risk_rank"],
+        )
         self.assertEqual([int(row["groupID"]) for row in rows], list(range(1, len(rows) + 1)))
         self.assertTrue(all(int(row["cluster_id"]) >= 1 for row in rows))
         self.assertTrue(all(float(row["clip_size"]) == 1.0 for row in rows))
+        representative_csv = Path(result["cluster_representative_csv_path"])
+        self.assertTrue(representative_csv.exists())
+        representative_rows = _read_csv_rows(representative_csv)
+        self.assertEqual(len(representative_rows), result["total_clusters"])
+        self.assertEqual(len(result["cluster_representative_csv_columns"]), len(representative_rows[0].keys()))
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
         self.assertEqual(result["seed_strategy"], "geometry_driven")
         self.assertGreater(result["marker_count"], 0)
@@ -748,6 +975,8 @@ class OptimizedV2LsfTests(unittest.TestCase):
         payload = v2_lsf._final_stage_output_payload(str(output), result)
         self.assertIn("final_verification_reject_reason_counts", payload)
         self.assertIn("candidate_group_count", payload)
+        self.assertIn("cluster_representative_csv", payload)
+        self.assertIn("seed_coverage_audit", payload)
         self.assertNotIn("max_rss_mb", payload)
         with self.assertRaises(ValueError):
             v2_lsf.merge_stage(str(manifest_path), str(self.temp_root / "merge_result.json"))
@@ -864,22 +1093,38 @@ class OptimizedV2LsfTests(unittest.TestCase):
             self.assertEqual(raw_payload["coverage_storage"], "npz_offsets_v1")
             self.assertEqual(raw_payload["source_fill_bin_count"], coverage_shard["source_fill_bin_count"])
             self.assertTrue(all("coverage" not in candidate for candidate in raw_payload["candidates"]))
-            metadata_candidates, _ = load_coverage_shard_metadata(
+            shard_metadata, coverage_offsets, coverage_values, _ = load_coverage_shard_csr_metadata(
                 coverage_shard["output_json"],
                 coverage_shard["output_npz"],
             )
-            self.assertTrue(all(candidate.clip_bitmap is None for candidate in metadata_candidates))
-            self.assertTrue(any(candidate.coverage for candidate in metadata_candidates))
+            self.assertEqual(len(shard_metadata) + 1, int(coverage_offsets.size))
+            self.assertGreater(int(coverage_values.size), 0)
+            bad_npz = self.temp_root / ("coverage_without_csr_%s.npz" % coverage_shard["coverage_shard_id"])
+            np.savez_compressed(str(bad_npz), candidate_bitmaps=np.zeros((0, 0, 0), dtype=bool))
+            with self.assertRaises(RuntimeError):
+                load_coverage_shard_csr_metadata(coverage_shard["output_json"], bad_npz)
 
+        broken_manifest = json.loads(json.dumps(manifest))
+        broken_manifest["exact_member_index"]["output_json"] = str(
+            Path(broken_manifest["exact_member_index"]["output_json"]).with_suffix(".missing")
+        )
+        manifest_path.write_text(json.dumps(broken_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            v2_lsf.merge_coverage_stage(str(manifest_path), str(self.temp_root / "missing_exact_members.csv"))
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         distributed = v2_lsf.merge_coverage_stage(str(manifest_path), str(distributed_output))
         distributed_rows = _read_csv_rows(distributed_output)
         self.assertEqual(list(distributed_rows[0].keys()), v2_lsf.CSV_OUTPUT_COLUMNS)
-        self.assertEqual(len(distributed_rows), distributed["candidate_group_count"])
+        self.assertEqual(len(distributed_rows), distributed["exact_cluster_count"])
         self.assertNotIn("output_format", distributed)
-        self.assertEqual(distributed["result_csv_row_count"], distributed["candidate_group_count"])
+        self.assertEqual(distributed["result_csv_row_count"], distributed["exact_cluster_count"])
         self.assertEqual(distributed["candidate_group_count"], manifest["candidate_bundle_index"]["candidate_group_count"])
         self.assertEqual([int(row["groupID"]) for row in distributed_rows], list(range(1, len(distributed_rows) + 1)))
         self.assertTrue(all(int(row["cluster_id"]) >= 1 for row in distributed_rows))
+        representative_csv = Path(distributed["cluster_representative_csv_path"])
+        self.assertTrue(representative_csv.exists())
+        representative_rows = _read_csv_rows(representative_csv)
+        self.assertEqual(len(representative_rows), distributed["total_clusters"])
         self.assertEqual(distributed["total_clusters"], baseline["total_clusters"])
         self.assertEqual(distributed["exact_cluster_count"], baseline["exact_cluster_count"])
         self.assertEqual(distributed["candidate_count"], baseline["candidate_count"])
@@ -959,8 +1204,9 @@ class OptimizedV2LsfTests(unittest.TestCase):
         result = v2_lsf.run_local_stage(str(input_oas), str(work_dir), str(output), config, [], shard_count=2, shard_size=1)
         rows = _read_csv_rows(output)
         self.assertEqual(result["pipeline_mode"], v2_lsf.PIPELINE_MODE)
-        self.assertEqual(len(rows), result["candidate_group_count"])
+        self.assertEqual(len(rows), result["exact_cluster_count"])
         self.assertGreaterEqual(result["selected_candidate_count"], 1)
+        self.assertTrue(Path(result["cluster_representative_csv_path"]).exists())
         self.assertTrue(all("distance_worst_case_score" in cluster for cluster in result["clusters"]))
         self.assertTrue(all(cluster["distance_worst_case_score"] >= 0.0 for cluster in result["clusters"]))
         self.assertNotIn("contact_pair_seed_count", result)
@@ -980,6 +1226,162 @@ class OptimizedV2LsfTests(unittest.TestCase):
         )
         self.assertEqual(distributed["total_clusters"], result["total_clusters"])
         self.assertGreater(distributed["lsf_manifest"]["coverage_shard_count"], 0)
+
+    def test_quality_metrics_extend_representative_csv(self):
+        """开启 quality metrics 时应补充全局指标和 representative CSV 质量列。"""
+
+        input_oas = self.temp_root / "quality.oas"
+        _write_oas(
+            input_oas,
+            [
+                gdstk.rectangle((0.05, 0.05), (0.25, 0.25), layer=1, datatype=0),
+                gdstk.rectangle((0.55, 0.05), (0.75, 0.25), layer=1, datatype=0),
+                gdstk.rectangle((1.05, 0.05), (1.25, 0.25), layer=1, datatype=0),
+            ],
+        )
+        work_dir = self.temp_root / "work_quality"
+        output = self.temp_root / "quality_result.csv"
+        config = {
+            "clip_size_um": 1.0,
+            "geometry_match_mode": "ecc",
+            "area_match_ratio": 0.96,
+            "edge_tolerance_um": 0.02,
+            "pixel_size_nm": 20,
+            "compute_quality_metrics": True,
+        }
+        result = v2_lsf.run_local_stage(str(input_oas), str(work_dir), str(output), config, [], shard_count=1, shard_size=1)
+        self.assertTrue(result["quality_metrics_enabled"])
+        self.assertIn("quality_metrics", result)
+        self.assertIn("representative_visual_purity", result["quality_metrics"])
+        self.assertIn("weighted_representative_visual_purity", result["quality_metrics"])
+        self.assertIn("pairwise_geometry_purity", result["quality_metrics"])
+        self.assertIn("raw_coverage_graph_recall", result["quality_metrics"])
+        self.assertIn("trusted_fragmentation_recall", result["quality_metrics"])
+        self.assertIn("review_merge_candidate_weight_ratio", result["quality_metrics"])
+        self.assertIn("safe_recall_merge_cluster_reduction", result["quality_metrics"])
+        self.assertNotIn("sampled_purity_score", result["quality_metrics"])
+        self.assertNotIn("overmerge_suspect_count", result["quality_metrics"])
+        self.assertNotIn("member_to_member_transitivity_purity", result["quality_metrics"])
+        self.assertNotIn("recall_proxy_score", result["quality_metrics"])
+        representative_rows = _read_csv_rows(result["cluster_representative_csv_path"])
+        self.assertIn("representative_visual_pass_ratio", representative_rows[0])
+        self.assertIn("representative_visual_fail_count", representative_rows[0])
+        self.assertIn("representative_visual_checked_count", representative_rows[0])
+        self.assertIn("representative_visual_sample_status", representative_rows[0])
+        self.assertIn("pairwise_geometry_purity", representative_rows[0])
+        self.assertIn("pairwise_geometry_fail_count", representative_rows[0])
+        self.assertIn("pairwise_geometry_sampled_pair_count", representative_rows[0])
+        self.assertIn("pairwise_geometry_sample_status", representative_rows[0])
+        self.assertIn("overmerge_score", representative_rows[0])
+        self.assertIn("overmerge_reason", representative_rows[0])
+        self.assertNotIn("purity_proxy", representative_rows[0])
+        self.assertNotIn("intra_cluster_fail_count", representative_rows[0])
+        self.assertNotIn("intra_cluster_sampled_pair_count", representative_rows[0])
+        self.assertNotIn("purity_sample_status", representative_rows[0])
+
+    def test_safe_recall_merge_requires_candidate_union_and_strict_verification(self):
+        """集中式 safe recall merge 必须同时满足 union coverage 与 strict verification。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(0, bitmap), _make_exact_cluster(1, bitmap)]
+        base0 = _make_candidate("base_0", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        base1 = _make_candidate("base_1", 1, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merge_candidate = _make_candidate("merge_0_1", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merge_candidate.coverage = set([0, 1])
+        candidates = [base0, base1, merge_candidate]
+        selected = [base0, base1]
+        config = {
+            "clip_size_um": 1.0,
+            "geometry_match_mode": "ecc",
+            "edge_tolerance_um": 0.0,
+            "pixel_size_nm": 125,
+            "compute_quality_metrics": True,
+        }
+        result = mainline_lsf.build_compact_result_exact_review(
+            None,
+            exact_clusters,
+            candidates,
+            selected,
+            {"candidate_group_count": len(candidates)},
+            config,
+            {},
+        )
+
+        self.assertEqual(result["total_clusters"], 1)
+        self.assertEqual(result["quality_metrics"]["safe_recall_merge_candidate_pair_count"], 1)
+        self.assertEqual(result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 1)
+        self.assertEqual(result["quality_metrics"]["safe_recall_merge_cluster_reduction"], 1)
+
+        rejected_candidate = _make_candidate("reject_0_1", 0, np.zeros_like(bitmap), origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        rejected_candidate.coverage = set([0, 1])
+        rejected_result = mainline_lsf.build_compact_result_exact_review(
+            None,
+            exact_clusters,
+            [base0, base1, rejected_candidate],
+            selected,
+            {"candidate_group_count": 3},
+            dict(config),
+            {},
+        )
+        self.assertEqual(rejected_result["total_clusters"], 2)
+        self.assertEqual(rejected_result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 0)
+        self.assertIn(
+            "strict_verification_reject",
+            rejected_result["quality_metrics"]["safe_recall_merge_reject_reason_counts"],
+        )
+
+    def test_safe_recall_merge_loads_distributed_candidate_bitmap(self):
+        """分布式 safe recall merge 应从 coverage shard bitmap 位置按需恢复候选。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(0, bitmap), _make_exact_cluster(1, bitmap)]
+        base0 = _make_candidate("dist_base_0", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        base1 = _make_candidate("dist_base_1", 1, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merge_candidate = _make_candidate("dist_merge_0_1", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        base0.coverage = set([0])
+        base1.coverage = set([1])
+        merge_candidate.coverage = set([0, 1])
+        source_candidates = [base0, base1, merge_candidate]
+        candidate_records = [mainline_lsf.candidate_metadata(candidate, include_coverage=False) for candidate in source_candidates]
+        coverage_offsets = np.asarray([0, 1, 2, 4], dtype=np.int64)
+        coverage_values = np.asarray([0, 1, 0, 1], dtype=np.int64)
+        npz_path = self.temp_root / "safe_recall_candidate_bitmaps.npz"
+        np.savez_compressed(
+            str(npz_path),
+            candidate_bitmaps=np.asarray([candidate.clip_bitmap for candidate in source_candidates], dtype=bool),
+        )
+        bitmap_locations = dict(
+            (
+                str(candidate.candidate_id),
+                {"npz_path": str(npz_path), "bitmap_index": int(idx)},
+            )
+            for idx, candidate in enumerate(source_candidates)
+        )
+        config = {
+            "clip_size_um": 1.0,
+            "geometry_match_mode": "ecc",
+            "edge_tolerance_um": 0.0,
+            "pixel_size_nm": 125,
+            "compute_quality_metrics": True,
+        }
+        result = mainline_lsf.build_compact_result_exact_review(
+            None,
+            exact_clusters,
+            candidate_records,
+            [base0, base1],
+            {"candidate_group_count": len(candidate_records)},
+            config,
+            {},
+            coverage_offsets=coverage_offsets,
+            coverage_values=coverage_values,
+            candidate_bitmap_locations=bitmap_locations,
+        )
+
+        self.assertEqual(result["total_clusters"], 1)
+        self.assertEqual(result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 1)
+        self.assertEqual(result["quality_metrics"]["safe_recall_merge_cluster_reduction"], 1)
 
     def test_layer_operation_lsf_path(self):
         """LSF layer operation 应保留 result layer 并排除 helper-only layer。"""
@@ -1024,6 +1426,7 @@ class OptimizedV2LsfTests(unittest.TestCase):
             manifest["shards"][0]["output_npz"],
         )
         self.assertGreater(len(records), 0)
+        self.assertTrue(all("grid_cell_bbox" not in record.metadata for record in records))
         self.assertTrue(payload["apply_layer_operations"])
         self.assertEqual(payload["registered_layer_operations"], [["10/0", "11/0", "subtract", "13/0"]])
         self.assertEqual(payload["effective_pattern_layers"], [[13, 0]])
