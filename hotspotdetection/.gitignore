@@ -1,0 +1,3 @@
+# 本目录只提交算法代码、文档和测试；运行生成的缓存与跨 run 记忆库不进 git。
+pattern_memory_store/
+_notrain_marker_cache/
