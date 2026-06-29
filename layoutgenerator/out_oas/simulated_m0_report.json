@@ -1,0 +1,95 @@
+{
+  "version": "simulated_m0_v1",
+  "config": {
+    "width_um": 1000.0,
+    "height_um": 1000.0,
+    "tile_size_um": 10.0,
+    "array_margin_um": 80.0,
+    "sense_corridor_um": 20.0,
+    "half_array_rows": 41,
+    "array_cols": 84,
+    "m0_layer": 0,
+    "m0_datatype": 0,
+    "output_path": "D:\\AIcoding\\layoutgenerator\\out_oas\\simulated_m0.oas",
+    "report_path": "D:\\AIcoding\\layoutgenerator\\out_oas\\simulated_m0_report.json"
+  },
+  "array": {
+    "array_cols": 84,
+    "half_array_rows": 41,
+    "total_array_tile_instances": 6888,
+    "lower_array_origin_um": {
+      "x": 80.0,
+      "y": 80.0
+    },
+    "upper_array_origin_um": {
+      "x": 80.0,
+      "y": 510.0
+    }
+  },
+  "tile_polygon_counts": {
+    "DRAM_M0_TILE_00": {
+      "track": 29,
+      "landing_pad": 21,
+      "bridge": 15,
+      "line_end": 7
+    },
+    "DRAM_M0_TILE_01": {
+      "track": 29,
+      "landing_pad": 24,
+      "bridge": 15,
+      "line_end": 6
+    },
+    "DRAM_M0_TILE_02": {
+      "track": 29,
+      "landing_pad": 21,
+      "bridge": 15,
+      "line_end": 5
+    },
+    "DRAM_M0_TILE_03": {
+      "track": 29,
+      "landing_pad": 21,
+      "bridge": 15,
+      "line_end": 5
+    }
+  },
+  "variant_usage": {
+    "DRAM_M0_TILE_00": 1764,
+    "DRAM_M0_TILE_01": 1764,
+    "DRAM_M0_TILE_02": 1680,
+    "DRAM_M0_TILE_03": 1680
+  },
+  "top_feature_counts": {
+    "sense_corridor": {
+      "corridor_rail": 4,
+      "feed_pad": 2470,
+      "local_bridge": 248
+    },
+    "subarray_boundaries": {
+      "vertical_boundary": 16,
+      "horizontal_boundary": 8,
+      "boundary_tap": 336
+    },
+    "periphery": {
+      "edge_frame": 4,
+      "decoder_rail": 252,
+      "corner_mesh": 24
+    }
+  },
+  "verification": {
+    "polygon_layer_pairs": [
+      [
+        0,
+        0
+      ]
+    ],
+    "top_bbox_um": {
+      "x0": 0.0,
+      "y0": 0.0,
+      "x1": 1000.0000000000001,
+      "y1": 1000.0000000000001,
+      "width": 1000.0000000000001,
+      "height": 1000.0000000000001
+    },
+    "instanced_m0_polygons": 496106
+  }
+}
