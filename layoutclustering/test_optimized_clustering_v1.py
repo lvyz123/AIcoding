@@ -1128,6 +1128,27 @@ class OptimizedGridV1Tests(unittest.TestCase):
 
         self.assertEqual([candidate.candidate_id for candidate in selected], ["cand_exact_hash"])
 
+    def test_greedy_cover_prefers_exact_count_before_weight(self) -> None:
+        """set cover 先减少 cluster 数，再用权重做次级排序。"""
+
+        bitmap = np.zeros((10, 10), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        pair_bitmap = np.zeros((10, 10), dtype=bool)
+        pair_bitmap[3:7, 3:7] = True
+        records = [
+            _record("heavy", bitmap, seed_weight=100),
+            _record("small_a", bitmap, seed_weight=1),
+            _record("small_b", bitmap, seed_weight=1),
+        ]
+        exact_clusters = [ExactCluster(idx, record, [record]) for idx, record in enumerate(records)]
+        runner = self._make_runner()
+        heavy_candidate = _candidate("cand_heavy", bitmap, origin_exact_cluster_id=0, shift_direction="base", coverage=(0,))
+        small_pair_candidate = _candidate("cand_small_pair", pair_bitmap, origin_exact_cluster_id=1, shift_direction="base", coverage=(1, 2))
+
+        selected = runner._greedy_cover(_coverage_groups(runner, [heavy_candidate, small_pair_candidate]), exact_clusters)
+
+        self.assertEqual([candidate.candidate_id for candidate in selected], ["cand_small_pair", "cand_heavy"])
+
     def test_assign_exact_clusters_uses_0429_tiebreak_without_seed_family(self) -> None:
         bitmap_candidate = np.zeros((10, 10), dtype=bool)
         bitmap_candidate[2:5, 2:5] = True
@@ -1462,8 +1483,8 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertEqual(metrics["singleton_trusted_mergeable_edge_count"], 1)
         self.assertAlmostEqual(metrics["singleton_trusted_mergeable_weight_ratio"], 0.5)
 
-    def test_review_merge_candidates_are_tiered_for_safe_merge(self) -> None:
-        """review merge 候选应分 high/medium/low，并且只作为 safe merge 内部证据。"""
+    def test_review_merge_candidates_are_tiered_for_singleton_absorption(self) -> None:
+        """review merge 候选应分 high/medium/low，并优先保留 singleton 目标。"""
 
         def bitmap_for(idx: int) -> np.ndarray:
             bitmap = np.zeros((8, 8), dtype=bool)
@@ -1544,12 +1565,18 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertEqual(rows[0]["source_cluster_id"], 1)
         self.assertEqual(rows[0]["target_cluster_id"], 2)
         self.assertTrue(rows[0]["target_is_singleton"])
+        self.assertTrue(rows[0]["endpoint_is_singleton"])
+        absorption_rows = metrics["singleton_absorption_candidate_rows"]
+        self.assertEqual([row["confidence_tier"] for row in absorption_rows], ["high", "medium"])
+        self.assertEqual(metrics["singleton_total_count"], 5)
+        self.assertEqual(metrics["singleton_with_candidate_count"], 2)
+        self.assertAlmostEqual(metrics["singleton_candidate_coverage_ratio"], 2.0 / 5.0)
         pair_rows = metrics["review_merge_cluster_pair_rows"]
         self.assertEqual(len(pair_rows), 4)
         self.assertEqual(pair_rows[0]["source_cluster_id"], 1)
         self.assertEqual(pair_rows[0]["target_cluster_id"], 2)
         self.assertEqual(pair_rows[0]["pair_edge_weight_sum"], 1)
-        self.assertEqual(pair_rows[0]["pair_review_bucket"], "safe_recall_candidate")
+        self.assertEqual(pair_rows[0]["pair_review_bucket"], "singleton_absorption_candidate")
         self.assertEqual([len(assigned) for _, assigned in cluster_units], [2, 1, 1, 1, 1, 1])
 
     def test_review_merge_candidate_rows_are_bounded_for_low_memory(self) -> None:
@@ -1577,7 +1604,8 @@ class OptimizedGridV1Tests(unittest.TestCase):
                         "shift_distance_um": 0.01,
                         "confidence_tier": tier,
                         "confidence_reason": "same_seed_small_shift",
-                        "target_is_singleton": False,
+                        "target_is_singleton": idx == 0,
+                        "endpoint_is_singleton": idx == 0,
                         "source_cluster_exact_count": 1,
                         "target_cluster_exact_count": 1,
                     },
@@ -1588,7 +1616,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
 
         self.assertEqual(len(top_rows), 6)
         self.assertEqual(Counter(str(row["confidence_tier"]) for row in top_rows), Counter({"high": 2, "medium": 2, "low": 2}))
-        self.assertEqual([int(row["edge_weight"]) for row in top_rows if row["confidence_tier"] == "high"], [10, 7])
+        self.assertEqual([int(row["edge_weight"]) for row in top_rows if row["confidence_tier"] == "high"], [1, 10])
         self.assertEqual([int(row["edge_weight"]) for row in top_rows if row["confidence_tier"] == "medium"], [8, 5])
         self.assertEqual([int(row["edge_weight"]) for row in top_rows if row["confidence_tier"] == "low"], [9, 6])
 
@@ -1603,6 +1631,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
                 "edge_weight": 10,
                 "confidence_tier": "high",
                 "target_is_singleton": True,
+                "endpoint_is_singleton": True,
             },
             {
                 "source_cluster_id": 2,
@@ -1611,6 +1640,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
                 "edge_weight": 5,
                 "confidence_tier": "high",
                 "target_is_singleton": False,
+                "endpoint_is_singleton": True,
             },
             {
                 "source_cluster_id": 1,
@@ -1692,29 +1722,33 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertEqual(pair_by_target[2]["row_count"], 2)
         self.assertEqual(pair_by_target[2]["unique_candidate_count"], 2)
         self.assertEqual(pair_by_target[2]["singleton_target_row_count"], 1)
-        self.assertEqual(pair_by_target[2]["pair_review_bucket"], "safe_recall_candidate")
+        self.assertEqual(pair_by_target[2]["singleton_endpoint_row_count"], 2)
+        self.assertEqual(pair_by_target[2]["pair_review_bucket"], "singleton_absorption_candidate")
         self.assertEqual(pair_by_target[3]["pair_review_bucket"], "overmerge_touching_candidate")
         self.assertEqual(pair_by_target[4]["pair_review_bucket"], "high_shift_touching_candidate")
         self.assertEqual(pair_by_target[5]["pair_review_bucket"], "low_confidence_candidate")
 
-    def test_safe_recall_merge_accepts_full_union_verified_pair(self) -> None:
-        """safe recall merge 只在 candidate 覆盖并验证完整 union 时合并。"""
+    def test_singleton_absorption_accepts_high_confidence_verified_singleton(self) -> None:
+        """high-confidence 证据且 strict verification 通过时，应吸收 singleton。"""
 
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
         exact_clusters = [
-            ExactCluster(idx, _record(f"safe{idx}", bitmap, seed_weight=1), [_record(f"safe{idx}", bitmap, seed_weight=1)])
-            for idx in range(2)
+            ExactCluster(idx, _record(f"absorb{idx}", bitmap, seed_weight=1), [_record(f"absorb{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
         ]
         runner = self._make_runner(compute_quality_metrics=True)
-        base0 = _candidate("base_safe_0", bitmap, origin_exact_cluster_id=0, shift_direction="base")
-        base1 = _candidate("base_safe_1", bitmap, origin_exact_cluster_id=1, shift_direction="base")
-        merge_candidate = _candidate("safe_merge", bitmap, origin_exact_cluster_id=0, shift_direction="east", coverage={0, 1})
-        runner._base_candidate_by_exact_id = {0: base0, 1: base1}
+        target = _candidate("target_absorb", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_absorb", bitmap, origin_exact_cluster_id=2, shift_direction="base")
 
         def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
-            del exact_cluster
-            return (str(candidate.candidate_id) == "safe_merge" and bool(strict), "unit_test", "base")
+            return (
+                str(candidate.candidate_id) == "target_absorb"
+                and int(exact_cluster.exact_cluster_id) == 2
+                and bool(strict),
+                "unit_test",
+                "base",
+            )
 
         runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
         quality_metrics = {
@@ -1722,174 +1756,1097 @@ class OptimizedGridV1Tests(unittest.TestCase):
                 {
                     "source_cluster_id": 1,
                     "target_cluster_id": 2,
-                    "candidate_id": "safe_merge",
+                    "candidate_id": "review_absorb",
                     "confidence_tier": "high",
-                    "target_exact_cluster_id": 1,
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
                     "edge_weight": 10,
                 }
             ],
-            "review_merge_cluster_pair_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "ok",
-                    "target_overmerge_reason": "ok",
-                }
-            ],
+            "cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}},
         }
-
-        merged_units, metrics = runner._apply_safe_recall_merge(
-            [(base0, [exact_clusters[0]]), (base1, [exact_clusters[1]])],
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
             quality_metrics,
-            _coverage_groups(runner, [merge_candidate]),
         )
 
         self.assertEqual(len(merged_units), 1)
-        self.assertEqual(str(merged_units[0][0].candidate_id), "safe_merge")
-        self.assertEqual([int(cluster.exact_cluster_id) for cluster in merged_units[0][1]], [0, 1])
-        self.assertEqual(metrics["safe_recall_merge_attempted_pair_count"], 1)
-        self.assertEqual(metrics["safe_recall_merge_merged_pair_count"], 1)
-        self.assertEqual(metrics["safe_recall_merge_cluster_reduction"], 1)
+        self.assertEqual(str(merged_units[0][0].candidate_id), "target_absorb")
+        self.assertEqual([int(cluster.exact_cluster_id) for cluster in merged_units[0][1]], [0, 1, 2])
+        self.assertEqual(metrics["singleton_absorption_candidate_edge_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_singleton_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_cluster_reduction"], 1)
 
-    def test_safe_recall_merge_rejects_partial_coverage_and_risky_endpoint(self) -> None:
-        """coverage 不完整或端点有 overmerge reason 时不做 safe merge。"""
+    def test_singleton_absorption_rejects_severe_target_cluster(self) -> None:
+        """目标代表点已有 visual fail 时，不应吸收 singleton。"""
 
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
         exact_clusters = [
-            ExactCluster(idx, _record(f"reject{idx}", bitmap, seed_weight=1), [_record(f"reject{idx}", bitmap, seed_weight=1)])
+            ExactCluster(idx, _record(f"risky{idx}", bitmap, seed_weight=1), [_record(f"risky{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_risky", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_risky", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (True, "unit_test", "base")
+        )
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_risky",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_visual_pass_ratio": 0.5,
+                    "representative_visual_fail_count": 1,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_reason": "low_representative_visual_quality",
+                    "overmerge_score": 0.6,
+                },
+                1: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_attempted_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_reject_reason_counts"]["target_representative_visual_fail"], 1)
+
+    def test_singleton_absorption_allows_low_pairwise_clean_target(self) -> None:
+        """低 pairwise target 只要代表点 visual 干净，仍允许尝试吸收 singleton。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"clean{idx}", bitmap, seed_weight=1), [_record(f"clean{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_clean_pairwise", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_clean_pairwise", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (True, "unit_test", "base")
+        )
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_clean_pairwise",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "pairwise_geometry_purity": 0.30,
+                    "overmerge_reason": "low_pairwise_geometry_purity",
+                    "overmerge_score": 0.30,
+                },
+                1: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_strict_merged_count"], 1)
+
+    def test_singleton_absorption_rejects_strict_verification_fail(self) -> None:
+        """目标代表点 strict 和 normal 都不能解释 singleton 时，应拒绝吸收。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"strict{idx}", bitmap, seed_weight=1), [_record(f"strict{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_strict", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_strict", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (False, "unit_test_reject", "base")
+        )
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_strict",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}},
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_checked_exact_count"], 2)
+        self.assertEqual(metrics["singleton_absorption_reject_reason_counts"]["normal_visual_verification_reject"], 1)
+
+    def test_singleton_absorption_uses_guarded_normal_visual_fallback(self) -> None:
+        """strict 拒绝但 normal visual 通过时，应在目标护栏内吸收 singleton。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"normal{idx}", bitmap, seed_weight=1), [_record(f"normal{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_normal", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_normal", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+
+        def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
+            del candidate, exact_cluster
+            return (not strict), "unit_test_normal", "base"
+
+        runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_normal",
+                    "confidence_tier": "medium",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                },
+                1: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_strict_merged_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_normal_visual_merged_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_checked_exact_count"], 2)
+
+    def test_singleton_absorption_descriptor_rescue_adds_missing_candidate(self) -> None:
+        """没有 review edge 的 singleton 应通过 descriptor nearest rescue 获得候选。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"rescue{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"rescue{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_descriptor_rescue", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_descriptor_rescue", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_rescue", "base")
+        )
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+                1: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_descriptor_rescue_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_rescue_agreement_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"]["strong_descriptor_graph_agreement"], 1)
+        self.assertEqual(metrics["singleton_with_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_no_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"]["strong_descriptor_graph_agreement"], 1)
+        self.assertEqual(metrics["singleton_absorption_rescue_selected_by_source"], {"strong_descriptor_graph_agreement": 1})
+        self.assertEqual(metrics["singleton_absorption_strong_agreement_candidate_count"], 1)
+
+    def test_singleton_absorption_agreement_ranks_before_descriptor_only(self) -> None:
+        """descriptor 与 graph 双源一致的 target 应优先于单 descriptor target。"""
+
+        agreement_bitmap = np.zeros((8, 8), dtype=bool)
+        agreement_bitmap[2:6, 2:6] = True
+        descriptor_bitmap = np.zeros((8, 8), dtype=bool)
+        descriptor_bitmap[0:2, 0:2] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(
+                    f"agreement_rank{idx}",
+                    agreement_bitmap if idx >= 2 else descriptor_bitmap,
+                    seed_weight=1,
+                    seed_type=optimized.SEED_TYPE_RESIDUAL,
+                ),
+                [
+                    _record(
+                        f"agreement_rank{idx}",
+                        agreement_bitmap if idx >= 2 else descriptor_bitmap,
+                        seed_weight=1,
+                        seed_type=optimized.SEED_TYPE_RESIDUAL,
+                    )
+                ],
+            )
+            for idx in range(5)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        descriptor_target = _candidate(
+            "target_descriptor_only",
+            descriptor_bitmap,
+            origin_exact_cluster_id=0,
+            shift_direction="base",
+        )
+        agreement_target = _candidate(
+            "target_agreement",
+            agreement_bitmap,
+            origin_exact_cluster_id=2,
+            shift_direction="base",
+        )
+        singleton = _candidate(
+            "singleton_agreement",
+            agreement_bitmap,
+            origin_exact_cluster_id=4,
+            shift_direction="base",
+        )
+        attempted: list[str] = []
+
+        def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
+            del exact_cluster
+            attempted.append(str(candidate.candidate_id))
+            return str(candidate.candidate_id) == "target_agreement" and bool(strict), "unit_test_agreement", "base"
+
+        def descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            if str(owner.candidate_id) == "target_agreement":
+                return np.asarray([0.90, 0.10], dtype=np.float32)
+            return np.asarray([1.0, 0.0], dtype=np.float32)
+
+        runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                1: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                2: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=descriptor_vector):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [
+                    (descriptor_target, [exact_clusters[0], exact_clusters[1]]),
+                    (agreement_target, [exact_clusters[2], exact_clusters[3]]),
+                    (singleton, [exact_clusters[4]]),
+                ],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(attempted, ["target_agreement"])
+        self.assertEqual(metrics["singleton_absorption_rescue_agreement_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"]["strong_descriptor_graph_agreement"], 1)
+
+    def test_singleton_absorption_strong_agreement_ranks_before_weak_agreement(self) -> None:
+        """context 近的双源一致候选应优先于 context 远的弱一致候选。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"strong_agreement{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"strong_agreement{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(5)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        weak_target = _candidate("target_weak_agreement", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        strong_target = _candidate("target_strong_agreement", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        singleton = _candidate("singleton_strong_agreement", bitmap, origin_exact_cluster_id=4, shift_direction="base")
+        attempted: list[str] = []
+
+        def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
+            del exact_cluster
+            attempted.append(str(candidate.candidate_id))
+            return str(candidate.candidate_id) == "target_strong_agreement" and bool(strict), "unit_test_strong", "base"
+
+        def context_distance(left: CandidateClip, right: CandidateClip) -> float:
+            del left
+            return 0.40 if str(right.candidate_id) == "target_weak_agreement" else 0.0
+
+        runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                1: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                2: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+            },
+        }
+
+        with mock.patch.object(optimized, "_singleton_context_distance", side_effect=context_distance):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [
+                    (weak_target, [exact_clusters[0], exact_clusters[1]]),
+                    (strong_target, [exact_clusters[2], exact_clusters[3]]),
+                    (singleton, [exact_clusters[4]]),
+                ],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(attempted, ["target_strong_agreement"])
+        self.assertEqual(metrics["singleton_absorption_strong_agreement_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"]["strong_descriptor_graph_agreement"], 1)
+
+    def test_singleton_absorption_prunes_descriptor_only_candidates(self) -> None:
+        """descriptor-only rescue 只保留生成诊断，不进入 absorption 尝试。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"descriptor_limit{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"descriptor_limit{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(7)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        targets = [
+            _candidate(f"target_descriptor_limit_{idx}", bitmap, origin_exact_cluster_id=idx * 2, shift_direction="base")
+            for idx in range(3)
+        ]
+        singleton = _candidate("singleton_descriptor_limit", bitmap, origin_exact_cluster_id=6, shift_direction="base")
+
+        def descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            if "singleton" in str(owner.candidate_id):
+                return np.asarray([1.0, 0.0], dtype=np.float32)
+            return np.asarray([0.99, 0.01], dtype=np.float32)
+
+        signature_calls = {"count": 0}
+
+        def far_signature_embedding(desc: object) -> np.ndarray:
+            del desc
+            signature_calls["count"] += 1
+            if signature_calls["count"] <= len(targets):
+                return np.asarray([1.0, 0.0], dtype=np.float32)
+            return np.asarray([0.0, 1.0], dtype=np.float32)
+
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_descriptor_limit", "base")
+        )
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                1: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                2: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                3: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=descriptor_vector), mock.patch.object(
+            optimized,
+            "_signature_embedding",
+            side_effect=far_signature_embedding,
+        ):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [
+                    (targets[0], [exact_clusters[0], exact_clusters[1]]),
+                    (targets[1], [exact_clusters[2], exact_clusters[3]]),
+                    (targets[2], [exact_clusters[4], exact_clusters[5]]),
+                    (singleton, [exact_clusters[6]]),
+                ],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 4)
+        self.assertEqual(metrics["singleton_absorption_descriptor_rescue_candidate_count"], 3)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"], {})
+        self.assertEqual(metrics["singleton_absorption_attempted_count"], 0)
+
+    def test_singleton_absorption_prunes_graph_only_candidate_after_descriptor_miss(self) -> None:
+        """descriptor 未命中时，纯 graph rescue 只统计生成量，不进入 absorption 尝试。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"graph_rescue{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"graph_rescue{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_graph_rescue", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_graph_rescue", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_graph_rescue", "base")
+        )
+
+        def far_descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            return np.asarray([1.0, 0.0], dtype=np.float32) if "target" in str(owner.candidate_id) else np.asarray([0.0, 1.0], dtype=np.float32)
+
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+                1: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=far_descriptor_vector), mock.patch.object(
+            optimized,
+            "_singleton_context_distance",
+            return_value=0.40,
+        ):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_descriptor_rescue_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"], {})
+        self.assertEqual(metrics["singleton_with_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_no_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_attempted_by_source"], {})
+        self.assertNotIn(optimized.SEED_TYPE_RESIDUAL, metrics["singleton_candidate_by_seed_type"])
+
+    def test_singleton_absorption_context_close_graph_rescue_is_strict_only_candidate(self) -> None:
+        """descriptor 未命中时，context-close graph rescue 可作为 strict-only 小候选。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"graph_context{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"graph_context{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_graph_context", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_graph_context", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_graph_context", "base")
+        )
+
+        def far_descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            return np.asarray([1.0, 0.0], dtype=np.float32) if "target" in str(owner.candidate_id) else np.asarray([0.0, 1.0], dtype=np.float32)
+
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+                1: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=far_descriptor_vector):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_descriptor_rescue_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_context_close_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_attempted_by_source"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 0)
+
+    def test_singleton_absorption_graph_rescue_does_not_override_review_candidate(self) -> None:
+        """已有 review edge 时，graph rescue 不应重复覆盖同一 singleton。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"review_priority{idx}", bitmap, seed_weight=1), [_record(f"review_priority{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_review_priority", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_review_priority", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (True, "unit_test_review_priority", "base")
+        )
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_priority",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+                1: {"representative_seed_type": optimized.SEED_TYPE_RESIDUAL, "overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"], {"review_edge": 1})
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"], {"review_edge": 1})
+
+    def test_singleton_absorption_prunes_graph_only_before_normal_visual_guard(self) -> None:
+        """context-close graph rescue strict 失败后不允许 normal visual fallback。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(
+                idx,
+                _record(f"graph_guard{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL),
+                [_record(f"graph_guard{idx}", bitmap, seed_weight=1, seed_type=optimized.SEED_TYPE_RESIDUAL)],
+            )
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_graph_guard", bitmap, origin_exact_cluster_id=0, shift_direction="right")
+        singleton = _candidate("singleton_graph_guard", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        target.shift_distance_um = 0.5
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (not strict, "unit_test_graph_guard", "base")
+        )
+
+        def far_descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            return np.asarray([1.0, 0.0], dtype=np.float32) if "target" in str(owner.candidate_id) else np.asarray([0.0, 1.0], dtype=np.float32)
+
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_LONG,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.5,
+                },
+                1: {
+                    "representative_seed_type": optimized.SEED_TYPE_RESIDUAL,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.0,
+                },
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=far_descriptor_vector):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_context_close_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_source_counts"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_attempted_by_source"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 0)
+        self.assertEqual(
+            metrics["singleton_absorption_reject_reason_by_source"]["graph_rescue_context_close"][
+                "strict_verification_reject"
+            ],
+            1,
+        )
+
+    def test_singleton_absorption_graph_rescue_skips_incompatible_seed_type(self) -> None:
+        """graph rescue 距离很近但 seed type 不兼容时，不应生成候选。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"graph_incompatible{idx}", bitmap, seed_weight=1), [_record(f"graph_incompatible{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_graph_incompatible", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        singleton = _candidate("singleton_graph_incompatible", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+
+        def far_descriptor_vector(owner: CandidateClip) -> np.ndarray:
+            return np.asarray([1.0, 0.0], dtype=np.float32) if "target" in str(owner.candidate_id) else np.asarray([0.0, 1.0], dtype=np.float32)
+
+        quality_metrics = {
+            "singleton_total_count": 1,
+            "cluster_quality_by_index": {
+                0: {"representative_seed_type": optimized.SEED_TYPE_ARRAY, "overmerge_reason": "ok"},
+                1: {"representative_seed_type": optimized.SEED_TYPE_LONG, "overmerge_reason": "ok"},
+            },
+        }
+
+        with mock.patch.object(optimized, "_normalized_cheap_feature_vector", side_effect=far_descriptor_vector):
+            merged_units, metrics = runner._apply_singleton_absorption(
+                [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+                quality_metrics,
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_graph_rescue_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_candidate_edge_count"], 0)
+        self.assertEqual(metrics["singleton_no_candidate_by_seed_type"][optimized.SEED_TYPE_LONG], 1)
+
+    def test_singleton_absorption_long_shape_target_allows_strict_pass(self) -> None:
+        """long-shape large-shift target 不应在 strict verification 前被挡掉。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"long_strict{idx}", bitmap, seed_weight=1), [_record(f"long_strict{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_long_strict", bitmap, origin_exact_cluster_id=0, shift_direction="right")
+        singleton = _candidate("singleton_long_strict", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        target.shift_distance_um = 0.5
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_long_strict", "base")
+        )
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_long_strict",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_LONG,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.5,
+                },
+                1: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_strict_merged_count"], 1)
+        self.assertNotIn("target_long_shape_large_shift", metrics["singleton_absorption_reject_reason_counts"])
+
+    def test_singleton_absorption_long_shape_target_blocks_normal_fallback(self) -> None:
+        """long-shape large-shift target 只在 normal fallback 前触发护栏。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"long_normal{idx}", bitmap, seed_weight=1), [_record(f"long_normal{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        target = _candidate("target_long_normal", bitmap, origin_exact_cluster_id=0, shift_direction="right")
+        singleton = _candidate("singleton_long_normal", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        target.shift_distance_um = 0.5
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (not strict, "unit_test_long_normal", "base")
+        )
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_long_normal",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 2,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {
+                    "representative_seed_type": optimized.SEED_TYPE_LONG,
+                    "representative_visual_pass_ratio": 1.0,
+                    "representative_visual_fail_count": 0,
+                    "representative_visual_checked_count": 2,
+                    "overmerge_score": 0.0,
+                    "overmerge_reason": "ok",
+                    "shift_distance_um": 0.5,
+                },
+                1: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            quality_metrics,
+        )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_reject_reason_counts"]["target_long_shape_large_shift"], 1)
+
+    def test_singleton_microcluster_merges_size3_strict_clique_without_chaining(self) -> None:
+        """三个 singleton 两两 strict 通过时，应合成一个 size-3 clique。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"single{idx}", bitmap, seed_weight=1), [_record(f"single{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        base0 = _candidate("singleton_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        base1 = _candidate("singleton_b", bitmap, origin_exact_cluster_id=1, shift_direction="base")
+        base2 = _candidate("singleton_c", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 2,
+                    "candidate_id": "review_singletons",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 1,
+                    "edge_weight": 10,
+                }
+            ],
+            "cluster_quality_by_index": {
+                0: {"overmerge_reason": "ok"},
+                1: {"overmerge_reason": "ok"},
+                2: {"overmerge_reason": "ok"},
+            },
+        }
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(base0, [exact_clusters[0]]), (base1, [exact_clusters[1]]), (base2, [exact_clusters[2]])],
+            quality_metrics,
+        )
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_candidate_edge_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_pair_candidate_count"], 3)
+        self.assertEqual(metrics["singleton_microcluster_clique_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_merged_count"], 2)
+        self.assertEqual(metrics["singleton_microcluster_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_attempted_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_clique_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_merged_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_clique_merged_count"], 2)
+
+    def test_singleton_microcluster_rejects_broken_clique_then_pair_fallback(self) -> None:
+        """size-3 clique 有任意一对 strict 失败时不能成团，但允许后续 pair fallback。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"clique_reject{idx}", bitmap, seed_weight=1), [_record(f"clique_reject{idx}", bitmap, seed_weight=1)])
+            for idx in range(3)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        base0 = _candidate("singleton_clique_reject_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        base1 = _candidate("singleton_clique_reject_b", bitmap, origin_exact_cluster_id=1, shift_direction="base")
+        base2 = _candidate("singleton_clique_reject_c", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+
+        def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
+            if str(candidate.candidate_id) == "singleton_clique_reject_a" and int(exact_cluster.exact_cluster_id) == 2:
+                return False, "unit_test_clique_reject", "base"
+            return bool(strict), "unit_test_clique_reject", "base"
+
+        runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(base0, [exact_clusters[0]]), (base1, [exact_clusters[1]]), (base2, [exact_clusters[2]])],
+            {"cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}, 2: {"overmerge_reason": "ok"}}},
+        )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_microcluster_clique_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_merged_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_merged_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_merged_count"], 0)
+        self.assertEqual(
+            metrics["singleton_microcluster_reject_reason_by_source"]["singleton_microcluster_clique"][
+                "strict_verification_reject"
+            ],
+            1,
+        )
+
+    def test_singleton_microcluster_pair_fallback_merges_two_singletons(self) -> None:
+        """不足 size-3 clique 时，pair microcluster 仍可 strict-only 合并。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"micro_pair{idx}", bitmap, seed_weight=1), [_record(f"micro_pair{idx}", bitmap, seed_weight=1)])
             for idx in range(2)
         ]
         runner = self._make_runner(compute_quality_metrics=True)
-        base0 = _candidate("base_reject_0", bitmap, origin_exact_cluster_id=0, shift_direction="base")
-        base1 = _candidate("base_reject_1", bitmap, origin_exact_cluster_id=1, shift_direction="base")
-        partial_candidate = _candidate("partial_merge", bitmap, origin_exact_cluster_id=0, shift_direction="east", coverage={0})
-        runner._base_candidate_by_exact_id = {0: base0, 1: base1}
+        left = _candidate("singleton_micro_pair_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        right = _candidate("singleton_micro_pair_b", bitmap, origin_exact_cluster_id=1, shift_direction="base")
         runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
-            lambda candidate, exact_cluster, *, strict: (True, "unit_test", "base")
-        )
-        quality_metrics = {
-            "review_merge_candidate_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "candidate_id": "partial_merge",
-                    "confidence_tier": "high",
-                    "target_exact_cluster_id": 1,
-                    "edge_weight": 10,
-                }
-            ],
-            "review_merge_cluster_pair_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "ok",
-                    "target_overmerge_reason": "ok",
-                }
-            ],
-        }
-
-        merged_units, metrics = runner._apply_safe_recall_merge(
-            [(base0, [exact_clusters[0]]), (base1, [exact_clusters[1]])],
-            quality_metrics,
-            _coverage_groups(runner, [partial_candidate]),
+            lambda candidate, exact_cluster, *, strict: (bool(strict), "unit_test_micro_pair", "base")
         )
 
-        self.assertEqual(len(merged_units), 2)
-        self.assertEqual(metrics["safe_recall_merge_merged_pair_count"], 0)
-        self.assertEqual(metrics["safe_recall_merge_reject_reason_counts"]["candidate_missing_union_coverage"], 1)
-
-        risky_metrics = {
-            "review_merge_candidate_rows": quality_metrics["review_merge_candidate_rows"],
-            "review_merge_cluster_pair_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "low_pairwise_geometry_purity",
-                    "target_overmerge_reason": "ok",
-                }
-            ],
-        }
-        risky_candidate = _candidate("partial_merge", bitmap, origin_exact_cluster_id=0, shift_direction="east", coverage={0})
-        merged_units, metrics = runner._apply_safe_recall_merge(
-            [(base0, [exact_clusters[0]]), (base1, [exact_clusters[1]])],
-            risky_metrics,
-            _coverage_groups(runner, [risky_candidate]),
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(left, [exact_clusters[0]]), (right, [exact_clusters[1]])],
+            {"cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}}},
         )
-        self.assertEqual(len(merged_units), 2)
-        self.assertEqual(metrics["safe_recall_merge_attempted_pair_count"], 0)
-        self.assertEqual(metrics["safe_recall_merge_reject_reason_counts"]["endpoint_overmerge_reason"], 1)
 
-    def test_safe_recall_merge_keeps_disjoint_pairs_only(self) -> None:
-        """第一版 safe merge 不做链式 component 合并，避免大 component 风险。"""
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_candidate_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_candidate_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_merged_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_attempted_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_pair_merged_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_merged_count"], 0)
+
+    def test_singleton_microcluster_rejects_without_normal_fallback(self) -> None:
+        """singleton microcluster strict 失败后不允许 normal visual fallback。"""
 
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
         exact_clusters = [
-            ExactCluster(idx, _record(f"chain{idx}", bitmap, seed_weight=1), [_record(f"chain{idx}", bitmap, seed_weight=1)])
+            ExactCluster(idx, _record(f"micro_reject{idx}", bitmap, seed_weight=1), [_record(f"micro_reject{idx}", bitmap, seed_weight=1)])
+            for idx in range(2)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        left = _candidate("singleton_micro_reject_a", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        right = _candidate("singleton_micro_reject_b", bitmap, origin_exact_cluster_id=1, shift_direction="base")
+        runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
+            lambda candidate, exact_cluster, *, strict: (False, "unit_test_micro_reject", "base")
+        )
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(left, [exact_clusters[0]]), (right, [exact_clusters[1]])],
+            {"cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}}},
+        )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_microcluster_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_merged_count"], 0)
+        self.assertEqual(metrics["singleton_microcluster_pair_attempted_count"], 1)
+        self.assertEqual(metrics["singleton_microcluster_pair_merged_count"], 0)
+        self.assertEqual(metrics["singleton_absorption_normal_visual_attempted_count"], 0)
+        self.assertEqual(
+            metrics["singleton_microcluster_reject_reason_by_source"]["singleton_microcluster"]["strict_verification_reject"],
+            1,
+        )
+
+    def test_singleton_absorption_accepts_source_side_singleton_candidate(self) -> None:
+        """singleton 在 source 端时，也应识别为可吸收端点。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"source_side{idx}", bitmap, seed_weight=1), [_record(f"source_side{idx}", bitmap, seed_weight=1)])
             for idx in range(3)
         ]
         runner = self._make_runner(compute_quality_metrics=True)
-        bases = [
-            _candidate(f"base_chain_{idx}", bitmap, origin_exact_cluster_id=idx, shift_direction="base")
-            for idx in range(3)
-        ]
-        merge_ab = _candidate("merge_ab", bitmap, origin_exact_cluster_id=0, shift_direction="east", coverage={0, 1})
-        merge_bc = _candidate("merge_bc", bitmap, origin_exact_cluster_id=1, shift_direction="east", coverage={1, 2})
-        runner._base_candidate_by_exact_id = {idx: bases[idx] for idx in range(3)}
+        singleton = _candidate("singleton_source_side", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        target = _candidate("target_source_side", bitmap, origin_exact_cluster_id=1, shift_direction="base")
         runner._cached_candidate_matches_exact_result = (  # type: ignore[method-assign]
-            lambda candidate, exact_cluster, *, strict: (True, "unit_test", "base")
+            lambda candidate, exact_cluster, *, strict: (True, "unit_test_source_side", "base")
         )
         quality_metrics = {
             "review_merge_candidate_rows": [
                 {
                     "source_cluster_id": 1,
                     "target_cluster_id": 2,
-                    "candidate_id": "merge_ab",
-                    "confidence_tier": "high",
+                    "candidate_id": "review_source_side",
+                    "confidence_tier": "medium",
+                    "source_exact_cluster_id": 0,
                     "target_exact_cluster_id": 1,
                     "edge_weight": 10,
-                },
-                {
-                    "source_cluster_id": 2,
-                    "target_cluster_id": 3,
-                    "candidate_id": "merge_bc",
-                    "confidence_tier": "high",
-                    "target_exact_cluster_id": 2,
-                    "edge_weight": 9,
-                },
+                }
             ],
-            "review_merge_cluster_pair_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "ok",
-                    "target_overmerge_reason": "ok",
-                },
-                {
-                    "source_cluster_id": 2,
-                    "target_cluster_id": 3,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "ok",
-                    "target_overmerge_reason": "ok",
-                },
-            ],
+            "cluster_quality_by_index": {0: {"overmerge_reason": "ok"}, 1: {"overmerge_reason": "ok"}},
         }
 
-        merged_units, metrics = runner._apply_safe_recall_merge(
-            [(bases[idx], [exact_clusters[idx]]) for idx in range(3)],
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [(singleton, [exact_clusters[0]]), (target, [exact_clusters[1], exact_clusters[2]])],
             quality_metrics,
-            _coverage_groups(runner, [merge_ab, merge_bc]),
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(str(merged_units[0][0].candidate_id), "target_source_side")
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 1)
+
+    def test_singleton_absorption_prefers_higher_edge_weight_target(self) -> None:
+        """同一个 singleton 有多个目标时，应优先尝试 edge weight 更高的目标。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [
+            ExactCluster(idx, _record(f"multi{idx}", bitmap, seed_weight=1), [_record(f"multi{idx}", bitmap, seed_weight=1)])
+            for idx in range(5)
+        ]
+        runner = self._make_runner(compute_quality_metrics=True)
+        low_target = _candidate("target_low_weight", bitmap, origin_exact_cluster_id=0, shift_direction="base")
+        high_target = _candidate("target_high_weight", bitmap, origin_exact_cluster_id=2, shift_direction="base")
+        singleton = _candidate("singleton_multi", bitmap, origin_exact_cluster_id=4, shift_direction="base")
+        attempted: list[str] = []
+
+        def fake_cached(candidate: CandidateClip, exact_cluster: ExactCluster, *, strict: bool) -> tuple[bool, str, str]:
+            del exact_cluster, strict
+            attempted.append(str(candidate.candidate_id))
+            return str(candidate.candidate_id) == "target_high_weight", "unit_test", "base"
+
+        runner._cached_candidate_matches_exact_result = fake_cached  # type: ignore[method-assign]
+        quality_metrics = {
+            "review_merge_candidate_rows": [
+                {
+                    "source_cluster_id": 1,
+                    "target_cluster_id": 3,
+                    "candidate_id": "review_low",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 0,
+                    "target_exact_cluster_id": 4,
+                    "edge_weight": 3,
+                },
+                {
+                    "source_cluster_id": 2,
+                    "target_cluster_id": 3,
+                    "candidate_id": "review_high",
+                    "confidence_tier": "high",
+                    "source_exact_cluster_id": 2,
+                    "target_exact_cluster_id": 4,
+                    "edge_weight": 10,
+                },
+            ],
+            "cluster_quality_by_index": {
+                0: {"overmerge_reason": "ok"},
+                1: {"overmerge_reason": "ok"},
+                2: {"overmerge_reason": "ok"},
+            },
+        }
+
+        merged_units, metrics = runner._apply_singleton_absorption(
+            [
+                (low_target, [exact_clusters[0], exact_clusters[1]]),
+                (high_target, [exact_clusters[2], exact_clusters[3]]),
+                (singleton, [exact_clusters[4]]),
+            ],
+            quality_metrics,
         )
 
         self.assertEqual(len(merged_units), 2)
-        self.assertEqual(metrics["safe_recall_merge_merged_pair_count"], 1)
-        self.assertEqual(metrics["safe_recall_merge_cluster_reduction"], 1)
-        self.assertEqual(metrics["safe_recall_merge_reject_reason_counts"]["cluster_already_merged"], 1)
+        self.assertEqual(attempted, ["target_high_weight"])
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_cluster_reduction"], 1)
+        self.assertEqual([int(cluster.exact_cluster_id) for cluster in merged_units[1][1]], [2, 3, 4])
 
     def test_empty_exception_message_keeps_exception_type(self) -> None:
         """空消息异常应打印异常类型，方便定位厂内大版图失败。"""
@@ -1998,55 +2955,6 @@ class OptimizedGridV1Tests(unittest.TestCase):
 
         self.assertIn(optimized.PACKED_CANDIDATE_CLIP_BITMAP_KEY, selected_base.match_cache)
         self.assertTrue(np.array_equal(optimized._candidate_clip_bitmap(selected_base), bitmap))
-
-    def test_safe_recall_merge_reject_keeps_base_candidate_payload(self) -> None:
-        """safe merge 拒绝非 selected base candidate 时不能删除其 packed bitmap。"""
-
-        bitmap = np.zeros((8, 8), dtype=bool)
-        bitmap[2:6, 2:6] = True
-        exact_clusters = [
-            ExactCluster(idx, _record(f"base_keep{idx}", bitmap, seed_weight=1), [_record(f"base_keep{idx}", bitmap, seed_weight=1)])
-            for idx in range(2)
-        ]
-        runner = self._make_runner(compute_quality_metrics=True)
-        selected0 = _candidate("selected_keep_0", bitmap, origin_exact_cluster_id=0, shift_direction="east", coverage={0})
-        selected1 = _candidate("selected_keep_1", bitmap, origin_exact_cluster_id=1, shift_direction="east", coverage={1})
-        base_candidate = _candidate("base_keep_payload", bitmap, origin_exact_cluster_id=0, shift_direction="base", coverage={0})
-        candidate_groups = _coverage_groups(runner, [base_candidate])
-        group = candidate_groups[0]
-        runner._park_candidate_group_bitmap(base_candidate, group.packed_clip_bitmap, group.clip_bitmap_shape)
-        quality_metrics = {
-            "review_merge_candidate_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "candidate_id": "base_keep_payload",
-                    "confidence_tier": "high",
-                    "target_exact_cluster_id": 1,
-                    "edge_weight": 10,
-                }
-            ],
-            "review_merge_cluster_pair_rows": [
-                {
-                    "source_cluster_id": 1,
-                    "target_cluster_id": 2,
-                    "pair_review_bucket": "safe_recall_candidate",
-                    "source_overmerge_reason": "ok",
-                    "target_overmerge_reason": "ok",
-                }
-            ],
-        }
-
-        merged_units, metrics = runner._apply_safe_recall_merge(
-            [(selected0, [exact_clusters[0]]), (selected1, [exact_clusters[1]])],
-            quality_metrics,
-            candidate_groups,
-        )
-
-        self.assertEqual(len(merged_units), 2)
-        self.assertEqual(metrics["safe_recall_merge_merged_pair_count"], 0)
-        self.assertIn(optimized.PACKED_CANDIDATE_CLIP_BITMAP_KEY, base_candidate.match_cache)
-        self.assertTrue(np.array_equal(optimized._candidate_clip_bitmap(base_candidate), bitmap))
 
     def test_final_verification_reuses_cached_candidate_exact_result(self) -> None:
         """final verification 写入 candidate-exact 缓存，后续重复检查应命中。"""
@@ -2773,9 +3681,7 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIn("gate_rejected_edge_weight_ratio=", logs)
         self.assertIn("review_merge_candidate_weight_ratio=", logs)
         self.assertIn("singleton_trusted_mergeable_weight_ratio=", logs)
-        self.assertIn("safe recall merge:", logs)
-        self.assertIn("cluster_reduction=", logs)
-        self.assertIn("rejects=", logs)
+        self.assertNotIn("singleton absorption:", logs)
         self.assertNotIn("visual quality:", logs)
         self.assertNotIn("weighted_visual_purity=", logs)
         self.assertNotIn("low_visual_purity_weight_ratio=", logs)
@@ -2856,6 +3762,19 @@ class OptimizedGridV1Tests(unittest.TestCase):
         self.assertIn("quality_metrics", result)
         self.assertNotIn("review_merge_candidate_rows", result["quality_metrics"])
         self.assertNotIn("review_merge_cluster_pair_rows", result["quality_metrics"])
+        self.assertNotIn("singleton_absorption_candidate_rows", result["quality_metrics"])
+        for key in result["quality_metrics"]:
+            self.assertFalse(str(key).startswith("singleton_absorption_"))
+            self.assertFalse(str(key).startswith("singleton_microcluster_"))
+        for key in (
+            "singleton_total_count",
+            "singleton_with_candidate_count",
+            "singleton_no_candidate_count",
+            "singleton_candidate_coverage_ratio",
+            "singleton_no_candidate_by_seed_type",
+            "singleton_candidate_by_seed_type",
+        ):
+            self.assertNotIn(key, result["quality_metrics"])
         for key in (
             "singleton_ratio",
             "singleton_weight_ratio",
@@ -2888,13 +3807,6 @@ class OptimizedGridV1Tests(unittest.TestCase):
             "medium_conf_review_merge_weight_ratio",
             "low_conf_review_merge_weight_ratio",
             "high_conf_singleton_mergeable_weight_ratio",
-            "safe_recall_merge_enabled",
-            "safe_recall_merge_candidate_pair_count",
-            "safe_recall_merge_attempted_pair_count",
-            "safe_recall_merge_merged_pair_count",
-            "safe_recall_merge_cluster_reduction",
-            "safe_recall_merge_checked_exact_count",
-            "safe_recall_merge_reject_reason_counts",
             "singleton_trusted_mergeable_weight_ratio",
         ):
             self.assertIn(key, result["quality_metrics"])

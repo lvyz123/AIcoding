@@ -2,7 +2,7 @@
 """面向 LSF 的 optimized v2 聚类入口。
 
 中文整体算法流程与使用说明：
-1. 本脚本是 optimized_v1 主算法的 LSF/Python 3.6 独立适配版。代码不 import v1、旧 mainline、
+1. 本脚本是 optimized_v1 主算法的 LSF/Python 3.12 独立适配版。代码不 import v1、旧 mainline、
    旧 layout_utils 或旧 layer_operations，但 coverage 主线刻意对齐 v1：candidate bundle、
    cheap shortlist、lazy full GraphDescriptor prefilter、packed/dilated/donut geometry cache、
    greedy set cover 和 final verification。
@@ -14,7 +14,7 @@
    - merge-coverage：汇总 coverage CSR，执行 greedy set cover，懒加载 selected candidate bitmap，
      用 shift-witness final verification 生成最终 cluster，再输出 Exact Cluster Review CSV 和代表 CSV。
 3. run-local 用于开发和小 crop 验证；默认走集中式小样本流程，带 --distributed-coverage 时顺序模拟完整 LSF 流程。
-4. 代码保持 Python 3.6 兼容：不使用 dataclasses、现代 union type、内置泛型类型标注或 scipy.optimize.milp。
+4. 代码面向 Python 3.12 运行环境；依赖限定在目标 package 清单内，并继续避免 scipy.optimize.milp。
 
 注意点：
 - grid_step_ratio 固定保持 v1 主线默认值 0.5，当前版本不开放采样密度实验入口。
@@ -1796,15 +1796,6 @@ def _final_stage_output_payload(output_path, result):
             "review_merge_candidate_weight_ratio": float(
                 quality_metrics.get("review_merge_candidate_weight_ratio", 0.0)
             ),
-            "safe_recall_merge_candidate_pair_count": int(
-                quality_metrics.get("safe_recall_merge_candidate_pair_count", 0)
-            ),
-            "safe_recall_merge_merged_pair_count": int(
-                quality_metrics.get("safe_recall_merge_merged_pair_count", 0)
-            ),
-            "safe_recall_merge_cluster_reduction": int(
-                quality_metrics.get("safe_recall_merge_cluster_reduction", 0)
-            ),
         }
     if result.get("cluster_representative_csv_path"):
         payload["cluster_representative_csv"] = str(result.get("cluster_representative_csv_path"))
@@ -1833,7 +1824,7 @@ def main():
        python layout_clustering_optimized_v2_lsf.py inspect-workdir --manifest work_v2_lsf/manifest.json
 
     注意点：
-    - v2_lsf 是 v1 optimized 主算法的 LSF/Python 3.6 独立适配版，不 import v1 或旧版 mainline/layout_utils/layer_operations。
+    - v2_lsf 是 v1 optimized 主算法的 LSF/Python 3.12 独立适配版，不 import v1 或旧版 mainline/layout_utils/layer_operations。
     - grid_step_ratio 固定保持 0.5；当前版本不开放 0.6/0.7 采样密度实验入口。
     - prepare 会为每个 seed shard 写出 halo tile OAS；run-shard 优先读取 tile，避免每个 LSF job 重读全版图。
     - 大样本不要走集中式 merge；应使用 prepare-coverage、run-coverage-shard、merge-coverage 的分布式 coverage 流程。

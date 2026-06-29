@@ -28,7 +28,7 @@
    - 少量 `diag_ne/diag_nw/diag_se/diag_sw`
 7. candidate generation 结束后，把逻辑 candidate 压成全局 strict bitmap `CoverageCandidateGroup`。
 8. coverage 阶段先做 cheap shortlist，再做 lazy full prefilter，最后做 ACC/ECC 几何比较。
-9. 通过 greedy set cover 选择 representative candidate。
+9. 通过 greedy set cover 选择 representative candidate；当前优先减少未覆盖 exact cluster 数，再用权重做次级排序。
 10. 对 selected candidate 做统一 shift-witness final verification；所有 witness 都失败的成员回退成 singleton。
 11. 输出 Exact Cluster Review CSV 和 Cluster Representative CSV；仅在指定 `--review-dir` 时物化 sample / representative 位图文件。
 
@@ -164,6 +164,20 @@ python layout_clustering_optimized_v1.py ./design.oas --apply-layer-ops --regist
 - `risk_rank` 按 `risk_score` 降序生成，`1` 表示最优先 review / weak-point 关注。
 - `result_csv_row_count` 等于 `exact_cluster_count`。
 - `cluster_representative_csv_row_count` 等于 `total_clusters`。
+
+### Singleton 收尾版
+
+- greedy set cover 的主目标是减少未覆盖 `exact_cluster_count`，权重只作为第二优先级，避免大量低权重 exact cluster 被留到最后只能形成 singleton。
+- coverage cheap prefilter 回到 `CHEAP_FILL_ABS_LIMIT=0.12`、`CHEAP_AREA_DENSITY_ABS_LIMIT=0.18`，避免无效放宽把更多弱候选推入 final verification。
+- singleton absorption 只处理 `exact_cluster_count=1` 的最终 singleton；候选池按每个 singleton 单独保留 top-K high/medium confidence review edge，避免被全局大权重边挤掉。
+- 对没有 review edge 的 singleton，会同时生成 normalized cheap descriptor 近邻和 signature embedding KNN graph 候选；descriptor / graph 双源一致且 context close 的 `strong_descriptor_graph_agreement` 进入 absorption 尝试。
+- descriptor-only、纯 graph-only、weak agreement 不进入 absorption 尝试；只有没有 review edge/strong agreement 的 singleton，才允许 top-1 `graph_rescue_context_close` 作为 strict-only 补充候选。
+- singleton absorption 保留目标 cluster 的已选 representative，先做 strict verification；strict 失败后，`graph_rescue_context_close` 直接拒绝，其它来源只有在目标代表点 visual 质量干净且没有 severe overmerge risk 时，才允许 normal visual fallback。
+- long-shape large-shift target 不在 strict verification 前一刀切拒绝，只在 normal visual fallback 前触发额外护栏。
+- singleton-singleton 只允许 strict-only microcluster：先尝试 size-3 clique，再做 pair fallback；必须 mutual KNN、seed 兼容、descriptor / graph / context 同时 close，不允许 normal visual fallback，也不做链式扩张。
+- 当前版本停止继续为了压低 residual singleton 做新一轮候选扩张；已验证结果显示剩余 singleton 主要是低权重 residual 局部 pattern，继续强行合并会直接碰到 purity 风险。
+- singleton absorption / microcluster 的调试明细不再写入默认 quality summary，也不再在主入口打印；主入口输出恢复为 0521 版的规模、coverage、representative quality、actionable overmerge 和 fragmentation audit。
+- final verification、greedy purity gate、target visual guard、overmerge score guard、long-shape fallback guard 和 strict-only microcluster guard 仍是 purity 保护边界。
 
 ### Candidate Group Packed-at-Rest
 

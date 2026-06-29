@@ -4,16 +4,13 @@
 中文说明：
 1. 本文件复制并精简旧版 layer operation 语义，但不 import 旧脚本。
 2. 支持 subtract / union / intersect 三类布尔运算。
-3. 代码保持 Python 3.6 兼容，供 layout_clustering_optimized_v2_lsf.py 独立部署。
+3. 代码面向 Python 3.12 运行环境，供 layout_clustering_optimized_v2_lsf.py 独立部署。
 """
 
-from typing import Iterable, List, Sequence, Set, Tuple
+from collections.abc import Sequence
 
 import gdstk
 import numpy as np
-
-
-LayerSpec = Tuple[int, int]
 
 
 def _normalize_layer_spec(spec):
@@ -24,7 +21,7 @@ def _normalize_layer_spec(spec):
         return int(layer_str.strip()), int(datatype_str.strip())
     if isinstance(spec, Sequence) and len(spec) >= 2:
         return int(spec[0]), int(spec[1])
-    raise ValueError("Invalid layer spec: %s" % (spec,))
+    raise ValueError(f"Invalid layer spec: {spec}")
 
 
 def _clone_polygon(poly, layer, datatype):
@@ -34,7 +31,7 @@ def _clone_polygon(poly, layer, datatype):
     return gdstk.Polygon(points, layer=int(layer), datatype=int(datatype))
 
 
-class LayerOperationProcessor(object):
+class LayerOperationProcessor:
     """管理 v2_lsf 的 layer operation 规则。"""
 
     _OPERATION_MAP = {
@@ -51,7 +48,7 @@ class LayerOperationProcessor(object):
 
         op = str(operation).strip().lower()
         if op not in self._OPERATION_MAP:
-            raise ValueError("Unsupported layer operation: %s" % operation)
+            raise ValueError(f"Unsupported layer operation: {operation}")
         self.operation_rules.append(
             {
                 "source_layer": _normalize_layer_spec(source_layer),

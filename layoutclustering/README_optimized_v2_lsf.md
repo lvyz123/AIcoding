@@ -1,6 +1,6 @@
 # Optimized V2 LSF Layout Clustering
 
-`layout_clustering_optimized_v2_lsf.py` 是当前 optimized v1 主算法的 LSF / Python 3.6 独立适配版。
+`layout_clustering_optimized_v2_lsf.py` 是当前 optimized v1 主算法的 LSF / Python 3.12 独立适配版。
 
 它的目标有两层：
 
@@ -60,7 +60,7 @@ python layout_clustering_optimized_v2_lsf.py merge-coverage --manifest work_v2_l
 - `--area-match-ratio`：`acc` 模式的面积匹配阈值，默认 `0.96`。
 - `--edge-tolerance-um`：`ecc` 模式的边界容差，单位 `um`，默认 `0.02`。
 - `--pixel-size-nm`：栅格像素尺寸，默认 `10nm`。
-- `--compute-quality-metrics`：可选计算 representative visual、pairwise geometry、fragmentation coverage graph 与 safe recall merge 指标；默认关闭。开启后不写额外诊断 CSV，只在最终 stage JSON 摘要中打印核心指标，并在 Cluster Representative CSV 追加 per-cluster quality 字段。
+- `--compute-quality-metrics`：可选计算 representative visual、pairwise geometry、fragmentation coverage graph，并执行与 v1 对齐的 singleton absorption 收尾；默认关闭。开启后不写额外诊断 CSV，只在最终 stage JSON 摘要中打印核心指标，并在 Cluster Representative CSV 追加 per-cluster quality 字段。
 - `--apply-layer-ops`：启用层操作预处理。
 - `--register-op SOURCE_LAYER TARGET_LAYER OPERATION RESULT_LAYER`：注册层操作规则。
 - `--distributed-coverage`：仅用于 `run-local`，顺序模拟完整分布式 coverage 流程。
@@ -133,14 +133,7 @@ representative_visual_pass_ratio,representative_visual_fail_count,representative
 
 `quality_metrics` 按问题域拆分输出：`representative_visual_purity` / `weighted_representative_visual_purity` 关注代表点对成员的覆盖质量，`pairwise_geometry_purity` / `weighted_pairwise_geometry_purity` 关注簇内成员两两几何一致性，`raw_coverage_graph_recall` / `trusted_fragmentation_recall` 区分原始 coverage graph 与可信已合并边，`gate_rejected_edge_weight_ratio` / `review_merge_candidate_weight_ratio` 用于判断剩余 recall 信号是被 purity gate 有意拒绝，还是仍有 review merge 候选。
 
-safe recall merge 只在内部使用 bounded review evidence，不新增用户可见诊断 CSV。它的收敛指标包括：
-
-- `safe_recall_merge_candidate_pair_count`
-- `safe_recall_merge_attempted_pair_count`
-- `safe_recall_merge_merged_pair_count`
-- `safe_recall_merge_cluster_reduction`
-- `safe_recall_merge_checked_exact_count`
-- `safe_recall_merge_reject_reason_counts`
+开启 `--compute-quality-metrics` 时，v2_lsf 会执行与当前 v1 收尾 baseline 对齐的 singleton absorption：先使用 review edge 与 strong descriptor/graph agreement 吸收 singleton，再用 strict-only singleton microcluster 做 size-3 clique 与 pair fallback。该机制会真实改写最终 `cluster_units`，但不把 `singleton_absorption_*` / `singleton_microcluster_*` 诊断字段写入 public `quality_metrics` 或终端 final payload。不开启质量指标时不执行这层额外 singleton absorption。
 
 `seed_coverage_audit` 包含：
 
@@ -165,8 +158,8 @@ safe recall merge 只在内部使用 bounded review evidence，不新增用户�
 
 greedy set cover 的优先级为：
 
-1. `uncovered_weight_gain` 最大
-2. `uncovered_exact_count` 最大
+1. `uncovered_exact_count` 最大
+2. `uncovered_weight_gain` 最大
 3. `representative_score` 最大
 4. `coverage_confidence_proxy` 最大
 5. base 方向优先
@@ -174,16 +167,18 @@ greedy set cover 的优先级为：
 7. `origin_exact_cluster_id`
 8. `candidate_id`
 
-`representative_score` 来自 OPC-center score、coverage weight 和 risk score 的组合，用于在覆盖收益相同的候选之间优先选择更适合作为 OPC clip center 的代表点。
+`uncovered_exact_count` 是当前主目标，用于优先降低 singleton cluster 数量；`representative_score` 来自 OPC-center score、coverage weight 和 risk score 的组合，用于在覆盖收益相同的候选之间优先选择更适合作为 OPC clip center 的代表点。v2_lsf 当前不继续新增更激进的 residual singleton 压制策略，收尾阶段只对齐 v1 的 bounded singleton absorption 和 strict-only microcluster，最终几何验证仍是合并硬门槛。
 
-## Python 3.6 兼容
+## Python 3.12 运行环境与依赖
 
-v2_lsf 代码保持 Python 3.6 语法兼容：
+v2_lsf 只使用 `Python 3.12 supporting packages.txt` 清单内的运行依赖：
 
-- 不使用 `dataclass`
-- 不使用 `X | Y` union type
-- 不使用 `list[int]` 等内置泛型标注
-- 不依赖 `scipy.optimize.milp`
+- `gdstk`
+- `numpy`
+- `scipy`
+- `scikit-learn`（代码内 import 名为 `sklearn`，用于大 subgroup 的 cosine 近邻 shortlist）
+
+代码已不再维护 Python 3.6 语法兼容约束；可以使用 Python 3.12 下更直接的 `dataclass(slots=True)` 等写法。仍然不依赖 `scipy.optimize.milp`，避免引入额外求解器路径。
 
 推荐回归命令：
 

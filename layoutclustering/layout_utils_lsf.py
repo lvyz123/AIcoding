@@ -4,7 +4,7 @@
 中文说明：
 1. 本文件只放 v2_lsf 运行所需的最小 OAS、bbox、polygon 工具。
 2. 不 import 旧版 layout_utils.py，保证 LSF 版本可以独立部署。
-3. 代码保持 Python 3.6 兼容，不使用现代类型语法。
+3. 代码面向 Python 3.12 运行环境，只保留必要的路径桥接和几何工具。
 """
 
 import os
@@ -13,7 +13,6 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Optional, Tuple
 
 import gdstk
 import numpy as np
@@ -44,7 +43,7 @@ def _temporary_ascii_path(prefix, suffix):
     root = Path(tempfile.gettempdir()) / "layout_lsf_ascii_bridge"
     if not root.exists():
         root.mkdir(parents=True)
-    filename = "%s_%s%s" % (_ascii_safe_token(prefix, "oas"), uuid.uuid4().hex[:8], suffix)
+    filename = f"{_ascii_safe_token(prefix, 'oas')}_{uuid.uuid4().hex[:8]}{suffix}"
     return root / filename
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the Python 3.6 compatible LSF v2 clustering pipeline."""
+"""Tests for the Python 3.12 LSF v2 clustering pipeline."""
 
 import ast
 import csv
@@ -49,6 +49,8 @@ LSF_FILES = [
     SCRIPT_DIR / "layout_utils_lsf.py",
     SCRIPT_DIR / "layer_operations_lsf.py",
 ]
+
+PACKAGE_LIST_FILE = SCRIPT_DIR / "Python 3.12 supporting packages.txt"
 
 
 def _write_oas(path, polygons):
@@ -195,12 +197,49 @@ class OptimizedV2LsfTests(unittest.TestCase):
                 if isinstance(node, ast.ImportFrom):
                     self.assertNotIn(node.module, forbidden_modules, str(path))
 
-    def test_lsf_scripts_parse_as_python36(self):
-        """LSF 新脚本需要保持 Python 3.6 语法可解析。"""
+    def test_lsf_scripts_parse_as_python312(self):
+        """LSF 脚本需要在目标 Python 3.12 语法下可解析。"""
 
         for path in LSF_FILES:
             source = path.read_text(encoding="utf-8")
-            ast.parse(source, filename=str(path), feature_version=(3, 6))
+            ast.parse(source, filename=str(path), feature_version=(3, 12))
+
+    def test_lsf_runtime_imports_are_in_python312_package_list(self):
+        """v2_lsf 第三方运行依赖必须来自 Python 3.12 环境清单。"""
+
+        package_names = set()
+        for raw_line in PACKAGE_LIST_FILE.read_text(encoding="utf-8").splitlines():
+            parts = raw_line.split()
+            if len(parts) >= 2 and not raw_line.startswith("Python") and not raw_line.startswith("Package"):
+                package_names.add(parts[0].lower().replace("_", "-"))
+
+        module_to_package = {
+            "gdstk": "gdstk",
+            "numpy": "numpy",
+            "scipy": "scipy",
+            "sklearn": "scikit-learn",
+        }
+        local_modules = {path.stem for path in LSF_FILES}
+        imported_roots = set()
+        for path in LSF_FILES:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 12))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported_roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    imported_roots.add(node.module.split(".", 1)[0])
+
+        external_roots = {
+            root
+            for root in imported_roots
+            if root not in sys.stdlib_module_names and root not in local_modules and not root.startswith("_")
+        }
+        missing = sorted(
+            root
+            for root in external_roots
+            if module_to_package.get(root, root).lower().replace("_", "-") not in package_names
+        )
+        self.assertEqual([], missing)
 
     def test_final_output_cli_is_csv_only(self):
         """最终主输出 CLI 不再接受旧 JSON/TXT 或 --format 入口。"""
@@ -1258,7 +1297,9 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertIn("raw_coverage_graph_recall", result["quality_metrics"])
         self.assertIn("trusted_fragmentation_recall", result["quality_metrics"])
         self.assertIn("review_merge_candidate_weight_ratio", result["quality_metrics"])
-        self.assertIn("safe_recall_merge_cluster_reduction", result["quality_metrics"])
+        self.assertNotIn("safe_recall_merge_cluster_reduction", result["quality_metrics"])
+        self.assertFalse(any(str(key).startswith("singleton_absorption_") for key in result["quality_metrics"]))
+        self.assertFalse(any(str(key).startswith("singleton_microcluster_") for key in result["quality_metrics"]))
         self.assertNotIn("sampled_purity_score", result["quality_metrics"])
         self.assertNotIn("overmerge_suspect_count", result["quality_metrics"])
         self.assertNotIn("member_to_member_transitivity_purity", result["quality_metrics"])
@@ -1279,109 +1320,245 @@ class OptimizedV2LsfTests(unittest.TestCase):
         self.assertNotIn("intra_cluster_sampled_pair_count", representative_rows[0])
         self.assertNotIn("purity_sample_status", representative_rows[0])
 
-    def test_safe_recall_merge_requires_candidate_union_and_strict_verification(self):
-        """集中式 safe recall merge 必须同时满足 union coverage 与 strict verification。"""
+    def test_greedy_cover_prefers_exact_count_before_weight(self):
+        """set cover 先减少 cluster 数，再用权重做次级排序。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(0, bitmap), _make_exact_cluster(1, bitmap), _make_exact_cluster(2, bitmap)]
+        exact_clusters[0].weight_sum = 100
+        heavy_candidate = _make_candidate("heavy", 0, bitmap)
+        heavy_candidate.coverage = set([0])
+        small_pair_candidate = _make_candidate("small_pair", 1, bitmap)
+        small_pair_candidate.coverage = set([1, 2])
+
+        selected = mainline_lsf.greedy_cover([heavy_candidate, small_pair_candidate], exact_clusters, {})
+
+        self.assertEqual([candidate.candidate_id for candidate in selected], ["small_pair", "heavy"])
+
+    def test_singleton_absorption_review_edge_absorbs_target_singleton(self):
+        """review edge 的 high/medium 候选可以把 singleton 吸收到 non-singleton target。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(idx, bitmap) for idx in range(3)]
+        target = _make_candidate("target", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        singleton = _make_candidate("singleton", 2, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merged_units, metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            {
+                "singleton_total_count": 1,
+                "singleton_absorption_candidate_rows": [
+                    {
+                        "source_cluster_id": 1,
+                        "target_cluster_id": 2,
+                        "candidate_id": "review_edge",
+                        "confidence_tier": "high",
+                        "candidate_source": "review_edge",
+                        "singleton_cluster_id": 2,
+                        "absorb_cluster_id": 1,
+                        "singleton_exact_cluster_id": 2,
+                        "source_exact_cluster_id": 0,
+                        "target_exact_cluster_id": 2,
+                        "edge_weight": 10,
+                    }
+                ],
+                "cluster_quality_by_index": {
+                    0: {
+                        "representative_visual_pass_ratio": 1.0,
+                        "representative_visual_checked_count": 2,
+                        "representative_seed_type": mainline_lsf.SEED_TYPE_ARRAY,
+                        "shift_distance_um": 0.0,
+                        "overmerge_score": 0.0,
+                    }
+                },
+            },
+            {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual([cluster.exact_cluster_id for cluster in merged_units[0][1]], [0, 1, 2])
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 1)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"], {"review_edge": 1})
+
+    def test_singleton_absorption_source_side_singleton(self):
+        """singleton 在 source 端时也应能识别并吸收到 non-singleton target。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(idx, bitmap) for idx in range(3)]
+        target = _make_candidate("target", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        singleton = _make_candidate("singleton", 2, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merged_units, metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            {
+                "review_merge_candidate_rows": [
+                    {
+                        "source_cluster_id": 2,
+                        "target_cluster_id": 1,
+                        "candidate_id": "review_source_singleton",
+                        "confidence_tier": "medium",
+                        "candidate_source": "review_edge",
+                        "source_exact_cluster_id": 2,
+                        "target_exact_cluster_id": 0,
+                        "edge_weight": 8,
+                    }
+                ],
+                "cluster_quality_by_index": {
+                    0: {
+                        "representative_visual_pass_ratio": 1.0,
+                        "representative_visual_checked_count": 2,
+                        "representative_seed_type": mainline_lsf.SEED_TYPE_ARRAY,
+                        "shift_distance_um": 0.0,
+                        "overmerge_score": 0.0,
+                    }
+                },
+            },
+            {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"], {"review_edge": 1})
+
+    def test_singleton_absorption_strong_agreement_rescue(self):
+        """无 review edge 时，descriptor 与 graph 双命中的 strong agreement 可进入吸收。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(idx, bitmap) for idx in range(3)]
+        target = _make_candidate("target", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        singleton = _make_candidate("singleton", 2, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        merged_units, metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+            [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+            {"cluster_quality_by_index": {}},
+            {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+        )
+
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_absorption_merged_by_source"], {"strong_descriptor_graph_agreement": 1})
+
+    def test_singleton_absorption_context_graph_is_strict_only(self):
+        """context-close graph 候选 strict 失败后不触发 normal fallback。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(idx, bitmap) for idx in range(3)]
+        target = _make_candidate("target", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        singleton = _make_candidate("singleton", 2, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+
+        def fake_descriptor_vector(candidate):
+            """让 descriptor rescue 不命中，只保留 graph/context close。"""
+
+            if str(candidate.candidate_id) == "target":
+                return np.asarray([1.0, 0.0], dtype=np.float32)
+            return np.asarray([0.0, 1.0], dtype=np.float32)
+
+        with mock.patch.object(mainline_lsf, "_normalized_cheap_feature_vector", side_effect=fake_descriptor_vector), mock.patch.object(
+            mainline_lsf,
+            "_candidate_matches_exact",
+            return_value=(False, "strict_reject", "none"),
+        ), mock.patch.object(mainline_lsf, "_candidate_matches_exact_normal", return_value=(True, "normal_pass", "base")) as normal_match:
+            merged_units, metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+                [(target, [exact_clusters[0], exact_clusters[1]]), (singleton, [exact_clusters[2]])],
+                {"cluster_quality_by_index": {}},
+                {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+            )
+
+        self.assertEqual(len(merged_units), 2)
+        self.assertEqual(metrics["singleton_absorption_attempted_by_source"], {"graph_rescue_context_close": 1})
+        self.assertEqual(metrics["singleton_absorption_merged_count"], 0)
+        self.assertEqual(
+            metrics["singleton_absorption_reject_reason_by_source"],
+            {"graph_rescue_context_close": {"strict_verification_reject": 1}},
+        )
+        normal_match.assert_not_called()
+
+    def test_singleton_microcluster_clique_and_pair_fallback(self):
+        """strict-only microcluster 先合 size-3 clique，broken clique 再允许 pair fallback。"""
+
+        bitmap = np.zeros((8, 8), dtype=bool)
+        bitmap[2:6, 2:6] = True
+        exact_clusters = [_make_exact_cluster(idx, bitmap) for idx in range(3)]
+        candidates = [_make_candidate("base_%d" % idx, idx, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY) for idx in range(3)]
+        units = [(candidates[idx], [exact_clusters[idx]]) for idx in range(3)]
+        merged_units, metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+            units,
+            {"cluster_quality_by_index": {}},
+            {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+        )
+        self.assertEqual(len(merged_units), 1)
+        self.assertEqual(metrics["singleton_microcluster_clique_merged_count"], 2)
+        self.assertEqual(metrics["singleton_microcluster_pair_merged_count"], 0)
+
+        def strict_pair_side_effect(candidate, exact_cluster, config, descriptor_cache):
+            """模拟 A-C strict fail，A-B/B-C strict pass。"""
+
+            if str(candidate.candidate_id) == "base_0" and int(exact_cluster.exact_cluster_id) == 2:
+                return False, "strict_reject", "none"
+            return True, "exact_hash", "base"
+
+        with mock.patch.object(mainline_lsf, "_candidate_matches_exact", side_effect=strict_pair_side_effect):
+            broken_units, broken_metrics = mainline_lsf._apply_singleton_absorption_exact_review(
+                units,
+                {"cluster_quality_by_index": {}},
+                {"clip_size_um": 1.0, "geometry_match_mode": "ecc", "edge_tolerance_um": 0.0, "pixel_size_nm": 125},
+            )
+        self.assertEqual(len(broken_units), 2)
+        self.assertEqual(broken_metrics["singleton_microcluster_clique_merged_count"], 0)
+        self.assertEqual(broken_metrics["singleton_microcluster_pair_merged_count"], 1)
+        self.assertEqual(
+            broken_metrics["singleton_microcluster_clique_reject_reason_counts"],
+            {"strict_verification_reject": 1},
+        )
+
+    def test_public_quality_metrics_hide_singleton_absorption_details(self):
+        """public quality_metrics 与 final payload 不暴露旧 safe recall 或 singleton 内部诊断字段。"""
 
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
         exact_clusters = [_make_exact_cluster(0, bitmap), _make_exact_cluster(1, bitmap)]
         base0 = _make_candidate("base_0", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
         base1 = _make_candidate("base_1", 1, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        merge_candidate = _make_candidate("merge_0_1", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        merge_candidate.coverage = set([0, 1])
-        candidates = [base0, base1, merge_candidate]
-        selected = [base0, base1]
-        config = {
-            "clip_size_um": 1.0,
-            "geometry_match_mode": "ecc",
-            "edge_tolerance_um": 0.0,
-            "pixel_size_nm": 125,
-            "compute_quality_metrics": True,
-        }
         result = mainline_lsf.build_compact_result_exact_review(
             None,
             exact_clusters,
-            candidates,
-            selected,
-            {"candidate_group_count": len(candidates)},
-            config,
+            [base0, base1],
+            [base0, base1],
+            {"candidate_group_count": 2},
+            {
+                "clip_size_um": 1.0,
+                "geometry_match_mode": "ecc",
+                "edge_tolerance_um": 0.0,
+                "pixel_size_nm": 125,
+                "compute_quality_metrics": True,
+            },
             {},
         )
-
         self.assertEqual(result["total_clusters"], 1)
-        self.assertEqual(result["quality_metrics"]["safe_recall_merge_candidate_pair_count"], 1)
-        self.assertEqual(result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 1)
-        self.assertEqual(result["quality_metrics"]["safe_recall_merge_cluster_reduction"], 1)
+        self.assertFalse(any(str(key).startswith("safe_recall_merge_") for key in result["quality_metrics"]))
+        self.assertFalse(any(str(key).startswith("singleton_absorption_") for key in result["quality_metrics"]))
+        self.assertFalse(any(str(key).startswith("singleton_microcluster_") for key in result["quality_metrics"]))
+        payload = v2_lsf._final_stage_output_payload(str(self.temp_root / "result.csv"), result)
+        self.assertFalse(any(str(key).startswith("safe_recall_merge_") for key in payload["quality_metrics"]))
+        self.assertFalse(any(str(key).startswith("singleton_absorption_") for key in payload["quality_metrics"]))
+        self.assertFalse(any(str(key).startswith("singleton_microcluster_") for key in payload["quality_metrics"]))
 
-        rejected_candidate = _make_candidate("reject_0_1", 0, np.zeros_like(bitmap), origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        rejected_candidate.coverage = set([0, 1])
-        rejected_result = mainline_lsf.build_compact_result_exact_review(
-            None,
-            exact_clusters,
-            [base0, base1, rejected_candidate],
-            selected,
-            {"candidate_group_count": 3},
-            dict(config),
-            {},
-        )
-        self.assertEqual(rejected_result["total_clusters"], 2)
-        self.assertEqual(rejected_result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 0)
-        self.assertIn(
-            "strict_verification_reject",
-            rejected_result["quality_metrics"]["safe_recall_merge_reject_reason_counts"],
-        )
-
-    def test_safe_recall_merge_loads_distributed_candidate_bitmap(self):
-        """分布式 safe recall merge 应从 coverage shard bitmap 位置按需恢复候选。"""
+    def test_distributed_candidate_bitmap_loader_restores_candidate(self):
+        """分布式 evidence 仍可按 candidate_bitmap_locations 恢复 candidate bitmap。"""
 
         bitmap = np.zeros((8, 8), dtype=bool)
         bitmap[2:6, 2:6] = True
-        exact_clusters = [_make_exact_cluster(0, bitmap), _make_exact_cluster(1, bitmap)]
-        base0 = _make_candidate("dist_base_0", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        base1 = _make_candidate("dist_base_1", 1, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        merge_candidate = _make_candidate("dist_merge_0_1", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
-        base0.coverage = set([0])
-        base1.coverage = set([1])
-        merge_candidate.coverage = set([0, 1])
-        source_candidates = [base0, base1, merge_candidate]
-        candidate_records = [mainline_lsf.candidate_metadata(candidate, include_coverage=False) for candidate in source_candidates]
-        coverage_offsets = np.asarray([0, 1, 2, 4], dtype=np.int64)
-        coverage_values = np.asarray([0, 1, 0, 1], dtype=np.int64)
-        npz_path = self.temp_root / "safe_recall_candidate_bitmaps.npz"
-        np.savez_compressed(
-            str(npz_path),
-            candidate_bitmaps=np.asarray([candidate.clip_bitmap for candidate in source_candidates], dtype=bool),
-        )
-        bitmap_locations = dict(
-            (
-                str(candidate.candidate_id),
-                {"npz_path": str(npz_path), "bitmap_index": int(idx)},
-            )
-            for idx, candidate in enumerate(source_candidates)
-        )
-        config = {
-            "clip_size_um": 1.0,
-            "geometry_match_mode": "ecc",
-            "edge_tolerance_um": 0.0,
-            "pixel_size_nm": 125,
-            "compute_quality_metrics": True,
-        }
-        result = mainline_lsf.build_compact_result_exact_review(
-            None,
-            exact_clusters,
-            candidate_records,
-            [base0, base1],
-            {"candidate_group_count": len(candidate_records)},
-            config,
-            {},
-            coverage_offsets=coverage_offsets,
-            coverage_values=coverage_values,
-            candidate_bitmap_locations=bitmap_locations,
+        candidate = _make_candidate("dist_candidate", 0, bitmap, origin_seed_type=mainline_lsf.SEED_TYPE_ARRAY)
+        metadata = mainline_lsf.candidate_metadata(candidate, include_coverage=False)
+        npz_path = self.temp_root / "candidate_bitmaps.npz"
+        np.savez_compressed(str(npz_path), candidate_bitmaps=np.asarray([candidate.clip_bitmap], dtype=bool))
+        restored = mainline_lsf._candidate_clip_from_evidence(
+            {"item": metadata, "coverage": set([0])},
+            {str(candidate.candidate_id): {"npz_path": str(npz_path), "bitmap_index": 0}},
         )
 
-        self.assertEqual(result["total_clusters"], 1)
-        self.assertEqual(result["quality_metrics"]["safe_recall_merge_merged_pair_count"], 1)
-        self.assertEqual(result["quality_metrics"]["safe_recall_merge_cluster_reduction"], 1)
+        self.assertTrue(np.array_equal(restored.clip_bitmap, bitmap))
+        self.assertEqual(restored.coverage, set([0]))
 
     def test_layer_operation_lsf_path(self):
         """LSF layer operation 应保留 result layer 并排除 helper-only layer。"""

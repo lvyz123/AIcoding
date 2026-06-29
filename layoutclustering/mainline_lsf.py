@@ -17,8 +17,8 @@
 5. merge-coverage 汇总 CSR coverage，用 lazy greedy set cover 选择代表 candidate，再只为 selected
    candidates 懒加载 bitmap，并为 target exact cluster 临时生成 shift-witness candidates 做最终验证，
    避免在汇总阶段长期持有全部 candidate Python 对象。
-6. 代码保持 Python 3.6 兼容：不使用 dataclasses、from __future__ annotations、现代 union type、
-   内置泛型类型标注或 scipy.optimize.milp。
+6. 代码面向 Python 3.12 运行环境：数据容器使用 dataclass slots，第三方依赖限定在目标环境清单内，
+   并继续避免引入 scipy.optimize.milp 这类额外求解器依赖。
 """
 
 import csv
@@ -29,17 +29,18 @@ import math
 import os
 import time
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gdstk
 import numpy as np
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 try:
-    import hnswlib
+    from sklearn.neighbors import NearestNeighbors
 except ImportError:
-    hnswlib = None
+    NearestNeighbors = None
 
 from layout_utils_lsf import (
     _bbox_center,
@@ -99,8 +100,18 @@ REVIEW_MERGE_CANDIDATE_TOP_N = 5000
 REVIEW_MERGE_CANDIDATE_TIER_QUOTAS = {"high": 3000, "medium": 1000, "low": 1000}
 REVIEW_MERGE_HIGH_SHIFT_DISTANCE_UM = 0.10
 REVIEW_MERGE_MEDIUM_SHIFT_DISTANCE_UM = 0.20
-SAFE_RECALL_MERGE_TOP_PAIR_N = 200
-SAFE_RECALL_MERGE_MAX_UNION_EXACT_COUNT = 2000
+SINGLETON_ABSORPTION_TOP_K = 5
+SINGLETON_ABSORPTION_DESCRIPTOR_RESCUE_TOP_K = 5
+SINGLETON_ABSORPTION_DESCRIPTOR_QUERY_MULTIPLIER = 4
+SINGLETON_ABSORPTION_GRAPH_RESCUE_TOP_K = 5
+SINGLETON_ABSORPTION_GRAPH_QUERY_MULTIPLIER = 4
+SINGLETON_ABSORPTION_CONTEXT_RESCUE_TOP_K = 1
+SINGLETON_ABSORPTION_DESCRIPTOR_HIGH_DISTANCE = 0.18
+SINGLETON_ABSORPTION_DESCRIPTOR_MEDIUM_DISTANCE = 0.38
+SINGLETON_ABSORPTION_CONTEXT_CLOSE_DISTANCE = 0.18
+SINGLETON_MICROCLUSTER_QUERY_K = 3
+SINGLETON_ABSORPTION_NORMAL_VISUAL_MIN_PASS_RATIO = 0.999
+SINGLETON_ABSORPTION_TARGET_OVERMERGE_SCORE_LIMIT = 0.50
 GREEDY_PURITY_GATE_EXACT_TRIGGER = 500
 GREEDY_PURITY_GATE_WEIGHT_RATIO = 0.005
 GREEDY_PURITY_GATE_LARGE_SHIFT_RATIO = 0.15
@@ -124,33 +135,47 @@ _POOL_EDGE_CACHE = {}
 _COVERAGE_STRUCTURE_CACHE = {}
 
 
-class GraphDescriptor(object):
+@dataclass(slots=True)
+class GraphDescriptor:
     """v1 风格 full prefilter 使用的 bitmap 图形描述符。"""
 
-    __slots__ = ("invariants", "topology", "signature_grid", "signature_proj_x", "signature_proj_y")
+    invariants: np.ndarray
+    topology: np.ndarray
+    signature_grid: np.ndarray
+    signature_proj_x: np.ndarray
+    signature_proj_y: np.ndarray
 
-    def __init__(self, invariants, topology, signature_grid, signature_proj_x, signature_proj_y):
-        self.invariants = np.asarray(invariants, dtype=np.float64)
-        self.topology = np.asarray(topology, dtype=np.float64)
-        self.signature_grid = np.asarray(signature_grid, dtype=np.float32)
-        self.signature_proj_x = np.asarray(signature_proj_x, dtype=np.float32)
-        self.signature_proj_y = np.asarray(signature_proj_y, dtype=np.float32)
+    def __post_init__(self):
+        """统一描述符数组 dtype，保持和旧手写构造函数一致。"""
+
+        self.invariants = np.asarray(self.invariants, dtype=np.float64)
+        self.topology = np.asarray(self.topology, dtype=np.float64)
+        self.signature_grid = np.asarray(self.signature_grid, dtype=np.float32)
+        self.signature_proj_x = np.asarray(self.signature_proj_x, dtype=np.float32)
+        self.signature_proj_y = np.asarray(self.signature_proj_y, dtype=np.float32)
 
 
-class CheapDescriptor(object):
+@dataclass(slots=True)
+class CheapDescriptor:
     """v1 coverage shortlist 使用的低成本 bitmap 描述符。"""
 
-    __slots__ = ("invariants", "signature_grid", "signature_proj_x", "signature_proj_y", "area_px")
+    invariants: np.ndarray
+    signature_grid: np.ndarray
+    signature_proj_x: np.ndarray
+    signature_proj_y: np.ndarray
+    area_px: int
 
-    def __init__(self, invariants, signature_grid, signature_proj_x, signature_proj_y, area_px):
-        self.invariants = np.asarray(invariants, dtype=np.float32)
-        self.signature_grid = np.asarray(signature_grid, dtype=np.float32)
-        self.signature_proj_x = np.asarray(signature_proj_x, dtype=np.float32)
-        self.signature_proj_y = np.asarray(signature_proj_y, dtype=np.float32)
-        self.area_px = int(area_px)
+    def __post_init__(self):
+        """统一 cheap descriptor 的数组 dtype 与面积整数类型。"""
+
+        self.invariants = np.asarray(self.invariants, dtype=np.float32)
+        self.signature_grid = np.asarray(self.signature_grid, dtype=np.float32)
+        self.signature_proj_x = np.asarray(self.signature_proj_x, dtype=np.float32)
+        self.signature_proj_y = np.asarray(self.signature_proj_y, dtype=np.float32)
+        self.area_px = int(self.area_px)
 
 
-class SimpleSpatialIndex(object):
+class SimpleSpatialIndex:
     """用简单 bbox 数组提供 intersection 查询，避免 LSF 环境额外依赖 rtree。"""
 
     __slots__ = (
@@ -266,7 +291,7 @@ class SimpleSpatialIndex(object):
         }
 
 
-class LayoutIndex(object):
+class LayoutIndex:
     """版图查询缓存，保存 polygon、bbox 数组和有效层摘要。"""
 
     __slots__ = (
@@ -339,18 +364,26 @@ def write_layout_index_oas(layout_index, filepath, cell_name="TILE"):
     }
 
 
-class GridSeedCandidate(object):
+@dataclass(slots=True)
+class GridSeedCandidate:
     """geometry-driven seed 记录。"""
 
-    __slots__ = ("center", "seed_bbox", "grid_ix", "grid_iy", "bucket_weight", "seed_type")
+    center: tuple[float, float]
+    seed_bbox: tuple[float, float, float, float]
+    grid_ix: int
+    grid_iy: int
+    bucket_weight: int = 1
+    seed_type: str = SEED_TYPE_RESIDUAL
 
-    def __init__(self, center, seed_bbox, grid_ix, grid_iy, bucket_weight=1, seed_type=SEED_TYPE_RESIDUAL):
-        self.center = (float(center[0]), float(center[1]))
-        self.seed_bbox = tuple(float(v) for v in seed_bbox)
-        self.grid_ix = int(grid_ix)
-        self.grid_iy = int(grid_iy)
-        self.bucket_weight = int(bucket_weight)
-        self.seed_type = str(seed_type)
+    def __post_init__(self):
+        """规范化 seed 坐标、网格编号和权重类型。"""
+
+        self.center = (float(self.center[0]), float(self.center[1]))
+        self.seed_bbox = tuple(float(v) for v in self.seed_bbox)
+        self.grid_ix = int(self.grid_ix)
+        self.grid_iy = int(self.grid_iy)
+        self.bucket_weight = int(self.bucket_weight)
+        self.seed_type = str(self.seed_type)
 
     def to_json(self):
         """把 seed 转成 JSON 可写格式。"""
@@ -378,34 +411,33 @@ class GridSeedCandidate(object):
         )
 
 
-class MarkerRecord(object):
+@dataclass(slots=True)
+class MarkerRecord:
     """单个 synthetic seed 栅格化后的 marker 记录。"""
 
-    __slots__ = (
-        "marker_id",
-        "source_path",
-        "source_name",
-        "marker_bbox",
-        "marker_center",
-        "clip_bbox",
-        "expanded_bbox",
-        "clip_bbox_q",
-        "expanded_bbox_q",
-        "marker_bbox_q",
-        "shift_limits_px",
-        "clip_bitmap",
-        "expanded_bitmap",
-        "clip_hash",
-        "expanded_hash",
-        "clip_area",
-        "seed_weight",
-        "exact_cluster_id",
-        "metadata",
-    )
+    marker_id: str
+    source_path: str
+    source_name: str
+    marker_bbox: tuple[float, float, float, float]
+    marker_center: tuple[float, float]
+    clip_bbox: tuple[float, float, float, float]
+    expanded_bbox: tuple[float, float, float, float]
+    clip_bbox_q: tuple[int, int, int, int]
+    expanded_bbox_q: tuple[int, int, int, int]
+    marker_bbox_q: tuple[int, int, int, int]
+    shift_limits_px: dict[str, tuple[int, int]]
+    clip_bitmap: np.ndarray
+    expanded_bitmap: np.ndarray
+    clip_hash: str
+    expanded_hash: str
+    clip_area: float
+    seed_weight: int = 1
+    exact_cluster_id: int = -1
+    metadata: dict[str, object] = field(default_factory=dict)
 
-    def __init__(self, **kwargs):
-        for name in self.__slots__:
-            setattr(self, name, kwargs.get(name))
+    def __post_init__(self):
+        """补齐 marker 记录的默认权重、簇编号和 metadata。"""
+
         if self.seed_weight is None:
             self.seed_weight = 1
         if self.exact_cluster_id is None:
@@ -414,24 +446,31 @@ class MarkerRecord(object):
             self.metadata = {}
 
 
-class ExactCluster(object):
+@dataclass(slots=True)
+class ExactCluster:
     """全局 exact hash 聚合后的簇。"""
 
-    __slots__ = ("exact_cluster_id", "exact_key", "representative", "members", "member_count", "weight_sum")
+    exact_cluster_id: int
+    exact_key: str
+    representative: MarkerRecord
+    members: list[MarkerRecord]
+    member_count: int | None = None
+    weight_sum: int | None = None
 
-    def __init__(self, exact_cluster_id, exact_key, representative, members, member_count=None, weight_sum=None):
-        self.exact_cluster_id = int(exact_cluster_id)
-        self.exact_key = str(exact_key)
-        self.representative = representative
-        self.members = list(members)
-        self.member_count = int(member_count) if member_count is not None else int(len(self.members))
-        if weight_sum is None:
+    def __post_init__(self):
+        """规范化 exact cluster 的标识、成员列表和权重汇总。"""
+
+        self.exact_cluster_id = int(self.exact_cluster_id)
+        self.exact_key = str(self.exact_key)
+        self.members = list(self.members)
+        self.member_count = int(self.member_count) if self.member_count is not None else int(len(self.members))
+        if self.weight_sum is None:
             total = 0
             for member in self.members:
                 total += max(1, int(member.seed_weight))
             self.weight_sum = int(total)
         else:
-            self.weight_sum = int(weight_sum)
+            self.weight_sum = int(self.weight_sum)
 
     @property
     def weight(self):
@@ -440,28 +479,27 @@ class ExactCluster(object):
         return int(self.weight_sum)
 
 
-class CandidateClip(object):
+@dataclass(slots=True)
+class CandidateClip:
     """由 exact cluster representative 派生出的 candidate clip。"""
 
-    __slots__ = (
-        "candidate_id",
-        "origin_exact_cluster_id",
-        "origin_exact_key",
-        "center",
-        "clip_bbox",
-        "clip_bbox_q",
-        "clip_bitmap",
-        "clip_hash",
-        "shift_direction",
-        "shift_distance_um",
-        "coverage",
-        "source_marker_id",
-        "origin_seed_type",
-    )
+    candidate_id: str
+    origin_exact_cluster_id: int
+    origin_exact_key: str
+    center: tuple[float, float]
+    clip_bbox: tuple[float, float, float, float]
+    clip_bbox_q: tuple[int, int, int, int]
+    clip_bitmap: np.ndarray
+    clip_hash: str
+    shift_direction: str
+    shift_distance_um: float
+    coverage: set[int] | None
+    source_marker_id: str
+    origin_seed_type: str
 
-    def __init__(self, **kwargs):
-        for name in self.__slots__:
-            setattr(self, name, kwargs.get(name))
+    def __post_init__(self):
+        """补齐 candidate coverage 集合，保留后续原地更新语义。"""
+
         if self.coverage is None:
             self.coverage = set()
 
@@ -709,6 +747,122 @@ def _signature_embedding(desc):
     return vector
 
 
+def _cheap_descriptor(owner):
+    """从 candidate 或 marker bitmap 提取 cheap descriptor。"""
+
+    bitmap = getattr(owner, "clip_bitmap", None)
+    if bitmap is None:
+        return _cheap_bitmap_descriptor(np.zeros((0, 0), dtype=bool))
+    return _cheap_bitmap_descriptor(bitmap)
+
+
+def _cheap_feature_vector(owner):
+    """把 cheap 描述符转成 singleton absorption 排序特征。"""
+
+    desc = _cheap_descriptor(owner)
+    return np.concatenate(
+        [
+            np.asarray(desc.invariants, dtype=np.float32),
+            np.asarray(desc.signature_grid, dtype=np.float32),
+            0.5 * np.asarray(desc.signature_proj_x, dtype=np.float32),
+            0.5 * np.asarray(desc.signature_proj_y, dtype=np.float32),
+        ],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
+def _normalized_cheap_feature_vector(owner):
+    """归一化 cheap 特征，供 singleton absorption KNN 使用。"""
+
+    vector = np.asarray(_cheap_feature_vector(owner), dtype=np.float32)
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return vector
+    return (vector / norm).astype(np.float32, copy=False)
+
+
+def _singleton_context_feature_vector(owner):
+    """提取多尺度 ring、方向投影与象限密度上下文特征。"""
+
+    bitmap = getattr(owner, "clip_bitmap", None)
+    if bitmap is None:
+        return np.zeros(19, dtype=np.float32)
+    mask = np.asarray(bitmap, dtype=bool)
+    height, width = mask.shape if mask.ndim == 2 else (0, 0)
+    if height <= 0 or width <= 0:
+        return np.zeros(19, dtype=np.float32)
+
+    yy, xx = np.indices((height, width), dtype=np.float32)
+    center_y = (float(height) - 1.0) * 0.5
+    center_x = (float(width) - 1.0) * 0.5
+    dx = (xx - center_x) / max(float(width), 1.0)
+    dy = (yy - center_y) / max(float(height), 1.0)
+    radius = np.sqrt(dx * dx + dy * dy)
+    max_radius = max(float(np.max(radius)), 1e-12)
+    radius = radius / max_radius
+    ring_density = []
+    for left, right in zip((0.0, 0.25, 0.50, 0.75), (0.25, 0.50, 0.75, 1.01)):
+        ring_mask = (radius >= float(left)) & (radius < float(right))
+        ring_density.append(float(_safe_ratio(int(np.count_nonzero(mask & ring_mask)), int(np.count_nonzero(ring_mask)))))
+
+    half_h = max(int(height // 2), 1)
+    half_w = max(int(width // 2), 1)
+    top = mask[:half_h, :]
+    bottom = mask[half_h:, :] if half_h < height else mask[:0, :]
+    left = mask[:, :half_w]
+    right = mask[:, half_w:] if half_w < width else mask[:, :0]
+    q1 = mask[:half_h, :half_w]
+    q2 = mask[:half_h, half_w:] if half_w < width else mask[:0, :0]
+    q3 = mask[half_h:, :half_w] if half_h < height else mask[:0, :0]
+    q4 = mask[half_h:, half_w:] if half_h < height and half_w < width else mask[:0, :0]
+
+    def _density(region):
+        """计算局部区域填充密度。"""
+
+        return float(_safe_ratio(int(np.count_nonzero(region)), int(region.size)))
+
+    row_profile = np.mean(mask.astype(np.float32), axis=1) if height > 0 else np.zeros(1, dtype=np.float32)
+    col_profile = np.mean(mask.astype(np.float32), axis=0) if width > 0 else np.zeros(1, dtype=np.float32)
+    x_gradient = float(np.mean(np.abs(np.diff(col_profile)))) if col_profile.size > 1 else 0.0
+    y_gradient = float(np.mean(np.abs(np.diff(row_profile)))) if row_profile.size > 1 else 0.0
+    vector = np.asarray(
+        [
+            *ring_density,
+            _density(top),
+            _density(bottom),
+            _density(left),
+            _density(right),
+            abs(_density(left) - _density(right)),
+            abs(_density(top) - _density(bottom)),
+            _density(q1),
+            _density(q2),
+            _density(q3),
+            _density(q4),
+            abs(_density(q1) - _density(q4)),
+            abs(_density(q2) - _density(q3)),
+            x_gradient,
+            y_gradient,
+            abs(x_gradient - y_gradient),
+        ],
+        dtype=np.float32,
+    )
+    norm = float(np.linalg.norm(vector))
+    if norm > 1e-12:
+        vector = (vector / norm).astype(np.float32, copy=False)
+    return vector
+
+
+def _singleton_context_distance(left, right):
+    """计算 singleton context 特征的 L2 距离。"""
+
+    return float(
+        np.linalg.norm(
+            np.asarray(_singleton_context_feature_vector(left), dtype=np.float32)
+            - np.asarray(_singleton_context_feature_vector(right), dtype=np.float32)
+        )
+    )
+
+
 def _cheap_descriptor_arrays_for_bitmaps(bitmaps):
     """批量提取同 shape bitmap 的 cheap descriptor 数组，避免 prepare-coverage 逐 group 循环。"""
 
@@ -906,7 +1060,7 @@ def _candidate_bundle_fill_neighbor_bins(fill_bin):
 
 
 def _exact_cosine_topk_labels(vectors, k):
-    """对中小 subgroup 执行精确 cosine top-k，避免 HNSW 建索引开销。"""
+    """对中小 subgroup 执行精确 cosine top-k，避免额外近邻索引开销。"""
 
     group_vectors = np.ascontiguousarray(vectors, dtype=np.float32)
     group_count = int(group_vectors.shape[0])
@@ -2736,7 +2890,7 @@ def _sorted_review_merge_candidate_rows(rows):
         key=lambda item: (
             _review_merge_confidence_rank(str(item.get("confidence_tier", ""))),
             -int(item.get("edge_weight", 0) or 0),
-            -int(bool(item.get("target_is_singleton", False))),
+            -int(bool(item.get("endpoint_is_singleton", item.get("target_is_singleton", False)))),
             float(item.get("shift_distance_um", 0.0) or 0.0),
             int(item.get("source_exact_cluster_id", 0) or 0),
             int(item.get("target_exact_cluster_id", 0) or 0),
@@ -2767,6 +2921,64 @@ def _append_bounded_review_merge_row(rows, row):
     prune_threshold = max(int(REVIEW_MERGE_CANDIDATE_TOP_N) * 2, int(REVIEW_MERGE_CANDIDATE_TOP_N) + 1)
     if len(rows) > prune_threshold:
         rows[:] = _tier_balanced_review_merge_candidate_rows(rows)
+
+
+def _singleton_absorption_source_rank(source):
+    """给 singleton absorption 的候选来源排序，越小越优先。"""
+
+    return {
+        "review_edge": 0,
+        "strong_descriptor_graph_agreement": 1,
+        "graph_rescue_context_close": 2,
+        "weak_descriptor_graph_agreement": 6,
+        "descriptor_graph_agreement": 6,
+        "graph_rescue": 6,
+        "descriptor_rescue": 6,
+    }.get(str(source or "review_edge"), 6)
+
+
+def _sorted_singleton_absorption_candidate_rows(rows):
+    """按每个 singleton 的吸收价值排序候选，避免大权重边挤掉小簇。"""
+
+    return sorted(
+        (dict(row) for row in rows),
+        key=lambda item: (
+            int(item.get("singleton_cluster_id", 0) or 0),
+            _singleton_absorption_source_rank(item.get("candidate_source", "review_edge")),
+            _review_merge_confidence_rank(str(item.get("confidence_tier", ""))),
+            -int(item.get("edge_weight", 0) or 0),
+            abs(float(item.get("shift_distance_um", 0.0) or 0.0)),
+            int(item.get("absorb_cluster_id", 0) or 0),
+            int(item.get("singleton_exact_cluster_id", 0) or 0),
+            str(item.get("candidate_id", "")),
+        ),
+    )
+
+
+def _append_singleton_absorption_candidate_row(rows_by_singleton, row):
+    """按 singleton 粒度流式保留 top-K absorption 候选。"""
+
+    singleton_cluster_id = int(row.get("singleton_cluster_id", 0) or 0)
+    if singleton_cluster_id <= 0:
+        return
+    bucket = rows_by_singleton.setdefault(singleton_cluster_id, [])
+    bucket.append(dict(row))
+    prune_threshold = max(int(SINGLETON_ABSORPTION_TOP_K) * 2, int(SINGLETON_ABSORPTION_TOP_K) + 1)
+    if len(bucket) > prune_threshold:
+        bucket[:] = _sorted_singleton_absorption_candidate_rows(bucket)[: int(SINGLETON_ABSORPTION_TOP_K)]
+
+
+def _flatten_singleton_absorption_candidate_rows(rows_by_singleton):
+    """展开每个 singleton 的 top-K 候选池，供 absorption 阶段使用。"""
+
+    rows = []
+    for singleton_cluster_id in sorted(rows_by_singleton):
+        rows.extend(
+            _sorted_singleton_absorption_candidate_rows(rows_by_singleton[int(singleton_cluster_id)])[
+                : int(SINGLETON_ABSORPTION_TOP_K)
+            ]
+        )
+    return rows
 
 
 def _maybe_float(value):
@@ -2837,7 +3049,7 @@ def _pairwise_endpoint_is_low_quality(endpoint_quality):
 
 
 def _review_merge_pair_bucket(pair_row, source_quality, target_quality):
-    """按端点质量和候选置信度给 cluster pair 分桶，方便 safe recall merge 只吃低风险边。"""
+    """按端点质量和候选置信度给 cluster pair 分桶，方便 singleton absorption 识别候选。"""
 
     if int(pair_row.get("high_conf_row_count", 0) or 0) <= 0:
         return "low_confidence_candidate"
@@ -2848,7 +3060,7 @@ def _review_merge_pair_bucket(pair_row, source_quality, target_quality):
         return "high_shift_touching_candidate"
     if _pairwise_endpoint_is_low_quality(source_quality) or _pairwise_endpoint_is_low_quality(target_quality):
         return "overmerge_touching_candidate"
-    return "safe_recall_candidate"
+    return "singleton_absorption_candidate"
 
 
 def _sorted_review_merge_cluster_pair_rows(rows):
@@ -2883,6 +3095,7 @@ def _review_merge_cluster_pair_rows(review_merge_rows, endpoint_quality_by_id):
                 "row_count": 0,
                 "candidate_ids": set(),
                 "singleton_target_row_count": 0,
+                "singleton_endpoint_row_count": 0,
                 "tier_row_counts": Counter(),
                 "tier_edge_weights": Counter(),
             },
@@ -2894,6 +3107,8 @@ def _review_merge_cluster_pair_rows(review_merge_rows, endpoint_quality_by_id):
         state["candidate_ids"].add(str(row.get("candidate_id", "")))
         if bool(row.get("target_is_singleton", False)):
             state["singleton_target_row_count"] = int(state["singleton_target_row_count"]) + 1
+        if bool(row.get("endpoint_is_singleton", row.get("target_is_singleton", False))):
+            state["singleton_endpoint_row_count"] = int(state["singleton_endpoint_row_count"]) + 1
         state["tier_row_counts"][tier] += 1
         state["tier_edge_weights"][tier] += int(edge_weight)
 
@@ -2908,6 +3123,7 @@ def _review_merge_cluster_pair_rows(review_merge_rows, endpoint_quality_by_id):
             "row_count": int(state["row_count"]),
             "unique_candidate_count": int(len(state["candidate_ids"])),
             "singleton_target_row_count": int(state["singleton_target_row_count"]),
+            "singleton_endpoint_row_count": int(state["singleton_endpoint_row_count"]),
             "high_conf_row_count": int(state["tier_row_counts"].get("high", 0)),
             "medium_conf_row_count": int(state["tier_row_counts"].get("medium", 0)),
             "low_conf_row_count": int(state["tier_row_counts"].get("low", 0)),
@@ -3162,6 +3378,42 @@ def _candidate_matches_exact(candidate, exact_cluster, config, descriptor_cache)
     return False, _dominant_reject_reason(reject_reasons), "none"
 
 
+def _normal_graph_gate_reason(candidate_desc, witness_desc):
+    """执行 singleton absorption normal fallback 使用的普通 graph gate。"""
+
+    invariant_score, critical = _graph_invariant_distance(candidate_desc, witness_desc)
+    if critical or invariant_score > float(GRAPH_INVARIANT_LIMIT):
+        return False, "graph_invariant"
+    topology_dist = float(
+        np.linalg.norm(np.asarray(candidate_desc.topology, dtype=np.float64) - np.asarray(witness_desc.topology, dtype=np.float64))
+    )
+    if topology_dist > float(GRAPH_TOPOLOGY_THRESHOLD):
+        return False, "graph_topology"
+    if _graph_signature_similarity(candidate_desc, witness_desc) < float(GRAPH_SIGNATURE_THRESHOLD):
+        return False, "graph_signature"
+    return True, "verified_shift_witness"
+
+
+def _candidate_matches_exact_normal(candidate, exact_cluster, config, descriptor_cache):
+    """使用普通 graph gate 判断 absorption fallback 是否可接受。"""
+
+    reject_reasons = []
+    for witness in _target_witness_candidates(exact_cluster, config):
+        if str(candidate.clip_hash) == str(witness.clip_hash):
+            return True, "exact_hash", str(witness.shift_direction)
+        geometry_ok, geometry_reason = _geometry_match_reason(candidate, witness, config)
+        if not geometry_ok:
+            reject_reasons.append(str(geometry_reason))
+            continue
+        candidate_desc = _descriptor_for_candidate(candidate, descriptor_cache)
+        witness_desc = _graph_bitmap_descriptor(witness.clip_bitmap)
+        matched, reason = _normal_graph_gate_reason(candidate_desc, witness_desc)
+        if matched:
+            return True, reason, str(witness.shift_direction)
+        reject_reasons.append(str(reason))
+    return False, _dominant_reject_reason(reject_reasons), "none"
+
+
 def distance_worst_case_proxy(bitmap):
     """用距离变换估计窄线宽、窄间距带来的代表样本风险。"""
 
@@ -3227,7 +3479,7 @@ def _empty_coverage_debug_stats():
         "shortlist_subgroup_count": 0,
         "shortlist_max_subgroup_size": 0,
         "shortlist_exact_subgroup_count": 0,
-        "shortlist_hnsw_subgroup_count": 0,
+        "shortlist_sklearn_subgroup_count": 0,
         "full_prefilter_probe_pair_count": 0,
         "full_prefilter_probe_reject_count": 0,
         "full_prefilter_disabled_bundle_count": 0,
@@ -3923,16 +4175,13 @@ def _build_bundle_shortlist_index(bundle, debug_stats):
                 neighbor_labels[int(global_idx), :k] = group_indices[:k]
             continue
         group_vectors = np.ascontiguousarray(signature_vectors[group_indices], dtype=np.float32)
-        if int(group_indices.size) <= int(COVERAGE_EXACT_SHORTLIST_MAX_GROUPS) or hnswlib is None:
+        if int(group_indices.size) <= int(COVERAGE_EXACT_SHORTLIST_MAX_GROUPS) or NearestNeighbors is None:
             debug_stats["shortlist_exact_subgroup_count"] += 1
             local_labels = _exact_cosine_topk_labels(group_vectors, k)
         else:
-            debug_stats["shortlist_hnsw_subgroup_count"] += 1
-            index = hnswlib.Index(space="cosine", dim=int(group_vectors.shape[1]))
-            index.init_index(max_elements=int(group_indices.size), ef_construction=max(64, k * 2), M=12)
-            index.add_items(group_vectors, np.arange(int(group_indices.size), dtype=np.int64))
-            index.set_ef(max(64, k * 2))
-            local_labels, _ = index.knn_query(group_vectors, k=k)
+            debug_stats["shortlist_sklearn_subgroup_count"] += 1
+            index = NearestNeighbors(n_neighbors=k, metric="cosine", algorithm="brute")
+            local_labels = index.fit(group_vectors).kneighbors(group_vectors, return_distance=False)
         mapped_labels = group_indices[np.asarray(local_labels, dtype=np.int64)]
         for row_idx, global_idx in enumerate(group_indices.tolist()):
             neighbor_labels[int(global_idx), :k] = mapped_labels[row_idx, :k]
@@ -4525,8 +4774,8 @@ def _csr_candidate_priority(metadata, offsets, values, candidate_index, uncovere
     representative_score = _metadata_representative_score(item, covered_weight, total_weight)
     confidence_proxy = float(_safe_ratio(confidence_weighted_sum, max(confidence_weight, 1)))
     return (
-        -int(covered_weight),
         -int(count),
+        -int(covered_weight),
         -float(representative_score),
         -float(confidence_proxy),
         0 if str(item.get("shift_direction", "")) == "base" else 1,
@@ -4642,7 +4891,7 @@ def selected_candidates_from_csr(candidate_metadata, coverage_offsets, coverage_
 
 
 def greedy_cover(candidates, exact_clusters, config=None):
-    """按 coverage 权重执行 greedy set cover。"""
+    """按未覆盖 exact 数优先执行 greedy set cover，减少最终 singleton 数量。"""
 
     uncovered = set(int(cluster.exact_cluster_id) for cluster in exact_clusters)
     weights = dict((int(cluster.exact_cluster_id), int(cluster.weight)) for cluster in exact_clusters)
@@ -4696,8 +4945,8 @@ def greedy_cover(candidates, exact_clusters, config=None):
             confidence_weight += exact_weight
         confidence_proxy = float(_safe_ratio(confidence_weighted_sum, max(confidence_weight, 1)))
         return (
-            -covered_weight,
             -len(covered_now),
+            -covered_weight,
             -float(representative_score),
             -float(confidence_proxy),
             *_candidate_greedy_tiebreak(candidate),
@@ -5027,7 +5276,7 @@ def _cluster_units_from_result(result, exact_clusters, selected_candidates):
 
 
 def _materialize_result_from_cluster_units(result, cluster_units, exact_clusters, config):
-    """把 safe recall merge 后的 cluster units 写回 result 主结构。"""
+    """把 singleton absorption 后的 cluster units 写回 result 主结构。"""
 
     exact_by_id = dict((int(cluster.exact_cluster_id), cluster) for cluster in exact_clusters)
     total_exact_weight = max(int(sum(_exact_cluster_weight(cluster) for cluster in exact_clusters)), 1)
@@ -5108,11 +5357,13 @@ def _build_coverage_graph_fragmentation_metrics_exact_review(candidate_evidence_
     review_merge_candidate_edge_count = 0
     review_merge_candidate_edge_weight = 0
     review_merge_candidate_rows = []
+    singleton_absorption_rows_by_singleton = {}
     review_merge_weight_by_tier = Counter()
     review_merge_edge_count_by_tier = Counter()
     high_conf_singleton_mergeable_edge_weight = 0
     singleton_trusted_mergeable_edge_count = 0
     singleton_trusted_mergeable_edge_weight = 0
+    singleton_total_count = sum(1 for count in final_cluster_exact_counts.values() if int(count) == 1)
 
     for evidence in candidate_evidence_rows:
         candidate_id = str(evidence.get("candidate_id", ""))
@@ -5149,33 +5400,64 @@ def _build_coverage_graph_fragmentation_metrics_exact_review(candidate_evidence_
                     target_seed_type,
                     float(evidence.get("shift_distance_um", 0.0)),
                 )
-                target_is_singleton = int(final_cluster_exact_counts.get(target_final_cluster, 0)) == 1
+                source_cluster_exact_count = int(final_cluster_exact_counts.get(source_final_cluster, 0))
+                target_cluster_exact_count = int(final_cluster_exact_counts.get(target_final_cluster, 0))
+                source_is_singleton = source_cluster_exact_count == 1
+                target_is_singleton = target_cluster_exact_count == 1
+                endpoint_is_singleton = bool(
+                    source_is_singleton != target_is_singleton
+                    and source_cluster_exact_count > 0
+                    and target_cluster_exact_count > 0
+                )
                 review_merge_weight_by_tier[str(confidence_tier)] += int(edge_weight)
                 review_merge_edge_count_by_tier[str(confidence_tier)] += 1
-                if target_is_singleton:
+                if endpoint_is_singleton:
                     singleton_trusted_mergeable_edge_count += 1
                     singleton_trusted_mergeable_edge_weight += int(edge_weight)
                     if str(confidence_tier) == "high":
                         high_conf_singleton_mergeable_edge_weight += int(edge_weight)
+                row = {
+                    "source_exact_cluster_id": int(source_id),
+                    "target_exact_cluster_id": int(target_id),
+                    "source_cluster_id": int(source_final_cluster) + 1,
+                    "target_cluster_id": int(target_final_cluster) + 1,
+                    "candidate_id": str(candidate_id),
+                    "edge_weight": int(edge_weight),
+                    "candidate_seed_type": str(candidate_seed_type),
+                    "target_seed_type": str(target_seed_type),
+                    "shift_direction": str(evidence.get("shift_direction", "unknown")),
+                    "shift_distance_um": float(evidence.get("shift_distance_um", 0.0)),
+                    "confidence_tier": str(confidence_tier),
+                    "confidence_reason": str(confidence_reason),
+                    "source_is_singleton": bool(source_is_singleton),
+                    "target_is_singleton": bool(target_is_singleton),
+                    "endpoint_is_singleton": bool(endpoint_is_singleton),
+                    "source_cluster_exact_count": int(source_cluster_exact_count),
+                    "target_cluster_exact_count": int(target_cluster_exact_count),
+                }
+                if endpoint_is_singleton and str(confidence_tier) in {"high", "medium"}:
+                    if source_is_singleton:
+                        row.update(
+                            {
+                                "singleton_cluster_id": int(source_final_cluster) + 1,
+                                "absorb_cluster_id": int(target_final_cluster) + 1,
+                                "singleton_exact_cluster_id": int(source_id),
+                                "absorb_exact_cluster_id": int(target_id),
+                            }
+                        )
+                    else:
+                        row.update(
+                            {
+                                "singleton_cluster_id": int(target_final_cluster) + 1,
+                                "absorb_cluster_id": int(source_final_cluster) + 1,
+                                "singleton_exact_cluster_id": int(target_id),
+                                "absorb_exact_cluster_id": int(source_id),
+                            }
+                        )
+                    _append_singleton_absorption_candidate_row(singleton_absorption_rows_by_singleton, row)
                 _append_bounded_review_merge_row(
                     review_merge_candidate_rows,
-                    {
-                        "source_exact_cluster_id": int(source_id),
-                        "target_exact_cluster_id": int(target_id),
-                        "source_cluster_id": int(source_final_cluster) + 1,
-                        "target_cluster_id": int(target_final_cluster) + 1,
-                        "candidate_id": str(candidate_id),
-                        "edge_weight": int(edge_weight),
-                        "candidate_seed_type": str(candidate_seed_type),
-                        "target_seed_type": str(target_seed_type),
-                        "shift_direction": str(evidence.get("shift_direction", "unknown")),
-                        "shift_distance_um": float(evidence.get("shift_distance_um", 0.0)),
-                        "confidence_tier": str(confidence_tier),
-                        "confidence_reason": str(confidence_reason),
-                        "target_is_singleton": bool(target_is_singleton),
-                        "source_cluster_exact_count": int(final_cluster_exact_counts.get(source_final_cluster, 0)),
-                        "target_cluster_exact_count": int(final_cluster_exact_counts.get(target_final_cluster, 0)),
-                    },
+                    row,
                 )
 
     trusted_seen_edges = set()
@@ -5205,7 +5487,9 @@ def _build_coverage_graph_fragmentation_metrics_exact_review(candidate_evidence_
             if target_final_cluster != int(source_final_cluster):
                 trusted_cross_edge_count += 1
                 trusted_cross_edge_weight += int(edge_weight)
-                if int(final_cluster_exact_counts.get(target_final_cluster, 0)) == 1:
+                source_is_singleton = int(final_cluster_exact_counts.get(source_final_cluster, 0)) == 1
+                target_is_singleton = int(final_cluster_exact_counts.get(target_final_cluster, 0)) == 1
+                if source_is_singleton != target_is_singleton:
                     singleton_trusted_mergeable_edge_count += 1
                     singleton_trusted_mergeable_edge_weight += int(edge_weight)
 
@@ -5213,6 +5497,7 @@ def _build_coverage_graph_fragmentation_metrics_exact_review(candidate_evidence_
     trusted_cross_ratio = float(_safe_ratio(trusted_cross_edge_weight, trusted_edge_weight))
     trusted_or_review_weight = int(trusted_edge_weight) + int(review_merge_candidate_edge_weight)
     bounded_review_merge_rows = _tier_balanced_review_merge_candidate_rows(review_merge_candidate_rows)
+    singleton_absorption_candidate_rows = _flatten_singleton_absorption_candidate_rows(singleton_absorption_rows_by_singleton)
     return {
         "raw_coverage_graph_edge_count": int(raw_edge_count),
         "raw_coverage_graph_cross_cluster_edge_count": int(raw_cross_edge_count),
@@ -5241,7 +5526,11 @@ def _build_coverage_graph_fragmentation_metrics_exact_review(candidate_evidence_
         "singleton_trusted_mergeable_edge_count": int(singleton_trusted_mergeable_edge_count),
         "singleton_trusted_mergeable_edge_weight": int(singleton_trusted_mergeable_edge_weight),
         "singleton_trusted_mergeable_weight_ratio": float(_safe_ratio(singleton_trusted_mergeable_edge_weight, trusted_or_review_weight)),
+        "singleton_total_count": int(singleton_total_count),
+        "singleton_with_candidate_count": int(len(singleton_absorption_rows_by_singleton)),
+        "singleton_candidate_coverage_ratio": float(_safe_ratio(len(singleton_absorption_rows_by_singleton), singleton_total_count)),
         "review_merge_candidate_rows": bounded_review_merge_rows,
+        "singleton_absorption_candidate_rows": singleton_absorption_candidate_rows,
     }
 
 
@@ -5464,6 +5753,8 @@ def _build_quality_metrics_exact_review(cluster_units, exact_clusters, candidate
                     "pairwise_geometry_sample_status": str(metrics.get("pairwise_geometry_sample_status", "unknown")),
                     "overmerge_score": float(metrics.get("overmerge_score", 0.0)),
                     "overmerge_reason": str(metrics.get("overmerge_reason", "ok")),
+                    "representative_seed_type": str(cluster_payloads[int(cluster_index)].get("representative_seed_type", "unknown")),
+                    "shift_distance_um": float(cluster_payloads[int(cluster_index)].get("shift_distance_um", 0.0)),
                 },
             )
             for cluster_index, metrics in sorted(cluster_quality_by_index.items())
@@ -5471,171 +5762,859 @@ def _build_quality_metrics_exact_review(cluster_units, exact_clusters, candidate
     }
 
 
-def _safe_recall_merge_exact_review(cluster_units, quality_metrics, candidate_evidence_by_id, candidate_bitmap_locations, config):
-    """对 safe recall pair 做保守合并，必须通过 candidate union coverage 与 strict verification。"""
+def _apply_singleton_absorption_exact_review(cluster_units, quality_metrics, config):
+    """用 v1 收尾版 singleton absorption 与 strict-only microcluster 更新 cluster units。"""
 
     original_units = [(candidate, list(exact_clusters)) for candidate, exact_clusters in cluster_units]
     metrics = {
-        "safe_recall_merge_enabled": True,
-        "safe_recall_merge_candidate_pair_count": 0,
-        "safe_recall_merge_attempted_pair_count": 0,
-        "safe_recall_merge_merged_pair_count": 0,
-        "safe_recall_merge_cluster_reduction": 0,
-        "safe_recall_merge_checked_exact_count": 0,
-        "safe_recall_merge_reject_reason_counts": {},
+        "singleton_absorption_enabled": True,
+        "singleton_absorption_candidate_edge_count": 0,
+        "singleton_absorption_candidate_singleton_count": 0,
+        "singleton_total_count": int(quality_metrics.get("singleton_total_count", 0) or 0),
+        "singleton_with_candidate_count": int(quality_metrics.get("singleton_with_candidate_count", 0) or 0),
+        "singleton_candidate_coverage_ratio": float(quality_metrics.get("singleton_candidate_coverage_ratio", 0.0) or 0.0),
+        "singleton_absorption_attempted_count": 0,
+        "singleton_absorption_merged_count": 0,
+        "singleton_absorption_strict_merged_count": 0,
+        "singleton_absorption_normal_visual_attempted_count": 0,
+        "singleton_absorption_normal_visual_merged_count": 0,
+        "singleton_absorption_cluster_reduction": 0,
+        "singleton_absorption_checked_exact_count": 0,
+        "singleton_absorption_candidate_source_counts": {},
+        "singleton_absorption_attempted_by_source": {},
+        "singleton_absorption_merged_by_source": {},
+        "singleton_absorption_reject_reason_by_source": {},
+        "singleton_absorption_reject_reason_counts": {},
+        "singleton_absorption_descriptor_rescue_candidate_count": 0,
+        "singleton_absorption_descriptor_rescue_singleton_count": 0,
+        "singleton_absorption_graph_rescue_candidate_count": 0,
+        "singleton_absorption_graph_rescue_singleton_count": 0,
+        "singleton_absorption_graph_rescue_context_close_candidate_count": 0,
+        "singleton_absorption_graph_rescue_context_close_singleton_count": 0,
+        "singleton_absorption_rescue_agreement_candidate_count": 0,
+        "singleton_absorption_strong_agreement_candidate_count": 0,
+        "singleton_absorption_rescue_selected_by_source": {},
+        "singleton_absorption_rescue_distance_bucket_by_source": {},
+        "singleton_absorption_merge_rate_by_rank_source": {},
+        "singleton_microcluster_candidate_count": 0,
+        "singleton_microcluster_pair_candidate_count": 0,
+        "singleton_microcluster_clique_candidate_count": 0,
+        "singleton_microcluster_pair_attempted_count": 0,
+        "singleton_microcluster_clique_attempted_count": 0,
+        "singleton_microcluster_pair_merged_count": 0,
+        "singleton_microcluster_clique_merged_count": 0,
+        "singleton_microcluster_attempted_count": 0,
+        "singleton_microcluster_merged_count": 0,
+        "singleton_microcluster_reject_reason_counts": {},
+        "singleton_microcluster_reject_reason_by_source": {},
+        "singleton_microcluster_pair_reject_reason_counts": {},
+        "singleton_microcluster_clique_reject_reason_counts": {},
+        "singleton_microcluster_pair_distance_bucket_counts": {},
+        "singleton_microcluster_clique_distance_bucket_counts": {},
+        "singleton_no_candidate_by_seed_type": {},
+        "singleton_candidate_by_seed_type": {},
     }
-    review_rows = [dict(row) for row in list(quality_metrics.get("review_merge_candidate_rows", []) or [])]
-    pair_rows = [dict(row) for row in list(quality_metrics.get("review_merge_cluster_pair_rows", []) or [])]
-    if not review_rows or not pair_rows:
-        return original_units, metrics
 
-    unit_by_cluster_id = dict(
-        (int(cluster_index) + 1, (candidate, list(assigned_exact_clusters)))
+    review_source = quality_metrics.get("singleton_absorption_candidate_rows")
+    if not review_source:
+        review_source = quality_metrics.get("review_merge_candidate_rows", [])
+    review_rows = [dict(row) for row in list(review_source or [])]
+    unit_by_cluster_id = {
+        int(cluster_index) + 1: (candidate, list(assigned_exact_clusters))
         for cluster_index, (candidate, assigned_exact_clusters) in enumerate(original_units)
-    )
-    selected_candidate_ids = set(str(candidate.candidate_id) for candidate, _ in original_units)
-    safe_pair_rows = {}
-    skip_reasons = Counter()
-    for row in pair_rows:
-        pair_key = _cluster_pair_key(row)
-        if str(row.get("pair_review_bucket", "")) != "safe_recall_candidate":
-            continue
-        safe_pair_rows[pair_key] = row
-    metrics["safe_recall_merge_candidate_pair_count"] = int(len(safe_pair_rows))
-    if not safe_pair_rows:
-        return original_units, metrics
-
-    high_rows_by_pair = defaultdict(list)
-    for row in review_rows:
-        if str(row.get("confidence_tier", "")) != "high":
-            continue
-        pair_key = _cluster_pair_key(row)
-        if pair_key in safe_pair_rows:
-            high_rows_by_pair[pair_key].append(row)
-
-    exact_weight_by_id = {}
-    for _, assigned_exact_clusters in original_units:
-        for exact_cluster in assigned_exact_clusters:
-            exact_weight_by_id[int(exact_cluster.exact_cluster_id)] = int(_exact_cluster_weight(exact_cluster))
-
-    merge_candidates = []
-    for pair_key, pair_row in safe_pair_rows.items():
-        rows_for_pair = list(high_rows_by_pair.get(pair_key, []))
-        if not rows_for_pair:
-            skip_reasons["no_high_conf_evidence"] += 1
-            continue
-        unique_target_ids = set(int(row.get("target_exact_cluster_id", -1)) for row in rows_for_pair)
-        unique_target_weight = int(sum(exact_weight_by_id.get(exact_id, 0) for exact_id in unique_target_ids))
-        high_edge_weight = int(sum(max(int(row.get("edge_weight", 0) or 0), 0) for row in rows_for_pair))
-        merge_candidates.append((-unique_target_weight, -high_edge_weight, pair_key, pair_row, rows_for_pair))
-    merge_candidates.sort(key=lambda item: (item[0], item[1], item[2][0], item[2][1]))
-
-    consumed_cluster_ids = set()
-    used_merge_candidate_ids = set()
-    merged_units_by_cluster_id = {}
-    candidate_cache = {}
+    }
+    exact_count_by_cluster_id = {
+        int(cluster_id): int(len(assigned_exact_clusters))
+        for cluster_id, (_, assigned_exact_clusters) in unit_by_cluster_id.items()
+    }
+    cluster_quality_by_index = dict(quality_metrics.get("cluster_quality_by_index", {}) or {})
     descriptor_cache = {}
 
-    def _record_skip(reason):
-        skip_reasons[str(reason)] += 1
+    def _cluster_quality(cluster_id):
+        """读取 final cluster 质量指标，缺失时返回空 dict。"""
 
-    def _load_candidate(candidate_id):
-        if str(candidate_id) in candidate_cache:
-            return candidate_cache[str(candidate_id)]
-        evidence = candidate_evidence_by_id.get(str(candidate_id))
-        if evidence is None:
-            candidate_cache[str(candidate_id)] = None
-            return None
-        candidate = _candidate_clip_from_evidence(evidence, candidate_bitmap_locations)
-        candidate_cache[str(candidate_id)] = candidate
-        return candidate
+        cluster_index = int(cluster_id) - 1
+        payload = cluster_quality_by_index.get(cluster_index)
+        if payload is None:
+            payload = cluster_quality_by_index.get(str(cluster_index), {})
+        return dict(payload or {})
 
-    for _, _, pair_key, pair_row, rows_for_pair in merge_candidates[:SAFE_RECALL_MERGE_TOP_PAIR_N]:
-        source_cluster_id, target_cluster_id = pair_key
-        if source_cluster_id in consumed_cluster_ids or target_cluster_id in consumed_cluster_ids:
-            _record_skip("cluster_already_merged")
-            continue
+    def _cluster_seed_type(cluster_id):
+        """读取 final cluster representative seed type，缺失时回退到 candidate。"""
+
+        payload = _cluster_quality(int(cluster_id))
+        seed_type = payload.get("representative_seed_type")
+        if seed_type:
+            return str(seed_type)
+        unit = unit_by_cluster_id.get(int(cluster_id))
+        if unit is not None:
+            return str(getattr(unit[0], "origin_seed_type", "unknown") or "unknown")
+        return "unknown"
+
+    def _target_reject_reason(cluster_id):
+        """只拦截代表验证已失败或 overmerge 风险高的吸收目标。"""
+
+        payload = _cluster_quality(int(cluster_id))
+        if int(payload.get("representative_visual_fail_count", 0) or 0) > 0:
+            return "target_representative_visual_fail"
+        checked_count = int(payload.get("representative_visual_checked_count", 0) or 0)
+        pass_ratio = float(payload.get("representative_visual_pass_ratio", 1.0) or 0.0)
+        if checked_count > 0 and pass_ratio < float(SINGLETON_ABSORPTION_NORMAL_VISUAL_MIN_PASS_RATIO):
+            return "target_representative_visual_low_ratio"
+        if float(payload.get("overmerge_score", 0.0) or 0.0) >= float(SINGLETON_ABSORPTION_TARGET_OVERMERGE_SCORE_LIMIT):
+            return "target_overmerge_score"
+        return None
+
+    def _normal_visual_guard_reject_reason(cluster_id, candidate):
+        """normal fallback 只额外拦截 long-shape large-shift target。"""
+
+        payload = _cluster_quality(int(cluster_id))
+        representative_seed_type = str(payload.get("representative_seed_type", getattr(candidate, "origin_seed_type", "")) or "")
+        shift_distance_um = abs(float(payload.get("shift_distance_um", getattr(candidate, "shift_distance_um", 0.0)) or 0.0))
         if (
-            str(pair_row.get("source_overmerge_reason", "ok") or "ok") != "ok"
-            or str(pair_row.get("target_overmerge_reason", "ok") or "ok") != "ok"
+            representative_seed_type == SEED_TYPE_LONG
+            and shift_distance_um > float(config.get("clip_size_um", 1.35)) * float(OVERMERGE_LARGE_SHIFT_RATIO)
         ):
-            _record_skip("endpoint_overmerge_reason")
-            continue
-        source_unit = unit_by_cluster_id.get(source_cluster_id)
-        target_unit = unit_by_cluster_id.get(target_cluster_id)
-        if source_unit is None or target_unit is None:
-            _record_skip("missing_endpoint_cluster")
-            continue
-        union_exact_clusters = list(source_unit[1]) + list(target_unit[1])
-        if len(union_exact_clusters) > int(SAFE_RECALL_MERGE_MAX_UNION_EXACT_COUNT):
-            _record_skip("union_exact_count_limit")
-            continue
+            return "target_long_shape_large_shift"
+        return None
 
-        metrics["safe_recall_merge_attempted_pair_count"] = int(metrics["safe_recall_merge_attempted_pair_count"]) + 1
-        metrics["safe_recall_merge_checked_exact_count"] = int(metrics["safe_recall_merge_checked_exact_count"]) + int(len(union_exact_clusters))
-        union_exact_ids = set(int(exact_cluster.exact_cluster_id) for exact_cluster in union_exact_clusters)
-        candidate_weight_by_id = Counter()
-        for row in rows_for_pair:
-            candidate_weight_by_id[str(row.get("candidate_id", ""))] += max(int(row.get("edge_weight", 0) or 0), 0)
-        accepted_candidate = None
-        candidate_failure_reason = "missing_candidate_evidence"
-        for candidate_id, _ in sorted(candidate_weight_by_id.items(), key=lambda item: (-int(item[1]), str(item[0]))):
-            if candidate_id in used_merge_candidate_ids:
-                candidate_failure_reason = "candidate_already_used"
-                continue
-            candidate = _load_candidate(candidate_id)
-            if candidate is None:
-                candidate_failure_reason = "missing_candidate_evidence"
-                continue
-            if getattr(candidate, "clip_bitmap", None) is None:
-                candidate_failure_reason = "missing_candidate_bitmap"
-                continue
-            coverage_ids = set(int(exact_id) for exact_id in getattr(candidate, "coverage", set()))
-            if not union_exact_ids.issubset(coverage_ids):
-                candidate_failure_reason = "candidate_missing_union_coverage"
-                continue
-            all_matched = True
-            for exact_cluster in union_exact_clusters:
-                matched, _, _ = _candidate_matches_exact(candidate, exact_cluster, config, descriptor_cache)
-                if not matched:
-                    all_matched = False
-                    candidate_failure_reason = "strict_verification_reject"
+    def _singleton_candidate_from_row(row):
+        """从 high/medium row 中提取 singleton 与 non-singleton 吸收目标。"""
+
+        if str(row.get("confidence_tier", "")) not in {"high", "medium"}:
+            return None
+        singleton_cluster_id = int(row.get("singleton_cluster_id", 0) or 0)
+        absorb_cluster_id = int(row.get("absorb_cluster_id", 0) or 0)
+        singleton_exact_id = int(row.get("singleton_exact_cluster_id", -1) or -1)
+        if singleton_cluster_id > 0 and absorb_cluster_id > 0:
+            return singleton_cluster_id, absorb_cluster_id, singleton_exact_id
+        source_cluster_id = int(row.get("source_cluster_id", 0) or 0)
+        target_cluster_id = int(row.get("target_cluster_id", 0) or 0)
+        if source_cluster_id <= 0 or target_cluster_id <= 0 or source_cluster_id == target_cluster_id:
+            return None
+        source_count = int(exact_count_by_cluster_id.get(source_cluster_id, 0))
+        target_count = int(exact_count_by_cluster_id.get(target_cluster_id, 0))
+        if source_count == 1 and target_count > 1:
+            return source_cluster_id, target_cluster_id, int(row.get("source_exact_cluster_id", -1) or -1)
+        if target_count == 1 and source_count > 1:
+            return target_cluster_id, source_cluster_id, int(row.get("target_exact_cluster_id", -1) or -1)
+        return None
+
+    def _seed_types_are_absorption_compatible(singleton_seed_type, target_seed_type):
+        """判断 singleton absorption 是否允许跨 seed type 尝试。"""
+
+        left = str(singleton_seed_type)
+        right = str(target_seed_type)
+        if left == right:
+            return True
+        if left == SEED_TYPE_RESIDUAL or right == SEED_TYPE_RESIDUAL:
+            return True
+        if left == SEED_TYPE_ARRAY_SPACE and right == SEED_TYPE_ARRAY:
+            return True
+        if left == SEED_TYPE_ARRAY and right == SEED_TYPE_ARRAY_SPACE:
+            return True
+        return False
+
+    def _rescue_confidence(source_name, singleton_seed_type, target_seed_type, distance):
+        """给主动 rescue 候选打 absorption 专用 confidence。"""
+
+        compatible = _seed_types_are_absorption_compatible(singleton_seed_type, target_seed_type)
+        if str(singleton_seed_type) == str(target_seed_type) and float(distance) <= float(SINGLETON_ABSORPTION_DESCRIPTOR_HIGH_DISTANCE):
+            return "high", "%s_same_seed_close" % str(source_name)
+        if compatible and float(distance) <= float(SINGLETON_ABSORPTION_DESCRIPTOR_MEDIUM_DISTANCE):
+            return "medium", "%s_compatible_seed_close" % str(source_name)
+        return None
+
+    def _rescue_combined_distance(row):
+        """综合 descriptor、graph 与 context 距离，仅用于候选排序。"""
+
+        explicit = row.get("rescue_combined_distance")
+        if explicit is not None:
+            return float(explicit or 0.0)
+        distances = [float(row[key]) for key in ("descriptor_distance", "graph_distance") if row.get(key) is not None]
+        base_distance = float(sum(distances) / len(distances)) if distances else 0.0
+        context_distance = float(row.get("context_distance", 0.0) or 0.0)
+        return float(0.85 * base_distance + 0.15 * context_distance)
+
+    def _rescue_distance_bucket(row):
+        """把 rescue 综合距离分桶，方便测试和诊断判断候选质量。"""
+
+        distance = float(_rescue_combined_distance(row))
+        if distance <= 0.10:
+            return "le_0.10"
+        if distance <= 0.18:
+            return "le_0.18"
+        if distance <= 0.38:
+            return "le_0.38"
+        return "gt_0.38"
+
+    def _rescue_sort_key(row):
+        """按 source、confidence、综合距离与 shift 排序 rescue 候选。"""
+
+        endpoint = _singleton_candidate_from_row(row)
+        absorb_cluster_id = int(endpoint[1]) if endpoint is not None else 0
+        singleton_exact_id = int(endpoint[2]) if endpoint is not None else 0
+        return (
+            _singleton_absorption_source_rank(row.get("candidate_source", "review_edge")),
+            _review_merge_confidence_rank(str(row.get("confidence_tier", ""))),
+            float(_rescue_combined_distance(row)),
+            abs(float(row.get("shift_distance_um", 0.0) or 0.0)),
+            -max(int(row.get("edge_weight", 0) or 0), 0),
+            int(absorb_cluster_id),
+            int(singleton_exact_id),
+        )
+
+    def _rescue_row(singleton_cluster_id, absorb_cluster_id, singleton_exact, target_candidate, source_name, distance, distance_key):
+        """构造 descriptor/graph rescue 的统一候选行。"""
+
+        singleton_seed_type = _cluster_seed_type(int(singleton_cluster_id))
+        target_seed_type = _cluster_seed_type(int(absorb_cluster_id))
+        confidence = _rescue_confidence(source_name, singleton_seed_type, target_seed_type, float(distance))
+        if confidence is None:
+            return None
+        confidence_tier, confidence_reason = confidence
+        context_distance = _singleton_context_distance(unit_by_cluster_id[int(singleton_cluster_id)][0], target_candidate)
+        return {
+            "source_cluster_id": int(singleton_cluster_id),
+            "target_cluster_id": int(absorb_cluster_id),
+            "candidate_id": "%s_rescue:%s->%s" % (str(source_name), int(singleton_cluster_id), int(absorb_cluster_id)),
+            "confidence_tier": str(confidence_tier),
+            "confidence_reason": str(confidence_reason),
+            "candidate_source": "%s_rescue" % str(source_name),
+            "source_exact_cluster_id": int(singleton_exact.exact_cluster_id),
+            "target_exact_cluster_id": int(getattr(target_candidate, "origin_exact_cluster_id", -1)),
+            "singleton_cluster_id": int(singleton_cluster_id),
+            "absorb_cluster_id": int(absorb_cluster_id),
+            "singleton_exact_cluster_id": int(singleton_exact.exact_cluster_id),
+            "absorb_exact_cluster_id": int(getattr(target_candidate, "origin_exact_cluster_id", -1)),
+            "edge_weight": int(max(1, round((1.0 - min(float(distance), 1.0)) * 1000.0))),
+            str(distance_key): float(distance),
+            "context_distance": float(context_distance),
+            "candidate_seed_type": str(singleton_seed_type),
+            "target_seed_type": str(target_seed_type),
+            "shift_direction": str(getattr(target_candidate, "shift_direction", "")),
+            "shift_distance_um": float(getattr(target_candidate, "shift_distance_um", 0.0)),
+            "source_is_singleton": True,
+            "target_is_singleton": False,
+            "endpoint_is_singleton": True,
+            "source_cluster_exact_count": 1,
+            "target_cluster_exact_count": int(exact_count_by_cluster_id.get(int(absorb_cluster_id), 0)),
+        }
+
+    def _candidate_singleton_ids(rows):
+        """统计候选行中已经覆盖到的 singleton cluster。"""
+
+        return {
+            int(endpoint[0])
+            for row in rows
+            for endpoint in [_singleton_candidate_from_row(row)]
+            if endpoint is not None
+        }
+
+    def _knn_rescue_rows(blocked_singleton_ids, source_name):
+        """为没有 review edge 的 singleton 构造 descriptor 或 graph KNN 候选。"""
+
+        singleton_items = []
+        target_items = []
+        for cluster_id, (candidate, assigned_exact_clusters) in unit_by_cluster_id.items():
+            exact_count = int(len(assigned_exact_clusters))
+            if exact_count == 1 and int(cluster_id) not in blocked_singleton_ids:
+                singleton_items.append((int(cluster_id), candidate, assigned_exact_clusters[0]))
+            elif exact_count > 1:
+                target_items.append((int(cluster_id), candidate))
+        if not singleton_items or not target_items:
+            return []
+
+        if str(source_name) == "descriptor":
+            target_vectors = np.vstack([_normalized_cheap_feature_vector(candidate) for _, candidate in target_items]).astype(np.float32, copy=False)
+            top_k = int(SINGLETON_ABSORPTION_DESCRIPTOR_RESCUE_TOP_K)
+            query_multiplier = int(SINGLETON_ABSORPTION_DESCRIPTOR_QUERY_MULTIPLIER)
+            distance_key = "descriptor_distance"
+        else:
+            target_vectors = np.vstack([_signature_embedding(_cheap_descriptor(candidate)) for _, candidate in target_items]).astype(np.float32, copy=False)
+            top_k = int(SINGLETON_ABSORPTION_GRAPH_RESCUE_TOP_K)
+            query_multiplier = int(SINGLETON_ABSORPTION_GRAPH_QUERY_MULTIPLIER)
+            distance_key = "graph_distance"
+        tree = cKDTree(target_vectors)
+        query_k = min(int(len(target_items)), max(top_k, top_k * query_multiplier))
+        rescue_rows = []
+        for singleton_cluster_id, singleton_candidate, singleton_exact in singleton_items:
+            if str(source_name) == "descriptor":
+                singleton_vector = _normalized_cheap_feature_vector(singleton_candidate)
+            else:
+                singleton_vector = _signature_embedding(_cheap_descriptor(singleton_candidate)).astype(np.float32, copy=False)
+            distances, indices = tree.query(singleton_vector, k=query_k)
+            kept_count = 0
+            for distance_raw, target_pos_raw in zip(np.atleast_1d(distances), np.atleast_1d(indices)):
+                if kept_count >= top_k:
                     break
-            if all_matched:
-                accepted_candidate = candidate
-                break
-        if accepted_candidate is None:
-            _record_skip(candidate_failure_reason)
-            continue
-        merged_cluster_id = min(source_cluster_id, target_cluster_id)
-        merged_exact_clusters = sorted(union_exact_clusters, key=lambda item: int(item.exact_cluster_id))
-        merged_units_by_cluster_id[merged_cluster_id] = (accepted_candidate, merged_exact_clusters)
-        consumed_cluster_ids.update([source_cluster_id, target_cluster_id])
-        used_merge_candidate_ids.add(str(accepted_candidate.candidate_id))
-        selected_candidate_ids.add(str(accepted_candidate.candidate_id))
-        metrics["safe_recall_merge_merged_pair_count"] = int(metrics["safe_recall_merge_merged_pair_count"]) + 1
+                target_pos = int(target_pos_raw)
+                if target_pos < 0 or target_pos >= len(target_items):
+                    continue
+                absorb_cluster_id, target_candidate = target_items[target_pos]
+                row = _rescue_row(
+                    int(singleton_cluster_id),
+                    int(absorb_cluster_id),
+                    singleton_exact,
+                    target_candidate,
+                    str(source_name),
+                    float(distance_raw),
+                    str(distance_key),
+                )
+                if row is None:
+                    continue
+                kept_count += 1
+                rescue_rows.append(row)
+        return rescue_rows
 
-    if not merged_units_by_cluster_id:
-        metrics["safe_recall_merge_reject_reason_counts"] = dict((str(key), int(value)) for key, value in sorted(skip_reasons.items()))
-        return original_units, metrics
+    def _candidate_pair_key(row):
+        """返回 singleton-target pair key，无法吸收的行返回 None。"""
+
+        endpoint = _singleton_candidate_from_row(row)
+        if endpoint is None:
+            return None
+        return int(endpoint[0]), int(endpoint[1])
+
+    def _merge_competing_rescue_rows(descriptor_rows, graph_rows):
+        """合并 descriptor 与 graph 候选，同一 pair 双命中且 context close 时标为 strong agreement。"""
+
+        pair_rows = defaultdict(dict)
+        for row in descriptor_rows:
+            pair_key = _candidate_pair_key(row)
+            if pair_key is not None:
+                pair_rows[pair_key]["descriptor_rescue"] = dict(row)
+        for row in graph_rows:
+            pair_key = _candidate_pair_key(row)
+            if pair_key is not None:
+                pair_rows[pair_key]["graph_rescue"] = dict(row)
+
+        merged_rows = []
+        for (singleton_cluster_id, absorb_cluster_id), source_rows in sorted(pair_rows.items()):
+            descriptor_row = source_rows.get("descriptor_rescue")
+            graph_row = source_rows.get("graph_rescue")
+            if descriptor_row is None or graph_row is None:
+                continue
+            descriptor_distance = float(descriptor_row.get("descriptor_distance", 0.0) or 0.0)
+            graph_distance = float(graph_row.get("graph_distance", 0.0) or 0.0)
+            context_distance = min(
+                float(descriptor_row.get("context_distance", 0.0) or 0.0),
+                float(graph_row.get("context_distance", 0.0) or 0.0),
+            )
+            if (
+                descriptor_distance > float(SINGLETON_ABSORPTION_DESCRIPTOR_MEDIUM_DISTANCE)
+                or graph_distance > float(SINGLETON_ABSORPTION_DESCRIPTOR_MEDIUM_DISTANCE)
+                or context_distance > float(SINGLETON_ABSORPTION_CONTEXT_CLOSE_DISTANCE)
+            ):
+                continue
+            row = dict(descriptor_row)
+            row["candidate_id"] = "strong_descriptor_graph_agreement:%s->%s" % (int(singleton_cluster_id), int(absorb_cluster_id))
+            row["candidate_source"] = "strong_descriptor_graph_agreement"
+            row["confidence_tier"] = "high" if min(
+                _review_merge_confidence_rank(str(descriptor_row.get("confidence_tier", ""))),
+                _review_merge_confidence_rank(str(graph_row.get("confidence_tier", ""))),
+            ) == 0 else "medium"
+            row["confidence_reason"] = "strong_descriptor_graph_agreement"
+            row["descriptor_distance"] = float(descriptor_distance)
+            row["graph_distance"] = float(graph_distance)
+            row["context_distance"] = float(context_distance)
+            row["rescue_combined_distance"] = float(0.45 * descriptor_distance + 0.45 * graph_distance + 0.10 * context_distance)
+            row["edge_weight"] = max(int(descriptor_row.get("edge_weight", 0) or 0), int(graph_row.get("edge_weight", 0) or 0))
+            merged_rows.append(row)
+        return merged_rows
+
+    def _select_strong_rescue_rows(rows):
+        """每个 singleton 只保留 strong agreement top-K。"""
+
+        rows_by_singleton = defaultdict(list)
+        for row in rows:
+            endpoint = _singleton_candidate_from_row(row)
+            if endpoint is not None and str(row.get("candidate_source", "")) == "strong_descriptor_graph_agreement":
+                rows_by_singleton[int(endpoint[0])].append(dict(row))
+        selected_rows = []
+        for singleton_cluster_id in sorted(rows_by_singleton):
+            selected_rows.extend(sorted(rows_by_singleton[int(singleton_cluster_id)], key=_rescue_sort_key)[: int(SINGLETON_ABSORPTION_TOP_K)])
+        return selected_rows
+
+    def _select_context_close_graph_rows(graph_rows, blocked_singleton_ids):
+        """只给没有 review/strong 候选的 singleton 保留 top-1 context-close graph 候选。"""
+
+        rows_by_singleton = defaultdict(list)
+        for row in graph_rows:
+            endpoint = _singleton_candidate_from_row(row)
+            if endpoint is None:
+                continue
+            singleton_cluster_id, absorb_cluster_id, _ = endpoint
+            if int(singleton_cluster_id) in blocked_singleton_ids:
+                continue
+            context_distance = float(row.get("context_distance", 0.0) or 0.0)
+            if context_distance > float(SINGLETON_ABSORPTION_CONTEXT_CLOSE_DISTANCE):
+                continue
+            graph_distance = float(row.get("graph_distance", 0.0) or 0.0)
+            selected_row = dict(row)
+            selected_row["candidate_id"] = "graph_rescue_context_close:%s->%s" % (int(singleton_cluster_id), int(absorb_cluster_id))
+            selected_row["candidate_source"] = "graph_rescue_context_close"
+            selected_row["confidence_reason"] = "graph_rescue_context_close"
+            selected_row["rescue_combined_distance"] = float(0.80 * graph_distance + 0.20 * context_distance)
+            rows_by_singleton[int(singleton_cluster_id)].append(selected_row)
+
+        selected_rows = []
+        for singleton_cluster_id in sorted(rows_by_singleton):
+            selected_rows.extend(
+                sorted(rows_by_singleton[int(singleton_cluster_id)], key=_rescue_sort_key)[
+                    : int(SINGLETON_ABSORPTION_CONTEXT_RESCUE_TOP_K)
+                ]
+            )
+        return selected_rows
+
+    def _dedupe_candidate_rows(rows):
+        """按当前顺序保留同一 singleton-target pair 的最高优先级候选。"""
+
+        deduped_rows = []
+        seen_pairs = set()
+        for row in rows:
+            endpoint = _singleton_candidate_from_row(row)
+            if endpoint is None:
+                deduped_rows.append(dict(row))
+                continue
+            pair_key = (int(endpoint[0]), int(endpoint[1]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+            deduped_rows.append(dict(row))
+        return deduped_rows
+
+    for row in review_rows:
+        row.setdefault("candidate_source", "review_edge")
+    review_candidate_singleton_ids = _candidate_singleton_ids(review_rows)
+    descriptor_rescue_rows = _knn_rescue_rows(review_candidate_singleton_ids, "descriptor")
+    graph_rescue_rows = _knn_rescue_rows(review_candidate_singleton_ids, "graph")
+    metrics["singleton_absorption_descriptor_rescue_candidate_count"] = int(len(descriptor_rescue_rows))
+    metrics["singleton_absorption_descriptor_rescue_singleton_count"] = int(len({int(row["singleton_cluster_id"]) for row in descriptor_rescue_rows}))
+    metrics["singleton_absorption_graph_rescue_candidate_count"] = int(len(graph_rescue_rows))
+    metrics["singleton_absorption_graph_rescue_singleton_count"] = int(len({int(row["singleton_cluster_id"]) for row in graph_rescue_rows}))
+    strong_rescue_rows = _select_strong_rescue_rows(_merge_competing_rescue_rows(descriptor_rescue_rows, graph_rescue_rows))
+    strong_rescue_singleton_ids = {
+        int(row["singleton_cluster_id"])
+        for row in strong_rescue_rows
+        if str(row.get("candidate_source", "")) == "strong_descriptor_graph_agreement"
+    }
+    context_close_graph_rows = _select_context_close_graph_rows(
+        graph_rescue_rows,
+        set(review_candidate_singleton_ids) | set(strong_rescue_singleton_ids),
+    )
+    metrics["singleton_absorption_graph_rescue_context_close_candidate_count"] = int(len(context_close_graph_rows))
+    metrics["singleton_absorption_graph_rescue_context_close_singleton_count"] = int(len({int(row["singleton_cluster_id"]) for row in context_close_graph_rows}))
+    rescue_rows = [*strong_rescue_rows, *context_close_graph_rows]
+    metrics["singleton_absorption_rescue_agreement_candidate_count"] = int(
+        sum(1 for row in rescue_rows if str(row.get("candidate_source", "")) == "strong_descriptor_graph_agreement")
+    )
+    metrics["singleton_absorption_strong_agreement_candidate_count"] = int(metrics["singleton_absorption_rescue_agreement_candidate_count"])
+    selected_by_source = {
+        str(key): int(value)
+        for key, value in sorted(Counter(str(row.get("candidate_source", "unknown") or "unknown") for row in rescue_rows).items())
+    }
+    metrics["singleton_absorption_rescue_selected_by_source"] = dict(selected_by_source)
+    distance_bucket_by_source = defaultdict(Counter)
+    for row in rescue_rows:
+        distance_bucket_by_source[str(row.get("candidate_source", "unknown") or "unknown")][_rescue_distance_bucket(row)] += 1
+    metrics["singleton_absorption_rescue_distance_bucket_by_source"] = {
+        str(source): {str(key): int(value) for key, value in sorted(counter.items())}
+        for source, counter in sorted(distance_bucket_by_source.items())
+    }
+
+    review_rows = _dedupe_candidate_rows(
+        sorted([*review_rows, *rescue_rows], key=lambda row: _rescue_sort_key(row))
+    )
+    absorption_candidates = []
+    for row in review_rows:
+        endpoint = _singleton_candidate_from_row(row)
+        if endpoint is None:
+            continue
+        singleton_cluster_id, absorb_cluster_id, singleton_exact_id = endpoint
+        absorption_candidates.append(
+            (
+                int(singleton_cluster_id),
+                _singleton_absorption_source_rank(row.get("candidate_source", "review_edge")),
+                _review_merge_confidence_rank(str(row.get("confidence_tier", ""))),
+                float(_rescue_combined_distance(row)),
+                abs(float(row.get("shift_distance_um", 0.0) or 0.0)),
+                -max(int(row.get("edge_weight", 0) or 0), 0),
+                int(absorb_cluster_id),
+                int(singleton_exact_id),
+                row,
+            )
+        )
+    absorption_candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4], item[5], item[6], item[7]))
+    metrics["singleton_absorption_candidate_edge_count"] = int(len(absorption_candidates))
+    candidate_singleton_ids = {int(item[0]) for item in absorption_candidates}
+    actual_singleton_ids = {
+        int(cluster_id)
+        for cluster_id, exact_count in exact_count_by_cluster_id.items()
+        if int(exact_count) == 1
+    }
+    if actual_singleton_ids and int(metrics.get("singleton_total_count", 0) or 0) <= 0:
+        metrics["singleton_total_count"] = int(len(actual_singleton_ids))
+    no_candidate_ids = actual_singleton_ids.difference(candidate_singleton_ids)
+    metrics["singleton_absorption_candidate_singleton_count"] = int(len(candidate_singleton_ids))
+    metrics["singleton_with_candidate_count"] = int(len(candidate_singleton_ids))
+    metrics["singleton_candidate_coverage_ratio"] = float(_safe_ratio(len(candidate_singleton_ids), int(metrics.get("singleton_total_count", 0) or 0)))
+    metrics["singleton_no_candidate_count"] = max(int(len(no_candidate_ids)), 0)
+    metrics["singleton_absorption_candidate_source_counts"] = {
+        str(key): int(value)
+        for key, value in sorted(Counter(str(item[8].get("candidate_source", "review_edge") or "review_edge") for item in absorption_candidates).items())
+    }
+    metrics["singleton_candidate_by_seed_type"] = {
+        str(key): int(value) for key, value in sorted(Counter(_cluster_seed_type(cluster_id) for cluster_id in candidate_singleton_ids).items())
+    }
+    metrics["singleton_no_candidate_by_seed_type"] = {
+        str(key): int(value) for key, value in sorted(Counter(_cluster_seed_type(cluster_id) for cluster_id in no_candidate_ids).items())
+    }
+
+    absorbed_by_cluster_id = defaultdict(list)
+    consumed_singleton_cluster_ids = set()
+    reject_reasons = Counter()
+    attempted_by_source = Counter()
+    merged_by_source = Counter()
+    reject_reason_by_source = defaultdict(Counter)
+    microcluster_reject_reason_by_source = defaultdict(Counter)
+    microcluster_pair_distance_buckets = Counter()
+    microcluster_clique_distance_buckets = Counter()
+    strict_only_absorption_sources = {"graph_rescue_context_close"}
+
+    def _record_reject(source, reason):
+        """记录 absorption 拒绝原因。"""
+
+        reject_reasons[str(reason)] += 1
+        reject_reason_by_source[str(source)][str(reason)] += 1
+
+    def _finalize_singleton_metrics():
+        """把 absorption / microcluster 的 Counter 写回 metrics。"""
+
+        metrics["singleton_absorption_reject_reason_counts"] = {str(key): int(value) for key, value in sorted(reject_reasons.items())}
+        metrics["singleton_absorption_attempted_by_source"] = {str(key): int(value) for key, value in sorted(attempted_by_source.items())}
+        metrics["singleton_absorption_merged_by_source"] = {str(key): int(value) for key, value in sorted(merged_by_source.items())}
+        metrics["singleton_absorption_reject_reason_by_source"] = {
+            str(source): {str(key): int(value) for key, value in sorted(counter.items())}
+            for source, counter in sorted(reject_reason_by_source.items())
+        }
+        metrics["singleton_absorption_merge_rate_by_rank_source"] = {
+            str(source): float(_safe_ratio(int(merged_by_source.get(source, 0)), int(attempted_by_source.get(source, 0))))
+            for source in sorted(set(attempted_by_source) | set(merged_by_source))
+        }
+        metrics["singleton_microcluster_reject_reason_by_source"] = {
+            str(source): {str(key): int(value) for key, value in sorted(counter.items())}
+            for source, counter in sorted(microcluster_reject_reason_by_source.items())
+        }
+        metrics["singleton_microcluster_pair_reject_reason_counts"] = {
+            str(key): int(value)
+            for key, value in sorted(microcluster_reject_reason_by_source.get("singleton_microcluster", Counter()).items())
+        }
+        metrics["singleton_microcluster_clique_reject_reason_counts"] = {
+            str(key): int(value)
+            for key, value in sorted(microcluster_reject_reason_by_source.get("singleton_microcluster_clique", Counter()).items())
+        }
+        metrics["singleton_microcluster_pair_distance_bucket_counts"] = {
+            str(key): int(value) for key, value in sorted(microcluster_pair_distance_buckets.items())
+        }
+        metrics["singleton_microcluster_clique_distance_bucket_counts"] = {
+            str(key): int(value) for key, value in sorted(microcluster_clique_distance_buckets.items())
+        }
+        microcluster_reject_counts = Counter()
+        for counter in microcluster_reject_reason_by_source.values():
+            microcluster_reject_counts.update(counter)
+        metrics["singleton_microcluster_reject_reason_counts"] = {
+            str(key): int(value) for key, value in sorted(microcluster_reject_counts.items())
+        }
+
+    for singleton_cluster_id, _, _, _, _, _, absorb_cluster_id, singleton_exact_id, row in absorption_candidates:
+        candidate_source = str(row.get("candidate_source", "review_edge") or "review_edge")
+        if singleton_cluster_id in consumed_singleton_cluster_ids:
+            continue
+        singleton_unit = unit_by_cluster_id.get(int(singleton_cluster_id))
+        absorb_unit = unit_by_cluster_id.get(int(absorb_cluster_id))
+        if singleton_unit is None or absorb_unit is None:
+            _record_reject(candidate_source, "missing_endpoint_cluster")
+            continue
+        singleton_exact_clusters = list(singleton_unit[1])
+        if len(singleton_exact_clusters) != 1:
+            _record_reject(candidate_source, "not_singleton_cluster")
+            continue
+        if len(absorb_unit[1]) <= 1:
+            _record_reject(candidate_source, "target_not_non_singleton")
+            continue
+        singleton_exact = singleton_exact_clusters[0]
+        if singleton_exact_id >= 0 and int(singleton_exact.exact_cluster_id) != int(singleton_exact_id):
+            _record_reject(candidate_source, "singleton_exact_mismatch")
+            continue
+        target_candidate = absorb_unit[0]
+        target_reject_reason = _target_reject_reason(int(absorb_cluster_id))
+        if target_reject_reason is not None:
+            _record_reject(candidate_source, str(target_reject_reason))
+            continue
+
+        metrics["singleton_absorption_attempted_count"] = int(metrics["singleton_absorption_attempted_count"]) + 1
+        attempted_by_source[candidate_source] += 1
+        metrics["singleton_absorption_checked_exact_count"] = int(metrics["singleton_absorption_checked_exact_count"]) + 1
+        matched, _, _ = _candidate_matches_exact(target_candidate, singleton_exact, config, descriptor_cache)
+        if not matched:
+            if candidate_source in strict_only_absorption_sources:
+                _record_reject(candidate_source, "strict_verification_reject")
+                continue
+            normal_guard_reject_reason = _normal_visual_guard_reject_reason(int(absorb_cluster_id), target_candidate)
+            if normal_guard_reject_reason is not None:
+                _record_reject(candidate_source, str(normal_guard_reject_reason))
+                continue
+            metrics["singleton_absorption_normal_visual_attempted_count"] = int(metrics["singleton_absorption_normal_visual_attempted_count"]) + 1
+            metrics["singleton_absorption_checked_exact_count"] = int(metrics["singleton_absorption_checked_exact_count"]) + 1
+            matched, _, _ = _candidate_matches_exact_normal(target_candidate, singleton_exact, config, descriptor_cache)
+            if not matched:
+                _record_reject(candidate_source, "normal_visual_verification_reject")
+                continue
+            metrics["singleton_absorption_normal_visual_merged_count"] = int(metrics["singleton_absorption_normal_visual_merged_count"]) + 1
+        else:
+            metrics["singleton_absorption_strict_merged_count"] = int(metrics["singleton_absorption_strict_merged_count"]) + 1
+
+        absorbed_by_cluster_id[int(absorb_cluster_id)].append(singleton_exact)
+        consumed_singleton_cluster_ids.add(int(singleton_cluster_id))
+        metrics["singleton_absorption_merged_count"] = int(metrics["singleton_absorption_merged_count"]) + 1
+        merged_by_source[candidate_source] += 1
+
+    microcluster_members_by_anchor_id = defaultdict(list)
+    microcluster_member_cluster_ids = set()
+    microcluster_locked_cluster_ids = set()
+    remaining_singleton_ids = sorted(int(cluster_id) for cluster_id in actual_singleton_ids if int(cluster_id) not in consumed_singleton_cluster_ids)
+    microcluster_items = []
+    for cluster_id in remaining_singleton_ids:
+        unit = unit_by_cluster_id.get(int(cluster_id))
+        if unit is None or len(unit[1]) != 1:
+            continue
+        candidate, exact_clusters_for_unit = unit
+        if str(getattr(candidate, "shift_direction", "base") or "base") != "base":
+            continue
+        microcluster_items.append((int(cluster_id), candidate, exact_clusters_for_unit[0]))
+
+    if len(microcluster_items) >= 2:
+        descriptor_vectors = [_normalized_cheap_feature_vector(candidate) for _, candidate, _ in microcluster_items]
+        graph_vectors = [
+            _signature_embedding(_cheap_descriptor(candidate)).astype(np.float32, copy=False)
+            for _, candidate, _ in microcluster_items
+        ]
+        combined_vectors = np.vstack(
+            [
+                np.concatenate([np.asarray(descriptor_vector, dtype=np.float32), np.asarray(graph_vector, dtype=np.float32)])
+                for descriptor_vector, graph_vector in zip(descriptor_vectors, graph_vectors)
+            ]
+        ).astype(np.float32, copy=False)
+        norms = np.linalg.norm(combined_vectors, axis=1)
+        norms[norms <= 1e-12] = 1.0
+        combined_vectors = (combined_vectors / norms[:, None]).astype(np.float32, copy=False)
+        tree = cKDTree(combined_vectors)
+        query_k = min(len(microcluster_items), max(2, int(SINGLETON_MICROCLUSTER_QUERY_K) + 1))
+        neighbor_ids_by_cluster_id = {}
+        for item_index, (cluster_id, _, _) in enumerate(microcluster_items):
+            _, neighbor_indices = tree.query(combined_vectors[item_index], k=query_k)
+            neighbor_ids_by_cluster_id[int(cluster_id)] = {
+                int(microcluster_items[int(index)][0])
+                for index in np.atleast_1d(neighbor_indices)
+                if int(index) != int(item_index) and 0 <= int(index) < len(microcluster_items)
+            }
+
+        microcluster_pair_rows = []
+        for left_index, (left_cluster_id, left_candidate, left_exact) in enumerate(microcluster_items):
+            for right_index in range(left_index + 1, len(microcluster_items)):
+                right_cluster_id, right_candidate, right_exact = microcluster_items[right_index]
+                if right_cluster_id not in neighbor_ids_by_cluster_id.get(left_cluster_id, set()):
+                    continue
+                if left_cluster_id not in neighbor_ids_by_cluster_id.get(right_cluster_id, set()):
+                    continue
+                left_seed_type = _cluster_seed_type(int(left_cluster_id))
+                right_seed_type = _cluster_seed_type(int(right_cluster_id))
+                descriptor_distance = float(
+                    np.linalg.norm(np.asarray(descriptor_vectors[left_index], dtype=np.float32) - np.asarray(descriptor_vectors[right_index], dtype=np.float32))
+                )
+                graph_distance = float(
+                    np.linalg.norm(np.asarray(graph_vectors[left_index], dtype=np.float32) - np.asarray(graph_vectors[right_index], dtype=np.float32))
+                )
+                context_distance = float(_singleton_context_distance(left_candidate, right_candidate))
+                combined_distance = float(0.40 * descriptor_distance + 0.40 * graph_distance + 0.20 * context_distance)
+                pair_row = {
+                    "source_cluster_id": int(left_cluster_id),
+                    "target_cluster_id": int(right_cluster_id),
+                    "candidate_id": "singleton_microcluster:%s->%s" % (int(left_cluster_id), int(right_cluster_id)),
+                    "confidence_tier": "high",
+                    "confidence_reason": "strict_only_singleton_microcluster",
+                    "candidate_source": "singleton_microcluster",
+                    "source_exact_cluster_id": int(left_exact.exact_cluster_id),
+                    "target_exact_cluster_id": int(right_exact.exact_cluster_id),
+                    "singleton_cluster_id": int(left_cluster_id),
+                    "absorb_cluster_id": int(right_cluster_id),
+                    "singleton_exact_cluster_id": int(left_exact.exact_cluster_id),
+                    "absorb_exact_cluster_id": int(right_exact.exact_cluster_id),
+                    "edge_weight": int(max(1, round((1.0 - min(combined_distance, 1.0)) * 1000.0))),
+                    "descriptor_distance": float(descriptor_distance),
+                    "graph_distance": float(graph_distance),
+                    "context_distance": float(context_distance),
+                    "candidate_seed_type": str(left_seed_type),
+                    "target_seed_type": str(right_seed_type),
+                    "shift_direction": "base",
+                    "shift_distance_um": 0.0,
+                    "source_is_singleton": True,
+                    "target_is_singleton": True,
+                    "endpoint_is_singleton": True,
+                    "source_cluster_exact_count": 1,
+                    "target_cluster_exact_count": 1,
+                }
+                metrics["singleton_microcluster_candidate_count"] = int(metrics["singleton_microcluster_candidate_count"]) + 1
+                metrics["singleton_microcluster_pair_candidate_count"] = int(metrics["singleton_microcluster_pair_candidate_count"]) + 1
+                microcluster_pair_distance_buckets[_rescue_distance_bucket(pair_row)] += 1
+                reject_reason = None
+                if not _seed_types_are_absorption_compatible(left_seed_type, right_seed_type):
+                    reject_reason = "seed_type_incompatible"
+                elif descriptor_distance > float(SINGLETON_ABSORPTION_DESCRIPTOR_HIGH_DISTANCE):
+                    reject_reason = "descriptor_distance_far"
+                elif graph_distance > float(SINGLETON_ABSORPTION_DESCRIPTOR_HIGH_DISTANCE):
+                    reject_reason = "graph_distance_far"
+                elif context_distance > float(SINGLETON_ABSORPTION_CONTEXT_CLOSE_DISTANCE):
+                    reject_reason = "context_distance_far"
+                if reject_reason is not None:
+                    microcluster_reject_reason_by_source["singleton_microcluster"][str(reject_reason)] += 1
+                    continue
+                microcluster_pair_rows.append((combined_distance, int(left_cluster_id), int(right_cluster_id), pair_row))
+
+        pair_row_by_key = {}
+        pair_distance_by_key = {}
+        valid_neighbors_by_cluster_id = defaultdict(set)
+        for combined_distance, left_cluster_id, right_cluster_id, pair_row in microcluster_pair_rows:
+            pair_key = (min(int(left_cluster_id), int(right_cluster_id)), max(int(left_cluster_id), int(right_cluster_id)))
+            pair_row_by_key[pair_key] = dict(pair_row)
+            pair_distance_by_key[pair_key] = float(combined_distance)
+            valid_neighbors_by_cluster_id[int(left_cluster_id)].add(int(right_cluster_id))
+            valid_neighbors_by_cluster_id[int(right_cluster_id)].add(int(left_cluster_id))
+
+        microcluster_clique_rows = []
+        seen_cliques = set()
+        for anchor_cluster_id in sorted(valid_neighbors_by_cluster_id):
+            neighbors = sorted(valid_neighbors_by_cluster_id[int(anchor_cluster_id)])
+            for left_pos in range(len(neighbors)):
+                for right_pos in range(left_pos + 1, len(neighbors)):
+                    clique_ids = tuple(sorted((int(anchor_cluster_id), int(neighbors[left_pos]), int(neighbors[right_pos]))))
+                    if clique_ids in seen_cliques:
+                        continue
+                    pair_keys = [(clique_ids[0], clique_ids[1]), (clique_ids[0], clique_ids[2]), (clique_ids[1], clique_ids[2])]
+                    if any(pair_key not in pair_row_by_key for pair_key in pair_keys):
+                        continue
+                    seen_cliques.add(clique_ids)
+                    combined_distance = float(sum(float(pair_distance_by_key[pair_key]) for pair_key in pair_keys) / 3.0)
+                    first_row = dict(pair_row_by_key[pair_keys[0]])
+                    first_row["candidate_id"] = "singleton_microcluster_clique:%s->%s->%s" % clique_ids
+                    first_row["candidate_source"] = "singleton_microcluster_clique"
+                    first_row["confidence_reason"] = "strict_only_singleton_microcluster_clique"
+                    first_row["rescue_combined_distance"] = float(combined_distance)
+                    first_row["edge_weight"] = int(max(1, round((1.0 - min(combined_distance, 1.0)) * 1000.0)))
+                    microcluster_clique_rows.append((combined_distance, clique_ids, first_row))
+                    metrics["singleton_microcluster_candidate_count"] = int(metrics["singleton_microcluster_candidate_count"]) + 1
+                    metrics["singleton_microcluster_clique_candidate_count"] = int(metrics["singleton_microcluster_clique_candidate_count"]) + 1
+                    microcluster_clique_distance_buckets[_rescue_distance_bucket(first_row)] += 1
+
+        def _microcluster_units_ready(cluster_ids):
+            """确认 microcluster 端点仍是未消费 singleton。"""
+
+            for cluster_id in cluster_ids:
+                unit = unit_by_cluster_id.get(int(cluster_id))
+                if unit is None or len(unit[1]) != 1:
+                    return False
+            return True
+
+        def _microcluster_strict_pair_passes(left_cluster_id, right_cluster_id):
+            """用 strict verification 验证一个 singleton pair。"""
+
+            left_unit = unit_by_cluster_id[int(left_cluster_id)]
+            right_unit = unit_by_cluster_id[int(right_cluster_id)]
+            metrics["singleton_absorption_checked_exact_count"] = int(metrics["singleton_absorption_checked_exact_count"]) + 1
+            matched, _, _ = _candidate_matches_exact(left_unit[0], right_unit[1][0], config, descriptor_cache)
+            return bool(matched)
+
+        for _, clique_ids, _ in sorted(microcluster_clique_rows):
+            if any(cluster_id in microcluster_locked_cluster_ids for cluster_id in clique_ids):
+                continue
+            if not _microcluster_units_ready(clique_ids):
+                microcluster_reject_reason_by_source["singleton_microcluster_clique"]["missing_endpoint_cluster"] += 1
+                continue
+            metrics["singleton_microcluster_attempted_count"] = int(metrics["singleton_microcluster_attempted_count"]) + 1
+            metrics["singleton_microcluster_clique_attempted_count"] = int(metrics["singleton_microcluster_clique_attempted_count"]) + 1
+            strict_pair_keys = [(clique_ids[0], clique_ids[1]), (clique_ids[0], clique_ids[2]), (clique_ids[1], clique_ids[2])]
+            if not all(_microcluster_strict_pair_passes(left_id, right_id) for left_id, right_id in strict_pair_keys):
+                microcluster_reject_reason_by_source["singleton_microcluster_clique"]["strict_verification_reject"] += 1
+                continue
+            anchor_cluster_id = int(clique_ids[0])
+            for member_cluster_id in clique_ids[1:]:
+                member_unit = unit_by_cluster_id[int(member_cluster_id)]
+                microcluster_members_by_anchor_id[anchor_cluster_id].append(member_unit[1][0])
+                microcluster_member_cluster_ids.add(int(member_cluster_id))
+            microcluster_locked_cluster_ids.update(int(cluster_id) for cluster_id in clique_ids)
+            metrics["singleton_microcluster_merged_count"] = int(metrics["singleton_microcluster_merged_count"]) + 2
+            metrics["singleton_microcluster_clique_merged_count"] = int(metrics["singleton_microcluster_clique_merged_count"]) + 2
+
+        for _, left_cluster_id, right_cluster_id, _ in sorted(microcluster_pair_rows):
+            if left_cluster_id in microcluster_locked_cluster_ids or right_cluster_id in microcluster_locked_cluster_ids:
+                continue
+            left_unit = unit_by_cluster_id.get(int(left_cluster_id))
+            right_unit = unit_by_cluster_id.get(int(right_cluster_id))
+            if left_unit is None or right_unit is None or len(left_unit[1]) != 1 or len(right_unit[1]) != 1:
+                microcluster_reject_reason_by_source["singleton_microcluster"]["missing_endpoint_cluster"] += 1
+                continue
+            metrics["singleton_microcluster_attempted_count"] = int(metrics["singleton_microcluster_attempted_count"]) + 1
+            metrics["singleton_microcluster_pair_attempted_count"] = int(metrics["singleton_microcluster_pair_attempted_count"]) + 1
+            if not _microcluster_strict_pair_passes(int(left_cluster_id), int(right_cluster_id)):
+                microcluster_reject_reason_by_source["singleton_microcluster"]["strict_verification_reject"] += 1
+                continue
+            microcluster_members_by_anchor_id[int(left_cluster_id)].append(right_unit[1][0])
+            microcluster_member_cluster_ids.add(int(right_cluster_id))
+            microcluster_locked_cluster_ids.add(int(left_cluster_id))
+            microcluster_locked_cluster_ids.add(int(right_cluster_id))
+            metrics["singleton_microcluster_merged_count"] = int(metrics["singleton_microcluster_merged_count"]) + 1
+            metrics["singleton_microcluster_pair_merged_count"] = int(metrics["singleton_microcluster_pair_merged_count"]) + 1
 
     merged_units = []
-    for cluster_id, unit in unit_by_cluster_id.items():
-        if cluster_id in merged_units_by_cluster_id:
-            merged_units.append(merged_units_by_cluster_id[cluster_id])
-        if cluster_id in consumed_cluster_ids:
+    for cluster_id, (candidate, assigned_exact_clusters) in unit_by_cluster_id.items():
+        if int(cluster_id) in consumed_singleton_cluster_ids or int(cluster_id) in microcluster_member_cluster_ids:
             continue
-        merged_units.append(unit)
-    metrics["safe_recall_merge_cluster_reduction"] = int(len(original_units) - len(merged_units))
-    metrics["safe_recall_merge_reject_reason_counts"] = dict((str(key), int(value)) for key, value in sorted(skip_reasons.items()))
+        merged_exact_clusters = list(assigned_exact_clusters)
+        if int(cluster_id) in absorbed_by_cluster_id:
+            merged_exact_clusters.extend(absorbed_by_cluster_id[int(cluster_id)])
+        if int(cluster_id) in microcluster_members_by_anchor_id:
+            merged_exact_clusters.extend(microcluster_members_by_anchor_id[int(cluster_id)])
+        if int(cluster_id) in absorbed_by_cluster_id or int(cluster_id) in microcluster_members_by_anchor_id:
+            merged_exact_clusters = sorted(merged_exact_clusters, key=lambda item: int(item.exact_cluster_id))
+        merged_units.append((candidate, merged_exact_clusters))
+    metrics["singleton_absorption_cluster_reduction"] = int(len(original_units) - len(merged_units))
+    _finalize_singleton_metrics()
     return merged_units, metrics
 
 
 def _quality_metrics_summary(quality_metrics):
     """生成 result_summary 中使用的精简质量指标，避免输出内部 review 行。"""
 
-    hidden = set(["cluster_quality_by_index", "review_merge_candidate_rows", "review_merge_cluster_pair_rows"])
-    return dict((str(key), value) for key, value in dict(quality_metrics).items() if str(key) not in hidden)
+    hidden = {
+        "cluster_quality_by_index",
+        "review_merge_candidate_rows",
+        "review_merge_cluster_pair_rows",
+        "singleton_absorption_candidate_rows",
+        "singleton_total_count",
+        "singleton_with_candidate_count",
+        "singleton_no_candidate_count",
+        "singleton_candidate_coverage_ratio",
+        "singleton_no_candidate_by_seed_type",
+        "singleton_candidate_by_seed_type",
+    }
+    return {
+        str(key): value
+        for key, value in dict(quality_metrics).items()
+        if str(key) not in hidden
+        and not str(key).startswith("singleton_absorption_")
+        and not str(key).startswith("singleton_microcluster_")
+        and not str(key).startswith("safe_recall_merge_")
+    }
 
 
 def build_compact_result_exact_review(
@@ -5658,7 +6637,6 @@ def build_compact_result_exact_review(
     result["result_summary"]["quality_metrics_enabled"] = bool(quality_enabled)
     if quality_enabled:
         candidate_evidence_rows = _candidate_evidence_rows(candidates, coverage_offsets, coverage_values)
-        candidate_evidence_by_id = dict((str(row.get("candidate_id", "")), row) for row in candidate_evidence_rows)
         rejected_candidate_ids = config.get("_greedy_purity_gate_rejected_ids", set()) if isinstance(config, dict) else set()
         cluster_units = _cluster_units_from_result(result, exact_clusters, selected_candidates)
         quality_metrics = _build_quality_metrics_exact_review(
@@ -5671,14 +6649,12 @@ def build_compact_result_exact_review(
             dict(result.get("coverage_debug_stats", {}) or {}),
             rejected_candidate_ids,
         )
-        cluster_units, safe_recall_merge_metrics = _safe_recall_merge_exact_review(
+        cluster_units, singleton_absorption_metrics = _apply_singleton_absorption_exact_review(
             cluster_units,
             quality_metrics,
-            candidate_evidence_by_id,
-            candidate_bitmap_locations or {},
             config,
         )
-        if int(safe_recall_merge_metrics.get("safe_recall_merge_cluster_reduction", 0) or 0) > 0:
+        if int(singleton_absorption_metrics.get("singleton_absorption_cluster_reduction", 0) or 0) > 0:
             _materialize_result_from_cluster_units(result, cluster_units, exact_clusters, config)
             quality_metrics = _build_quality_metrics_exact_review(
                 cluster_units,
@@ -5690,9 +6666,9 @@ def build_compact_result_exact_review(
                 dict(result.get("coverage_debug_stats", {}) or {}),
                 rejected_candidate_ids,
             )
-        quality_metrics.update(safe_recall_merge_metrics)
-        cluster_quality_by_index = dict(quality_metrics.pop("cluster_quality_by_index", {}))
-        result["quality_metrics"] = dict(quality_metrics)
+        quality_metrics.update(singleton_absorption_metrics)
+        cluster_quality_by_index = dict(quality_metrics.get("cluster_quality_by_index", {}))
+        result["quality_metrics"] = _quality_metrics_summary(quality_metrics)
         result["cluster_quality_by_index"] = dict(cluster_quality_by_index)
         result["result_summary"]["quality_metrics"] = _quality_metrics_summary(quality_metrics)
     return result
